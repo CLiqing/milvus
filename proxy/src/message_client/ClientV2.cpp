@@ -21,14 +21,19 @@ MsgClientV2 &MsgClientV2::GetInstance() {
 MsgClientV2::MsgClientV2(int64_t client_id, std::string &service_url, const pulsar::ClientConfiguration &config)
     : client_id_(client_id), service_url_(service_url) {}
 
-Status MsgClientV2::Init(const std::string &mut_topic, const std::string &query_topic,
-                         const std::string &result_topic) {
-  auto pulsar_client = std::make_shared<pulsar::Client>(service_url_);
-  mut_producer_ = std::make_shared<MsgProducer>(pulsar_client, mut_topic);
-  query_producer_ = std::make_shared<MsgProducer>(pulsar_client, mut_topic);
-  consumer_ = std::make_shared<MsgConsumer>(pulsar_client, result_topic);
+Status MsgClientV2::Init(const std::string &insert_delete,
+        const std::string &search,
+        const std::string &time_sync,
+        const std::string &search_by_id,
+        const std::string &search_result) {
+  auto pulsar_client = std::make_shared<MsgClient>(service_url_);
+  insert_delete_producer_ = std::make_shared<MsgProducer>(pulsar_client, insert_delete);
+  search_producer_ = std::make_shared<MsgProducer>(pulsar_client, search);
+  search_by_id_producer_ = std::make_shared<MsgProducer>(pulsar_client, search_by_id);
+  time_sync_producer_ = std::make_shared<MsgProducer>(pulsar_client, time_sync);
+  consumer_ = std::make_shared<MsgConsumer>(pulsar_client, search_result);
 
-  auto result = consumer_->subscribe(result_topic);
+  auto result = consumer_->subscribe(search_result);
   if (result != pulsar::Result::ResultOk) {
     return Status(SERVER_UNEXPECTED_ERROR, "Pulsar message client init occur error, " + std::string(pulsar::strResult(result)));
   }
@@ -57,7 +62,7 @@ Status MsgClientV2::SendMutMessage(const milvus::grpc::InsertParam &request) {
     mut_msg.mutable_rows_data()->CopyFrom(request.rows_data(i));
     mut_msg.mutable_extra_params()->CopyFrom(request.extra_params());
 
-    auto result = mut_producer_->send(mut_msg);
+    auto result = insert_delete_producer_->send(mut_msg);
     if (result != pulsar::ResultOk) {
       // TODO: error code
       return Status(DB_ERROR, pulsar::strResult(result));
@@ -75,7 +80,7 @@ Status MsgClientV2::SendMutMessage(const milvus::grpc::DeleteByIDParam &request)
     mut_msg.set_uid(id);
     mut_msg.set_collection_name(request.collection_name());
 
-    auto result = mut_producer_->send(mut_msg);
+    auto result = insert_delete_producer_->send(mut_msg);
     if (result != pulsar::ResultOk) {
       // TODO: error code
       return Status(DB_ERROR, pulsar::strResult(result));
@@ -85,8 +90,10 @@ Status MsgClientV2::SendMutMessage(const milvus::grpc::DeleteByIDParam &request)
 }
 
 MsgClientV2::~MsgClientV2() {
-  mut_producer_->close();
-  query_producer_->close();
+  insert_delete_producer_->close();
+  search_producer_->close();
+  search_by_id_producer_->close();
+  time_sync_producer_->close();
   consumer_->close();
 }
 }
