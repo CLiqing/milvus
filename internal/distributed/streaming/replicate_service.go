@@ -13,6 +13,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/replicateutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
@@ -128,6 +129,8 @@ func (s replicateService) overwriteReplicateMessage(ctx context.Context, msg mes
 		if err := s.overwriteAlterReplicateConfigMessage(cfg, msg); err != nil {
 			return nil, err
 		}
+	case message.MessageTypeAlterLoadConfig:
+		s.overwriteAlterLoadConfigMessage(msg)
 	}
 
 	if funcutil.IsControlChannel(msg.VChannel()) {
@@ -190,4 +193,18 @@ func (s replicateService) overwriteAlterReplicateConfigMessage(currentReplicateC
 		},
 	})
 	return nil
+}
+
+// overwriteAlterLoadConfigMessage sets use_local_replica_config flag on replicated AlterLoadConfig messages
+// when streaming.replication.useLocalReplicaConfig is enabled.
+// This allows the secondary cluster to use its own cluster-level replica/resource-group config
+// instead of blindly applying the primary's config.
+func (s replicateService) overwriteAlterLoadConfigMessage(msg message.ReplicateMutableMessage) {
+	if !paramtable.Get().StreamingCfg.ReplicationUseLocalReplicaConfig.GetAsBool() {
+		return
+	}
+	alterLoadConfigMsg := message.MustAsMutableAlterLoadConfigMessageV2(msg)
+	header := alterLoadConfigMsg.Header()
+	header.UseLocalReplicaConfig = true
+	alterLoadConfigMsg.OverwriteHeader(header)
 }
