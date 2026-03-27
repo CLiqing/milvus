@@ -369,6 +369,11 @@ TEST_P(GrowingIndexTest, Correctness) {
 }
 
 TEST_P(GrowingIndexTest, AddWithoutBuildPool) {
+    // Sparse inverted indexes do not support Add after Build since knowhere
+    // overhauled sparse index architecture (zilliztech/knowhere#1476).
+    if (is_sparse) {
+        GTEST_SKIP() << "Sparse indexes do not support post-build Add";
+    }
     constexpr int N = 1024;
     constexpr int dim = 4;
     constexpr int add_cont = 5;
