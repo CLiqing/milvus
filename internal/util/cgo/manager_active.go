@@ -7,18 +7,22 @@ import (
 	"go.uber.org/atomic"
 
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
+	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 const (
 	registerIndex      = 0
 	maxSelectCase      = 65535
-	defaultRegisterBuf = 1
+	defaultRegisterBuf = 256
+	coresPerShard      = 8
 )
 
 var (
-	futureManager *activeFutureManager
-	initOnce      sync.Once
+	futureManagers []*activeFutureManager
+	managerCount   uint64
+	registerSeq    atomic.Uint64
+	initOnce       sync.Once
 )
 
 // initCGO initializes the cgo caller and future manager.
@@ -27,8 +31,17 @@ func initCGO() {
 		nodeID := paramtable.GetStringNodeID()
 		initCaller(nodeID)
 		initExecutor()
-		futureManager = newActiveFutureManager(nodeID)
-		futureManager.Run()
+
+		numShards := hardware.GetCPUNum() / coresPerShard
+		if numShards < 1 {
+			numShards = 1
+		}
+		managerCount = uint64(numShards)
+		futureManagers = make([]*activeFutureManager, numShards)
+		for i := 0; i < numShards; i++ {
+			futureManagers[i] = newActiveFutureManager(nodeID)
+			futureManagers[i].Run()
+		}
 	})
 }
 
