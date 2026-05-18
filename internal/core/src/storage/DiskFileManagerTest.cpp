@@ -272,6 +272,19 @@ TEST_F(DiskAnnFileManagerTest, ReadAndWriteWithStream) {
     lcm->Remove(small_index_file_path);
 }
 
+TEST_F(DiskAnnFileManagerTest, V2IndexPathIncludesStorageRootPath) {
+    FieldDataMeta filed_data_meta = {1, 2, 3, 100};
+    IndexMeta index_meta = {3, 100, 1000, 1, "index"};
+    storage::FileManagerContext context(filed_data_meta, index_meta, cm_, fs_);
+
+    storage::MemFileManagerImpl file_manager(context);
+
+    EXPECT_EQ(file_manager.GetRemoteIndexObjectPrefixV2(),
+              TestRemotePath + "index_files/1000/1/2/3");
+}
+
+// Ensure that index v3 generated path is the same as v2 path, only with different
+// file name.
 TEST_F(DiskAnnFileManagerTest, V3PackedIndexPathMismatch) {
     FieldDataMeta filed_data_meta = {1, 2, 3, 100};
     IndexMeta index_meta = {3, 100, 1000, 1, "index"};

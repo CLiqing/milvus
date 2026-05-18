@@ -278,11 +278,7 @@ class FileManagerImpl : public milvus::FileManager {
 
     virtual std::string
     GetRemoteIndexObjectPrefixV2() const {
-        return std::string(INDEX_ROOT_PATH) + "/" +
-               std::to_string(index_meta_.build_id) + "/" +
-               std::to_string(index_meta_.index_version) + "/" +
-               std::to_string(field_meta_.partition_id) + "/" +
-               std::to_string(field_meta_.segment_id);
+        return GetRemoteIndexObjectPrefix();
     }
 
     virtual std::string
