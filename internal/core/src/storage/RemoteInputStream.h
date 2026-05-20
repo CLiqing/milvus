@@ -11,8 +11,14 @@
 
 #pragma once
 
+#include <stddef.h>
+#include <stdint.h>
+#include <future>
+#include <memory>
+
+#include "arrow/io/interfaces.h"
 #include "filemanager/InputStream.h"
-#include "milvus-storage/filesystem/fs.h"
+#include "storage/RemoteAsyncReadResult.h"
 
 namespace milvus::storage {
 
@@ -31,6 +37,12 @@ class RemoteInputStream : public milvus::InputStream {
 
     size_t
     ReadAt(void* data, size_t offset, size_t size) override;
+
+    bool
+    SupportsAsyncReadAt() const;
+
+    std::future<RemoteAsyncReadResult>
+    ReadAtAsync(size_t offset, size_t size);
 
     size_t
     Read(int fd, size_t size) override;

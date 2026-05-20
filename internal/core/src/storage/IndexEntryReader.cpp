@@ -20,8 +20,10 @@
 #include <unistd.h>
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <string>
@@ -32,8 +34,42 @@
 #include "nlohmann/json.hpp"
 #include "storage/Crc32cUtil.h"
 #include "storage/PluginLoader.h"
+#include "storage/RemoteInputStream.h"
 
 namespace milvus::storage {
+namespace {
+
+bool
+IsEnvEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    std::string text(value);
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return text == "1" || text == "true" || text == "on" || text == "yes";
+}
+
+const uint8_t*
+AsBytes(const std::vector<std::byte>& data) {
+    return reinterpret_cast<const uint8_t*>(data.data());
+}
+
+std::shared_ptr<RemoteInputStream>
+GetAsyncRemoteInputStream(const std::shared_ptr<milvus::InputStream>& input) {
+    if (!IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC")) {
+        return nullptr;
+    }
+    auto remote_input = std::dynamic_pointer_cast<RemoteInputStream>(input);
+    if (remote_input == nullptr || !remote_input->SupportsAsyncReadAt()) {
+        return nullptr;
+    }
+    return remote_input;
+}
+
+}  // namespace
 
 std::unique_ptr<IndexEntryReader>
 IndexEntryReader::Open(std::shared_ptr<milvus::InputStream> input,
@@ -240,6 +276,52 @@ IndexEntryReader::ReadPlainEntry(const EntryMeta& meta) {
 
     constexpr size_t kRangeSize = 16 * 1024 * 1024;
 
+    uint8_t* dest = result.data.data();
+    size_t remaining = pm.size;
+    size_t offset = 0;
+
+    if (auto remote_input = GetAsyncRemoteInputStream(input_)) {
+        if (pm.size <= kRangeSize) {
+            auto future = remote_input->ReadAtAsync(
+                MILVUS_V3_MAGIC_SIZE + pm.offset, pm.size);
+            auto read_result = future.get();
+            AssertInfo(read_result.bytes_read == pm.size,
+                       "Failed to read entry data");
+            std::memcpy(result.data.data(), AsBytes(read_result.data), pm.size);
+            VerifyCrc32c(pm.crc32, result.data.data(), pm.size, "");
+            return result;
+        }
+
+        struct RangeTask {
+            size_t offset;
+            size_t len;
+            std::future<RemoteAsyncReadResult> future;
+        };
+        std::vector<RangeTask> tasks;
+
+        while (remaining > 0) {
+            size_t len = std::min(remaining, kRangeSize);
+            tasks.push_back(
+                {offset,
+                 len,
+                 remote_input->ReadAtAsync(
+                     MILVUS_V3_MAGIC_SIZE + pm.offset + offset, len)});
+            remaining -= len;
+            offset += len;
+        }
+
+        for (auto& task : tasks) {
+            auto read_result = task.future.get();
+            AssertInfo(read_result.bytes_read == task.len,
+                       "Failed to read entry data range");
+            std::memcpy(
+                dest + task.offset, AsBytes(read_result.data), task.len);
+        }
+
+        VerifyCrc32c(pm.crc32, result.data.data(), pm.size, "");
+        return result;
+    }
+
     if (pm.size <= kRangeSize) {
         size_t n = input_->ReadAt(
             result.data.data(), MILVUS_V3_MAGIC_SIZE + pm.offset, pm.size);
@@ -249,11 +331,7 @@ IndexEntryReader::ReadPlainEntry(const EntryMeta& meta) {
     }
 
     auto& pool = ThreadPools::GetThreadPool(priority_);
-    uint8_t* dest = result.data.data();
-
     std::vector<std::future<void>> futures;
-    size_t remaining = pm.size;
-    size_t offset = 0;
 
     while (remaining > 0) {
         size_t len = std::min(remaining, kRangeSize);
@@ -287,11 +365,56 @@ IndexEntryReader::ReadEncryptedEntry(const EntryMeta& meta) {
     Entry result;
     result.data.resize(em.original_size);
 
-    auto& pool = ThreadPools::GetThreadPool(priority_);
     uint8_t* dest = result.data.data();
-
-    std::vector<std::future<void>> futures;
     size_t cur_output_offset = 0;
+
+    if (auto remote_input = GetAsyncRemoteInputStream(input_)) {
+        struct SliceTask {
+            size_t output_offset;
+            size_t plain_len;
+            size_t cipher_len;
+            std::future<RemoteAsyncReadResult> future;
+        };
+        std::vector<SliceTask> tasks;
+
+        for (const auto& slice : em.slices) {
+            size_t this_output_offset = cur_output_offset;
+            size_t remaining = em.original_size - cur_output_offset;
+            size_t plain_len = std::min(remaining, slice_size_);
+            cur_output_offset += plain_len;
+
+            tasks.push_back(
+                {this_output_offset,
+                 plain_len,
+                 static_cast<size_t>(slice.size),
+                 remote_input->ReadAtAsync(MILVUS_V3_MAGIC_SIZE + slice.offset,
+                                           slice.size)});
+        }
+
+        for (auto& task : tasks) {
+            auto read_result = task.future.get();
+            AssertInfo(read_result.bytes_read == task.cipher_len,
+                       "Failed to read encrypted slice");
+
+            auto dec =
+                cipher_plugin_->GetDecryptor(ez_id_, collection_id_, edek_);
+            auto plain = dec->Decrypt(AsBytes(read_result.data),
+                                      read_result.data.size());
+
+            AssertInfo(plain.size() == task.plain_len,
+                       "Decrypted size mismatch: expected {}, got {}",
+                       task.plain_len,
+                       plain.size());
+            std::memcpy(
+                dest + task.output_offset, plain.data(), plain.size());
+        }
+
+        VerifyCrc32c(em.crc32, result.data.data(), em.original_size, "");
+        return result;
+    }
+
+    auto& pool = ThreadPools::GetThreadPool(priority_);
+    std::vector<std::future<void>> futures;
 
     for (const auto& slice : em.slices) {
         size_t this_output_offset = cur_output_offset;
@@ -455,6 +578,106 @@ IndexEntryReader::SubmitEntryDownloadTasks(
 }
 
 void
+IndexEntryReader::SubmitEntryDownloadAsyncTasks(
+    const std::shared_ptr<RemoteInputStream>& remote_input,
+    const EntryMeta& meta,
+    EntryDownloadState& state,
+    std::vector<EntryDownloadAsyncTask>& tasks) {
+    constexpr size_t kRangeSize = 16 * 1024 * 1024;
+
+    if (meta.encrypted) {
+        const auto& em = meta.enc;
+        size_t output_offset = 0;
+
+        for (size_t i = 0; i < em.slices.size(); i++) {
+            const auto& slice = em.slices[i];
+            size_t this_output_offset = output_offset;
+            size_t remaining = em.original_size - output_offset;
+            size_t plain_len = std::min(remaining, slice_size_);
+            output_offset += plain_len;
+
+            tasks.push_back(
+                {&state,
+                 remote_input->ReadAtAsync(MILVUS_V3_MAGIC_SIZE + slice.offset,
+                                           slice.size),
+                 static_cast<size_t>(slice.size),
+                 this_output_offset,
+                 i,
+                 true,
+                 plain_len});
+        }
+    } else {
+        const auto& pm = meta.plain;
+        size_t remaining = pm.size;
+        size_t file_offset = 0;
+        size_t src_offset = pm.offset;
+        size_t range_idx = 0;
+
+        while (remaining > 0) {
+            size_t len = std::min(remaining, kRangeSize);
+
+            tasks.push_back(
+                {&state,
+                 remote_input->ReadAtAsync(MILVUS_V3_MAGIC_SIZE + src_offset,
+                                           len),
+                 len,
+                 file_offset,
+                 range_idx,
+                 false,
+                 0});
+
+            remaining -= len;
+            file_offset += len;
+            src_offset += len;
+            range_idx++;
+        }
+    }
+}
+
+void
+IndexEntryReader::FinishEntryDownloadAsyncTasks(
+    std::vector<EntryDownloadAsyncTask>& tasks) {
+    for (auto& task : tasks) {
+        auto read_result = task.future.get();
+        AssertInfo(read_result.bytes_read == task.expected_size,
+                   task.encrypted ? "Failed to read encrypted slice"
+                                  : "Failed to read data for file");
+
+        if (task.encrypted) {
+            auto dec =
+                cipher_plugin_->GetDecryptor(ez_id_, collection_id_, edek_);
+            auto plain =
+                dec->Decrypt(AsBytes(read_result.data), read_result.data.size());
+
+            AssertInfo(plain.size() == task.plain_len,
+                       "Decrypted size mismatch: expected {}, got {}",
+                       task.plain_len,
+                       plain.size());
+            auto written = ::pwrite(task.state->fd,
+                                    plain.data(),
+                                    plain.size(),
+                                    task.file_offset);
+            AssertInfo(written == static_cast<ssize_t>(plain.size()),
+                       "Failed to pwrite");
+            task.state->range_crcs[task.range_idx] = {
+                Crc32cValue(reinterpret_cast<const uint8_t*>(plain.data()),
+                            plain.size()),
+                plain.size()};
+        } else {
+            auto written = ::pwrite(task.state->fd,
+                                    AsBytes(read_result.data),
+                                    read_result.bytes_read,
+                                    task.file_offset);
+            AssertInfo(written == static_cast<ssize_t>(read_result.bytes_read),
+                       "Failed to pwrite");
+            task.state->range_crcs[task.range_idx] = {
+                Crc32cValue(AsBytes(read_result.data), read_result.bytes_read),
+                read_result.bytes_read};
+        }
+    }
+}
+
+void
 IndexEntryReader::FinalizeEntryDownload(EntryDownloadState& state) {
     uint32_t combined_crc = 0;
     if (!state.range_crcs.empty()) {
@@ -483,11 +706,17 @@ IndexEntryReader::ReadEntryToFile(const std::string& name,
 
     auto state = PrepareEntryDownload(name, local_path, meta);
     try {
-        std::vector<std::future<void>> futures;
-        SubmitEntryDownloadTasks(meta, state, futures);
+        if (auto remote_input = GetAsyncRemoteInputStream(input_)) {
+            std::vector<EntryDownloadAsyncTask> tasks;
+            SubmitEntryDownloadAsyncTasks(remote_input, meta, state, tasks);
+            FinishEntryDownloadAsyncTasks(tasks);
+        } else {
+            std::vector<std::future<void>> futures;
+            SubmitEntryDownloadTasks(meta, state, futures);
 
-        for (auto& f : futures) {
-            f.get();
+            for (auto& f : futures) {
+                f.get();
+            }
         }
 
         FinalizeEntryDownload(state);
@@ -527,16 +756,30 @@ IndexEntryReader::ReadEntriesToFiles(
             states.push_back(PrepareEntryDownload(name, path, it->second));
         }
 
-        // Submit ALL tasks for ALL entries at once (avoids thread pool deadlock)
-        std::vector<std::future<void>> all_futures;
-        for (size_t i = 0; i < name_path_pairs.size(); i++) {
-            const auto& meta = entry_index_.at(name_path_pairs[i].first);
-            SubmitEntryDownloadTasks(meta, states[i], all_futures);
-        }
+        if (auto remote_input = GetAsyncRemoteInputStream(input_)) {
+            // Submit ALL async S3 reads first, then wait. This preserves the
+            // original batched range concurrency without using the upper fetch
+            // thread pool.
+            std::vector<EntryDownloadAsyncTask> all_tasks;
+            for (size_t i = 0; i < name_path_pairs.size(); i++) {
+                const auto& meta = entry_index_.at(name_path_pairs[i].first);
+                SubmitEntryDownloadAsyncTasks(
+                    remote_input, meta, states[i], all_tasks);
+            }
+            FinishEntryDownloadAsyncTasks(all_tasks);
+        } else {
+            // Submit ALL tasks for ALL entries at once (avoids thread pool
+            // deadlock)
+            std::vector<std::future<void>> all_futures;
+            for (size_t i = 0; i < name_path_pairs.size(); i++) {
+                const auto& meta = entry_index_.at(name_path_pairs[i].first);
+                SubmitEntryDownloadTasks(meta, states[i], all_futures);
+            }
 
-        // Wait for ALL tasks to complete
-        for (auto& f : all_futures) {
-            f.get();
+            // Wait for ALL tasks to complete
+            for (auto& f : all_futures) {
+                f.get();
+            }
         }
 
         // Verify CRCs and close all file descriptors

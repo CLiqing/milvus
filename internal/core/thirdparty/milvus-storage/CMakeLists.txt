@@ -18,6 +18,15 @@ set( milvus-storage_VERSION ddc6ec7)
 set( GIT_REPOSITORY  "https://github.com/milvus-io/milvus-storage.git")
 message(STATUS "milvus-storage repo: ${GIT_REPOSITORY}")
 message(STATUS "milvus-storage version: ${milvus-storage_VERSION}")
+if(DEFINED ENV{MILVUS_STORAGE_LOCAL_SOURCE_DIR} AND NOT "$ENV{MILVUS_STORAGE_LOCAL_SOURCE_DIR}" STREQUAL "")
+    set(MILVUS_STORAGE_USE_LOCAL_SOURCE ON)
+    set(milvus-storage_SOURCE_DIR "$ENV{MILVUS_STORAGE_LOCAL_SOURCE_DIR}")
+    set(milvus-storage_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/milvus-storage-build")
+    message(STATUS "milvus-storage local source: ${milvus-storage_SOURCE_DIR}")
+else()
+    set(MILVUS_STORAGE_USE_LOCAL_SOURCE OFF)
+    set(milvus-storage_SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/milvus-storage-src")
+endif()
 
 message(STATUS "Building milvus-storage-${milvus-storage_SOURCE_VER} from source")
 message(STATUS ${CMAKE_BUILD_TYPE})
@@ -28,24 +37,87 @@ else ()
     set(WITH_AZURE_FS OFF CACHE BOOL "" FORCE )
 endif ()
 
-set( CMAKE_PREFIX_PATH ${CONAN_BOOST_ROOT} )
-FetchContent_Declare(
-        milvus-storage
-        GIT_REPOSITORY  ${GIT_REPOSITORY}
-        GIT_TAG         ${milvus-storage_VERSION}
-        SOURCE_DIR      ${CMAKE_CURRENT_BINARY_DIR}/milvus-storage-src
-        BINARY_DIR      ${CMAKE_CURRENT_BINARY_DIR}/milvus-storage-build
-        SOURCE_SUBDIR   cpp
-        DOWNLOAD_DIR    ${THIRDPARTY_DOWNLOAD_PATH} )
+# Disable benchmark for milvus-storage (we don't need it and it may have missing deps)
+set(WITH_BENCHMARK OFF CACHE BOOL "" FORCE)
 
-FetchContent_GetProperties( milvus-storage )
-if ( NOT milvus-storage_POPULATED )
-    FetchContent_Populate( milvus-storage )
+# This S3 async read-path demo only exercises AWS/S3-compatible storage.
+# Keep GCP's google-cloud-cpp/gRPC stack out of the C++ shared objects so the
+# local Milvus process does not load a second static gRPC runtime beside Go.
+set(WITH_GCP_FS OFF CACHE BOOL "" FORCE)
 
-    # Adding the following target:
-    # milvus-storage
+set( CMAKE_PREFIX_PATH ${CONAN_BOOST_ROOT} ${CONAN_PROTOBUF_ROOT} )
+
+# Make Conan's protoc visible to milvus-storage's find_package(Protobuf)
+find_program(_PROTOC_PROGRAM protoc
+    PATHS ${CONAN_BIN_DIRS_PROTOBUF} ${CONAN_BIN_DIRS}
+          "${CMAKE_BINARY_DIR}/bin"
+    NO_DEFAULT_PATH)
+if(NOT _PROTOC_PROGRAM)
+    file(GLOB _PROTOC_CANDIDATES
+        "${CONAN_BIN_DIRS_PROTOBUF}/protoc-*"
+        "${CMAKE_BINARY_DIR}/bin/protoc-*")
+    if(_PROTOC_CANDIDATES)
+        list(SORT _PROTOC_CANDIDATES)
+        list(GET _PROTOC_CANDIDATES -1 _PROTOC_PROGRAM)
+    endif()
+endif()
+if(_PROTOC_PROGRAM)
+    message(STATUS "Setting Protobuf_PROTOC_EXECUTABLE for milvus-storage: ${_PROTOC_PROGRAM}")
+    set(Protobuf_PROTOC_EXECUTABLE "${_PROTOC_PROGRAM}" CACHE FILEPATH "" FORCE)
+endif()
+if (MILVUS_STORAGE_USE_LOCAL_SOURCE)
     add_subdirectory( ${milvus-storage_SOURCE_DIR}/cpp
                       ${milvus-storage_BINARY_DIR} )
+else()
+    FetchContent_Declare(
+            milvus-storage
+            GIT_REPOSITORY  ${GIT_REPOSITORY}
+            GIT_TAG         ${milvus-storage_VERSION}
+            SOURCE_DIR      ${milvus-storage_SOURCE_DIR}
+            BINARY_DIR      ${CMAKE_CURRENT_BINARY_DIR}/milvus-storage-build
+            SOURCE_SUBDIR   cpp
+            DOWNLOAD_DIR    ${THIRDPARTY_DOWNLOAD_PATH} )
+
+    FetchContent_GetProperties( milvus-storage )
+    if ( NOT milvus-storage_POPULATED )
+        FetchContent_Populate( milvus-storage )
+
+        # Adding the following target:
+        # milvus-storage
+        add_subdirectory( ${milvus-storage_SOURCE_DIR}/cpp
+                          ${milvus-storage_BINARY_DIR} )
+    endif()
+endif()
+
+if (TARGET milvus-storage)
+    # Enable S3 filesystem support on all platforms
+    target_compile_definitions(milvus-storage PRIVATE MILVUS_S3_FS)
+
+    # milvus-storage uses Aws::S3::S3Client and Aws::S3::Model::* directly but only
+    # links AWS::aws-sdk-cpp-identity-management in its own CMakeLists.txt. The S3
+    # symbols happen to resolve through Arrow's transitive dependency on aws-sdk-cpp-s3,
+    # but this is fragile (depends on Arrow package config). Explicitly link the S3
+    # component so the symbols are always resolved in libmilvus-storage.so.
+    # Conan's cmake_find_package generator creates FindAWSSDK.cmake but it must be
+    # explicitly loaded to create the AWS::* targets.
+    find_package(AWSSDK REQUIRED)
+    if(TARGET AWS::aws-sdk-cpp-s3)
+        target_link_libraries(milvus-storage PUBLIC AWS::aws-sdk-cpp-s3)
+    elseif(TARGET AWS::s3)
+        target_link_libraries(milvus-storage PUBLIC AWS::s3)
+    else()
+        message(WARNING "Neither AWS::aws-sdk-cpp-s3 nor AWS::s3 target found after find_package(AWSSDK)")
+    endif()
+
+    # On macOS, aws-c-io uses Apple's Network.framework for socket operations
+    if(APPLE)
+        target_link_libraries(milvus-storage PUBLIC "-framework Network")
+    endif()
 endif()
 
 set( MILVUS_STORAGE_INCLUDE_DIR ${milvus-storage_SOURCE_DIR}/cpp/include CACHE INTERNAL "Path to milvus-storage include directory" )
+
+# Add the milvus-storage include directory to the target's interface include directories
+# This ensures that consumers of milvus-storage can find <arrow/c/abi.h> which is bundled
+# inside the milvus-storage include directory
+target_include_directories(milvus-storage PUBLIC ${MILVUS_STORAGE_INCLUDE_DIR})

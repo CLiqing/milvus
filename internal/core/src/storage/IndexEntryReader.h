@@ -28,10 +28,13 @@
 #include "filemanager/InputStream.h"
 #include "nlohmann/json.hpp"
 #include "storage/IndexEntryWriter.h"
+#include "storage/RemoteAsyncReadResult.h"
 #include "storage/ThreadPools.h"
 #include "storage/plugin/PluginInterface.h"
 
 namespace milvus::storage {
+
+class RemoteInputStream;
 
 struct Entry {
     std::vector<uint8_t> data;
@@ -133,6 +136,16 @@ class IndexEntryReader {
         std::vector<RangeCrc> range_crcs;
     };
 
+    struct EntryDownloadAsyncTask {
+        EntryDownloadState* state;
+        std::future<RemoteAsyncReadResult> future;
+        size_t expected_size;
+        size_t file_offset;
+        size_t range_idx;
+        bool encrypted;
+        size_t plain_len;
+    };
+
     // Prepare download state for an entry (open file, allocate CRC vector)
     EntryDownloadState
     PrepareEntryDownload(const std::string& name,
@@ -144,6 +157,16 @@ class IndexEntryReader {
     SubmitEntryDownloadTasks(const EntryMeta& meta,
                              EntryDownloadState& state,
                              std::vector<std::future<void>>& futures);
+
+    void
+    SubmitEntryDownloadAsyncTasks(
+        const std::shared_ptr<RemoteInputStream>& remote_input,
+        const EntryMeta& meta,
+        EntryDownloadState& state,
+        std::vector<EntryDownloadAsyncTask>& tasks);
+
+    void
+    FinishEntryDownloadAsyncTasks(std::vector<EntryDownloadAsyncTask>& tasks);
 
     // Verify CRC and close file descriptor
     void

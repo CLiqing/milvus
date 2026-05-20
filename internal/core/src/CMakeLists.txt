@@ -72,6 +72,29 @@ add_library(milvus_core SHARED
     $<TARGET_OBJECTS:milvus_rescores>
 )
 
+set(MILVUS_CORE_CONAN_LIBS ${CONAN_LIBS})
+if(NOT ENABLE_GCP_NATIVE)
+    list(FILTER MILVUS_CORE_CONAN_LIBS EXCLUDE REGEX "^google_.*")
+    list(FILTER MILVUS_CORE_CONAN_LIBS EXCLUDE REGEX "^google_cloud_cpp.*")
+endif()
+
+list(FILTER MILVUS_CORE_CONAN_LIBS EXCLUDE REGEX "^opentelemetry_exporter_otlp_grpc.*")
+list(FILTER MILVUS_CORE_CONAN_LIBS EXCLUDE REGEX "^opentelemetry_proto_grpc$")
+list(REMOVE_ITEM MILVUS_CORE_CONAN_LIBS
+    grpc++_alts
+    grpc++_error_details
+    grpc++_reflection
+    grpc++_unsecure
+    grpc_unsecure
+    grpc_authorization_provider
+    grpc_plugin_support
+    grpcpp_channelz
+    grpc++
+    grpc
+    address_sorting
+    gpr
+)
+
 set(LINK_TARGETS
     boost_bitset_ext
     simdjson
@@ -81,7 +104,7 @@ set(LINK_TARGETS
     milvus-common
     bsoncxx
     ${OpenMP_CXX_FLAGS}
-    ${CONAN_LIBS}
+    ${MILVUS_CORE_CONAN_LIBS}
     )
 
 if(USE_OPENDAL)
