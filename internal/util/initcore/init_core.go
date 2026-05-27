@@ -25,6 +25,7 @@ package initcore
 #include "segcore/segcore_init_c.h"
 #include "storage/storage_c.h"
 #include "segcore/arrow_fs_c.h"
+#include "exec/expression/function/init_c.h"
 */
 import "C"
 
@@ -32,7 +33,9 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -48,6 +51,27 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
+
+func isEnvEnabledForS3AsyncReadPath(name string) bool {
+	value := os.Getenv(name)
+	if value == "" {
+		return false
+	}
+	switch strings.ToLower(value) {
+	case "1", "true", "on", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldSkipKnowhereFetchThreadPoolInit() bool {
+	return isEnvEnabledForS3AsyncReadPath("MILVUS_S3_GETOBJECT_ASYNC")
+}
+
+func InitExecExpressionFunctionFactory() {
+	C.InitExecExpressionFunctionFactory()
+}
 
 func InitLocalChunkManager(path string) {
 	CLocalRootPath := C.CString(path)
@@ -521,6 +545,10 @@ func SetupCoreConfigChangelCallback() {
 		})
 
 		paramtable.Get().QueryNodeCfg.KnowhereFetchThreadPoolSize.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			if shouldSkipKnowhereFetchThreadPoolInit() {
+				log.Info("Skip UpdateKnowhereFetchThreadPoolSize for async S3 read path")
+				return nil
+			}
 			factor, err := strconv.ParseFloat(newValue, 64)
 			if err != nil {
 				return err

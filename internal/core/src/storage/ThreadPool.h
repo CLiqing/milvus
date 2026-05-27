@@ -16,6 +16,13 @@
 
 #pragma once
 
+#include <stddef.h>
+#include <stdint.h>
+#include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <condition_variable>
+#include <cmath>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -24,7 +31,6 @@
 #include <thread>
 #include <vector>
 #include <utility>
-#include <cassert>
 
 #include <prometheus/counter.h>
 #include <prometheus/gauge.h>
@@ -48,6 +54,17 @@ extern std::atomic<float> LOW_PRIORITY_THREAD_CORE_COEFFICIENT;
 
 extern int CPU_NUM;
 extern std::atomic<int> THREAD_POOL_MAX_THREADS_SIZE;
+
+inline int
+GetDefaultThreadPoolMaxSize(float thread_core_coefficient) {
+    auto max_size = std::max(
+        1,
+        static_cast<int>(std::round(CPU_NUM * thread_core_coefficient)));
+    // Only IO pool will set large limit, but the CPU helps nothing to IO
+    // operations. According to the benchmark, 16 threads is enough to saturate
+    // the network bandwidth.
+    return std::min(max_size, 16);
+}
 
 void
 SetHighPriorityThreadCoreCoefficient(const float coefficient);

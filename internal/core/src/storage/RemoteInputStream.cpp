@@ -1,11 +1,14 @@
 #include <unistd.h>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -36,11 +39,213 @@ IsEnvEnabled(const char* name) {
     return text == "1" || text == "true" || text == "on" || text == "yes";
 }
 
+uint64_t
+GetUnsignedEnv(const char* name, uint64_t default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return default_value;
+    }
+    try {
+        size_t parsed = 0;
+        auto result = std::stoull(value, &parsed, 10);
+        return parsed == std::string(value).size() ? result : default_value;
+    } catch (...) {
+        return default_value;
+    }
+}
+
+uint64_t
+NowMicros() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+void
+UpdateMax(std::atomic<uint64_t>& target, uint64_t value) {
+    auto current = target.load(std::memory_order_relaxed);
+    while (current < value &&
+           !target.compare_exchange_weak(current,
+                                         value,
+                                         std::memory_order_relaxed,
+                                         std::memory_order_relaxed)) {
+    }
+}
+
+struct AsyncReadStats {
+    std::atomic<uint64_t> configured{0};
+    std::atomic<uint64_t> submitted{0};
+    std::atomic<uint64_t> started{0};
+    std::atomic<uint64_t> queued{0};
+    std::atomic<uint64_t> completed{0};
+    std::atomic<uint64_t> failed{0};
+    std::atomic<uint64_t> requested_bytes{0};
+    std::atomic<uint64_t> completed_bytes{0};
+    std::atomic<uint64_t> max_pending{0};
+    std::atomic<uint64_t> max_inflight_observed{0};
+    std::atomic<uint64_t> last_max_inflight{0};
+    std::atomic<uint64_t> last_reported_done{0};
+    std::atomic<uint64_t> window_last_us{0};
+    std::atomic<uint64_t> window_last_submitted{0};
+    std::atomic<uint64_t> window_last_started{0};
+    std::atomic<uint64_t> window_last_completed{0};
+    std::atomic<uint64_t> window_last_failed{0};
+    std::atomic<uint64_t> window_last_requested_bytes{0};
+    std::atomic<uint64_t> window_last_completed_bytes{0};
+
+    ~AsyncReadStats() {
+        if (!IsEnvEnabled("MILVUS_S3_ASYNC_STATS")) {
+            return;
+        }
+        Print("process_exit");
+    }
+
+    void
+    Print(const char* reason) const {
+        std::cerr << "[MILVUS_S3_ASYNC_STATS]"
+                  << " reason=" << reason
+                  << " configured="
+                  << configured.load(std::memory_order_relaxed)
+                  << " submitted=" << submitted.load(std::memory_order_relaxed)
+                  << " started=" << started.load(std::memory_order_relaxed)
+                  << " queued=" << queued.load(std::memory_order_relaxed)
+                  << " completed="
+                  << completed.load(std::memory_order_relaxed)
+                  << " failed=" << failed.load(std::memory_order_relaxed)
+                  << " requested_bytes="
+                  << requested_bytes.load(std::memory_order_relaxed)
+                  << " completed_bytes="
+                  << completed_bytes.load(std::memory_order_relaxed)
+                  << " max_pending="
+                  << max_pending.load(std::memory_order_relaxed)
+                  << " max_inflight_observed="
+                  << max_inflight_observed.load(std::memory_order_relaxed)
+                  << " last_max_inflight="
+                  << last_max_inflight.load(std::memory_order_relaxed)
+                  << std::endl;
+    }
+
+    void
+    MaybePrintWindow(const char* reason) {
+        if (!IsEnvEnabled("MILVUS_READ_PATH_WINDOW_STATS")) {
+            return;
+        }
+        const auto now_us = NowMicros();
+        const auto interval_us =
+            std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_READ_PATH_WINDOW_MS", 250)) *
+            1000;
+        auto last_us = window_last_us.load(std::memory_order_relaxed);
+        if (last_us == 0) {
+            window_last_us.compare_exchange_strong(last_us,
+                                                   now_us,
+                                                   std::memory_order_relaxed,
+                                                   std::memory_order_relaxed);
+            return;
+        }
+        if (now_us <= last_us || now_us - last_us < interval_us) {
+            return;
+        }
+        if (!window_last_us.compare_exchange_strong(last_us,
+                                                    now_us,
+                                                    std::memory_order_relaxed,
+                                                    std::memory_order_relaxed)) {
+            return;
+        }
+
+        const auto submitted_now = submitted.load(std::memory_order_relaxed);
+        const auto started_now = started.load(std::memory_order_relaxed);
+        const auto completed_now = completed.load(std::memory_order_relaxed);
+        const auto failed_now = failed.load(std::memory_order_relaxed);
+        const auto requested_bytes_now =
+            requested_bytes.load(std::memory_order_relaxed);
+        const auto completed_bytes_now =
+            completed_bytes.load(std::memory_order_relaxed);
+        const auto submitted_prev =
+            window_last_submitted.exchange(submitted_now, std::memory_order_relaxed);
+        const auto started_prev =
+            window_last_started.exchange(started_now, std::memory_order_relaxed);
+        const auto completed_prev =
+            window_last_completed.exchange(completed_now, std::memory_order_relaxed);
+        const auto failed_prev =
+            window_last_failed.exchange(failed_now, std::memory_order_relaxed);
+        const auto requested_bytes_prev =
+            window_last_requested_bytes.exchange(requested_bytes_now,
+                                                 std::memory_order_relaxed);
+        const auto completed_bytes_prev =
+            window_last_completed_bytes.exchange(completed_bytes_now,
+                                                 std::memory_order_relaxed);
+        const auto active_now =
+            started_now >= completed_now + failed_now
+                ? started_now - completed_now - failed_now
+                : 0;
+
+        std::cerr << "[MILVUS_READ_PATH_WINDOW]"
+                  << " layer=remote_input"
+                  << " reason=" << reason
+                  << " ts_us=" << now_us
+                  << " delta_us=" << (now_us - last_us)
+                  << " active=" << active_now
+                  << " submitted_total=" << submitted_now
+                  << " started_total=" << started_now
+                  << " completed_total=" << completed_now
+                  << " failed_total=" << failed_now
+                  << " requested_bytes_total=" << requested_bytes_now
+                  << " completed_bytes_total=" << completed_bytes_now
+                  << " submitted_delta=" << (submitted_now - submitted_prev)
+                  << " started_delta=" << (started_now - started_prev)
+                  << " completed_delta=" << (completed_now - completed_prev)
+                  << " failed_delta=" << (failed_now - failed_prev)
+                  << " requested_bytes_delta="
+                  << (requested_bytes_now - requested_bytes_prev)
+                  << " completed_bytes_delta="
+                  << (completed_bytes_now - completed_bytes_prev)
+                  << " max_pending=" << max_pending.load(std::memory_order_relaxed)
+                  << " max_inflight_observed="
+                  << max_inflight_observed.load(std::memory_order_relaxed)
+                  << " last_max_inflight="
+                  << last_max_inflight.load(std::memory_order_relaxed)
+                  << std::endl;
+    }
+};
+
+AsyncReadStats&
+GetAsyncReadStats() {
+    static AsyncReadStats stats;
+    return stats;
+}
+
+void
+MaybeReportAsyncReadStats() {
+    if (!IsEnvEnabled("MILVUS_S3_ASYNC_STATS")) {
+        return;
+    }
+    auto& stats = GetAsyncReadStats();
+    const auto submitted = stats.submitted.load(std::memory_order_relaxed);
+    const auto done = stats.completed.load(std::memory_order_relaxed) +
+                      stats.failed.load(std::memory_order_relaxed);
+    if (submitted == 0 || done != submitted) {
+        return;
+    }
+    auto last = stats.last_reported_done.load(std::memory_order_relaxed);
+    while (last < done &&
+           !stats.last_reported_done.compare_exchange_weak(
+               last,
+               done,
+               std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+    if (last < done) {
+        stats.Print("all_submitted_done");
+    }
+}
+
 }  // namespace
 
 RemoteInputStream::RemoteInputStream(
     std::shared_ptr<arrow::io::RandomAccessFile>&& remote_file)
-    : remote_file_(std::move(remote_file)) {
+    : remote_file_(std::move(remote_file)),
+      async_read_at_limiter_id_(0) {
     auto status = remote_file_->GetSize();
     AssertInfo(status.ok(), "Failed to get size of remote file");
     file_size_ = static_cast<size_t>(status.ValueOrDie());
@@ -67,14 +272,100 @@ RemoteInputStream::SupportsAsyncReadAt() const {
 
 std::future<RemoteAsyncReadResult>
 RemoteInputStream::ReadAtAsync(size_t offset, size_t size) {
+    auto& stats = GetAsyncReadStats();
+    stats.submitted.fetch_add(1, std::memory_order_relaxed);
+    stats.requested_bytes.fetch_add(size, std::memory_order_relaxed);
+    stats.MaybePrintWindow("submit");
+
     auto promise = std::make_shared<std::promise<RemoteAsyncReadResult>>();
     auto future = promise->get_future();
+    PendingAsyncRead request{
+        remote_file_, offset, size, promise, async_read_at_limiter_id_};
+    bool start_now = false;
+    auto& limiter = GetAsyncReadLimiter(request.limiter_id);
+    {
+        std::lock_guard<std::mutex> lock(limiter.mutex);
+        if (limiter.inflight < limiter.max_inflight) {
+            limiter.inflight++;
+            UpdateMax(stats.max_inflight_observed, limiter.inflight);
+            start_now = true;
+        } else {
+            limiter.pending.push_back(std::move(request));
+            stats.queued.fetch_add(1, std::memory_order_relaxed);
+            UpdateMax(stats.max_pending, limiter.pending.size());
+        }
+    }
+
+    if (start_now) {
+        StartAsyncRead(std::move(request));
+    }
+    return future;
+}
+
+void
+RemoteInputStream::ConfigureAsyncReadAtLimiter(size_t limiter_id,
+                                               size_t max_inflight) {
+    if (max_inflight == 0) {
+        max_inflight = 1;
+    }
+    auto& stats = GetAsyncReadStats();
+    stats.configured.fetch_add(1, std::memory_order_relaxed);
+    stats.last_max_inflight.store(max_inflight, std::memory_order_relaxed);
+    async_read_at_limiter_id_ = limiter_id;
+
+    std::vector<PendingAsyncRead> ready;
+    auto& limiter = GetAsyncReadLimiter(limiter_id);
+    {
+        std::lock_guard<std::mutex> lock(limiter.mutex);
+        limiter.max_inflight = max_inflight;
+        while (!limiter.pending.empty() &&
+               limiter.inflight < limiter.max_inflight) {
+            ready.push_back(std::move(limiter.pending.front()));
+            limiter.pending.pop_front();
+            limiter.inflight++;
+            UpdateMax(stats.max_inflight_observed, limiter.inflight);
+        }
+    }
+
+    for (auto& request : ready) {
+        StartAsyncRead(std::move(request));
+    }
+}
+
+size_t
+RemoteInputStream::GetAsyncReadAtMaxInflight() const {
+    const auto& limiter = GetAsyncReadLimiter(async_read_at_limiter_id_);
+    std::lock_guard<std::mutex> lock(limiter.mutex);
+    return limiter.max_inflight;
+}
+
+size_t
+RemoteInputStream::GetAsyncReadAtCurrentInflight() const {
+    const auto& limiter = GetAsyncReadLimiter(async_read_at_limiter_id_);
+    std::lock_guard<std::mutex> lock(limiter.mutex);
+    return limiter.inflight;
+}
+
+RemoteInputStream::AsyncReadLimiter&
+RemoteInputStream::GetAsyncReadLimiter(size_t limiter_id) {
+    static std::array<AsyncReadLimiter, 4> limiters;
+    if (limiter_id >= limiters.size()) {
+        limiter_id = 0;
+    }
+    return limiters[limiter_id];
+}
+
+void
+RemoteInputStream::StartAsyncRead(PendingAsyncRead request) {
+    GetAsyncReadStats().started.fetch_add(1, std::memory_order_relaxed);
+    GetAsyncReadStats().MaybePrintWindow("start");
     try {
         auto arrow_future =
-            remote_file_->ReadAsync(static_cast<int64_t>(offset),
-                                    static_cast<int64_t>(size));
+            request.remote_file->ReadAsync(static_cast<int64_t>(request.offset),
+                                           static_cast<int64_t>(request.size));
         arrow_future.AddCallback(
-            [promise](const arrow::Result<std::shared_ptr<arrow::Buffer>>& result) {
+            [promise = request.promise, limiter_id = request.limiter_id](
+                const arrow::Result<std::shared_ptr<arrow::Buffer>>& result) {
                 try {
                     if (!result.ok()) {
                         throw std::runtime_error(result.status().ToString());
@@ -83,6 +374,11 @@ RemoteInputStream::ReadAtAsync(size_t offset, size_t size) {
                     RemoteAsyncReadResult async_result;
                     async_result.bytes_read =
                         buffer ? static_cast<size_t>(buffer->size()) : 0;
+                    GetAsyncReadStats().completed.fetch_add(
+                        1, std::memory_order_relaxed);
+                    GetAsyncReadStats().completed_bytes.fetch_add(
+                        async_result.bytes_read, std::memory_order_relaxed);
+                    GetAsyncReadStats().MaybePrintWindow("complete");
                     async_result.data.resize(async_result.bytes_read);
                     if (async_result.bytes_read > 0) {
                         std::memcpy(async_result.data.data(),
@@ -91,13 +387,47 @@ RemoteInputStream::ReadAtAsync(size_t offset, size_t size) {
                     }
                     promise->set_value(std::move(async_result));
                 } catch (...) {
+                    GetAsyncReadStats().failed.fetch_add(
+                        1, std::memory_order_relaxed);
+                    GetAsyncReadStats().MaybePrintWindow("fail");
                     promise->set_exception(std::current_exception());
                 }
+                FinishAsyncReadAndStartNext(limiter_id);
+                MaybeReportAsyncReadStats();
             });
     } catch (...) {
-        promise->set_exception(std::current_exception());
+        GetAsyncReadStats().failed.fetch_add(1, std::memory_order_relaxed);
+        GetAsyncReadStats().MaybePrintWindow("fail_start");
+        request.promise->set_exception(std::current_exception());
+        FinishAsyncReadAndStartNext(request.limiter_id);
+        MaybeReportAsyncReadStats();
     }
-    return future;
+}
+
+void
+RemoteInputStream::FinishAsyncReadAndStartNext(size_t limiter_id) {
+    PendingAsyncRead next;
+    bool has_next = false;
+    auto& limiter = GetAsyncReadLimiter(limiter_id);
+    {
+        std::lock_guard<std::mutex> lock(limiter.mutex);
+        AssertInfo(limiter.inflight > 0,
+                   "Invalid async read in-flight count");
+        limiter.inflight--;
+        if (!limiter.pending.empty() &&
+            limiter.inflight < limiter.max_inflight) {
+            next = std::move(limiter.pending.front());
+            limiter.pending.pop_front();
+            limiter.inflight++;
+            UpdateMax(GetAsyncReadStats().max_inflight_observed,
+                      limiter.inflight);
+            has_next = true;
+        }
+    }
+
+    if (has_next) {
+        StartAsyncRead(std::move(next));
+    }
 }
 
 size_t

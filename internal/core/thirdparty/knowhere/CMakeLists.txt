@@ -52,6 +52,55 @@ FetchContent_GetProperties( knowhere )
 if ( NOT knowhere_POPULATED )
     FetchContent_Populate( knowhere )
 
+    if ( INDEX_ENGINE STREQUAL "cardinal" )
+        set( KNOWHERE_CARDINAL_V2_CMAKE_DIR ${knowhere_SOURCE_DIR}/cmake/libs/cardinal/v2 )
+
+        execute_process(
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        ${CMAKE_CURRENT_SOURCE_DIR}/cardinal_async_input_stream.h
+                        ${KNOWHERE_CARDINAL_V2_CMAKE_DIR}/cardinal_async_input_stream.h
+                RESULT_VARIABLE CARDINAL_ASYNC_HEADER_COPY_RESULT )
+        if ( NOT CARDINAL_ASYNC_HEADER_COPY_RESULT EQUAL 0 )
+            message( FATAL_ERROR "Failed to stage Cardinal async_input_stream.h" )
+        endif()
+
+        execute_process(
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        ${CMAKE_CURRENT_SOURCE_DIR}/cardinal_async_no_fetch_pool.patch
+                        ${KNOWHERE_CARDINAL_V2_CMAKE_DIR}/cardinal_async_no_fetch_pool.patch
+                RESULT_VARIABLE CARDINAL_ASYNC_PATCH_COPY_RESULT )
+        if ( NOT CARDINAL_ASYNC_PATCH_COPY_RESULT EQUAL 0 )
+            message( FATAL_ERROR "Failed to stage Cardinal async no-fetch-pool patch" )
+        endif()
+
+        set( CARDINAL_ASYNC_PATCH_HOOK ${CMAKE_CURRENT_SOURCE_DIR}/cardinal_async_patch_hook.patch )
+        execute_process(
+                COMMAND git apply --check ${CARDINAL_ASYNC_PATCH_HOOK}
+                WORKING_DIRECTORY ${knowhere_SOURCE_DIR}
+                RESULT_VARIABLE CARDINAL_ASYNC_PATCH_HOOK_CHECK_RESULT
+                OUTPUT_QUIET
+                ERROR_QUIET )
+        if ( CARDINAL_ASYNC_PATCH_HOOK_CHECK_RESULT EQUAL 0 )
+            execute_process(
+                    COMMAND git apply ${CARDINAL_ASYNC_PATCH_HOOK}
+                    WORKING_DIRECTORY ${knowhere_SOURCE_DIR}
+                    RESULT_VARIABLE CARDINAL_ASYNC_PATCH_HOOK_APPLY_RESULT )
+            if ( NOT CARDINAL_ASYNC_PATCH_HOOK_APPLY_RESULT EQUAL 0 )
+                message( FATAL_ERROR "Failed to apply Knowhere Cardinal async patch hook" )
+            endif()
+        else()
+            execute_process(
+                    COMMAND git apply --reverse --check ${CARDINAL_ASYNC_PATCH_HOOK}
+                    WORKING_DIRECTORY ${knowhere_SOURCE_DIR}
+                    RESULT_VARIABLE CARDINAL_ASYNC_PATCH_HOOK_REVERSE_CHECK_RESULT
+                    OUTPUT_QUIET
+                    ERROR_QUIET )
+            if ( NOT CARDINAL_ASYNC_PATCH_HOOK_REVERSE_CHECK_RESULT EQUAL 0 )
+                message( FATAL_ERROR "Knowhere Cardinal async patch hook is neither applicable nor already applied" )
+            endif()
+        endif()
+    endif()
+
     # Adding the following target:
     # knowhere
     add_subdirectory( ${knowhere_SOURCE_DIR}

@@ -81,6 +81,32 @@ else()
     FetchContent_GetProperties( milvus-storage )
     if ( NOT milvus-storage_POPULATED )
         FetchContent_Populate( milvus-storage )
+        set( MILVUS_STORAGE_S3_ASYNC_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/s3_async_read_path.patch )
+        execute_process(
+                COMMAND git apply --check ${MILVUS_STORAGE_S3_ASYNC_PATCH}
+                WORKING_DIRECTORY ${milvus-storage_SOURCE_DIR}
+                RESULT_VARIABLE MILVUS_STORAGE_S3_ASYNC_PATCH_CHECK_RESULT
+                OUTPUT_QUIET
+                ERROR_QUIET )
+        if ( MILVUS_STORAGE_S3_ASYNC_PATCH_CHECK_RESULT EQUAL 0 )
+            execute_process(
+                    COMMAND git apply ${MILVUS_STORAGE_S3_ASYNC_PATCH}
+                    WORKING_DIRECTORY ${milvus-storage_SOURCE_DIR}
+                    RESULT_VARIABLE MILVUS_STORAGE_S3_ASYNC_PATCH_APPLY_RESULT )
+            if ( NOT MILVUS_STORAGE_S3_ASYNC_PATCH_APPLY_RESULT EQUAL 0 )
+                message( FATAL_ERROR "Failed to apply milvus-storage S3 async read-path patch" )
+            endif()
+        else()
+            execute_process(
+                    COMMAND git apply --reverse --check ${MILVUS_STORAGE_S3_ASYNC_PATCH}
+                    WORKING_DIRECTORY ${milvus-storage_SOURCE_DIR}
+                    RESULT_VARIABLE MILVUS_STORAGE_S3_ASYNC_PATCH_REVERSE_CHECK_RESULT
+                    OUTPUT_QUIET
+                    ERROR_QUIET )
+            if ( NOT MILVUS_STORAGE_S3_ASYNC_PATCH_REVERSE_CHECK_RESULT EQUAL 0 )
+                message( FATAL_ERROR "milvus-storage S3 async read-path patch is neither applicable nor already applied" )
+            endif()
+        endif()
 
         # Adding the following target:
         # milvus-storage
@@ -107,6 +133,13 @@ if (TARGET milvus-storage)
         target_link_libraries(milvus-storage PUBLIC AWS::s3)
     else()
         message(WARNING "Neither AWS::aws-sdk-cpp-s3 nor AWS::s3 target found after find_package(AWSSDK)")
+    endif()
+    if(TARGET AWS::aws-sdk-cpp-s3-crt)
+        target_link_libraries(milvus-storage PUBLIC AWS::aws-sdk-cpp-s3-crt)
+    elseif(TARGET AWS::s3-crt)
+        target_link_libraries(milvus-storage PUBLIC AWS::s3-crt)
+    else()
+        message(WARNING "Neither AWS::aws-sdk-cpp-s3-crt nor AWS::s3-crt target found after find_package(AWSSDK)")
     endif()
 
     # On macOS, aws-c-io uses Apple's Network.framework for socket operations

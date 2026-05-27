@@ -69,6 +69,33 @@ GetAsyncRemoteInputStream(const std::shared_ptr<milvus::InputStream>& input) {
     return remote_input;
 }
 
+size_t
+OriginalFetchPoolMaxInflight(ThreadPoolPriority priority) {
+    float coefficient = LOW_PRIORITY_THREAD_CORE_COEFFICIENT.load();
+    switch (priority) {
+        case ThreadPoolPriority::HIGH:
+            coefficient = HIGH_PRIORITY_THREAD_CORE_COEFFICIENT.load();
+            break;
+        case ThreadPoolPriority::MIDDLE:
+            coefficient = MIDDLE_PRIORITY_THREAD_CORE_COEFFICIENT.load();
+            break;
+        case ThreadPoolPriority::LOW:
+            coefficient = LOW_PRIORITY_THREAD_CORE_COEFFICIENT.load();
+            break;
+    }
+
+    return static_cast<size_t>(GetDefaultThreadPoolMaxSize(coefficient));
+}
+
+void
+ConfigureAsyncReadAtConcurrency(
+    const std::shared_ptr<RemoteInputStream>& remote_input,
+    ThreadPoolPriority priority) {
+    remote_input->ConfigureAsyncReadAtLimiter(
+        static_cast<size_t>(priority),
+        OriginalFetchPoolMaxInflight(priority));
+}
+
 }  // namespace
 
 std::unique_ptr<IndexEntryReader>
@@ -281,6 +308,7 @@ IndexEntryReader::ReadPlainEntry(const EntryMeta& meta) {
     size_t offset = 0;
 
     if (auto remote_input = GetAsyncRemoteInputStream(input_)) {
+        ConfigureAsyncReadAtConcurrency(remote_input, priority_);
         if (pm.size <= kRangeSize) {
             auto future = remote_input->ReadAtAsync(
                 MILVUS_V3_MAGIC_SIZE + pm.offset, pm.size);
@@ -369,6 +397,7 @@ IndexEntryReader::ReadEncryptedEntry(const EntryMeta& meta) {
     size_t cur_output_offset = 0;
 
     if (auto remote_input = GetAsyncRemoteInputStream(input_)) {
+        ConfigureAsyncReadAtConcurrency(remote_input, priority_);
         struct SliceTask {
             size_t output_offset;
             size_t plain_len;
@@ -707,6 +736,7 @@ IndexEntryReader::ReadEntryToFile(const std::string& name,
     auto state = PrepareEntryDownload(name, local_path, meta);
     try {
         if (auto remote_input = GetAsyncRemoteInputStream(input_)) {
+            ConfigureAsyncReadAtConcurrency(remote_input, priority_);
             std::vector<EntryDownloadAsyncTask> tasks;
             SubmitEntryDownloadAsyncTasks(remote_input, meta, state, tasks);
             FinishEntryDownloadAsyncTasks(tasks);
@@ -757,9 +787,9 @@ IndexEntryReader::ReadEntriesToFiles(
         }
 
         if (auto remote_input = GetAsyncRemoteInputStream(input_)) {
-            // Submit ALL async S3 reads first, then wait. This preserves the
-            // original batched range concurrency without using the upper fetch
-            // thread pool.
+            ConfigureAsyncReadAtConcurrency(remote_input, priority_);
+            // Submit all logical async reads first, then wait. RemoteInputStream
+            // starts at most the original fetch/read pool size concurrently.
             std::vector<EntryDownloadAsyncTask> all_tasks;
             for (size_t i = 0; i < name_path_pairs.size(); i++) {
                 const auto& meta = entry_index_.at(name_path_pairs[i].first);

@@ -1,0 +1,50 @@
+diff --git a/cmake/libs/cardinal/v2/CMakeLists.txt b/cmake/libs/cardinal/v2/CMakeLists.txt
+index 2082af2d..3d31cbb4 100644
+--- a/cmake/libs/cardinal/v2/CMakeLists.txt
++++ b/cmake/libs/cardinal/v2/CMakeLists.txt
+@@ -74,4 +74,45 @@ if(CARDINAL_VERSION_FORCE_CHECKOUT)
+     endif()
+ endif()
+
++set(CARDINAL_ASYNC_HEADER ${CMAKE_CURRENT_LIST_DIR}/cardinal_async_input_stream.h)
++set(CARDINAL_ASYNC_PATCH ${CMAKE_CURRENT_LIST_DIR}/cardinal_async_no_fetch_pool.patch)
++if(EXISTS ${CARDINAL_ASYNC_HEADER} AND EXISTS ${CARDINAL_ASYNC_PATCH})
++    execute_process(
++            COMMAND ${CMAKE_COMMAND} -E copy_if_different
++                    ${CARDINAL_ASYNC_HEADER}
++                    ${CARDINAL_ROOT}/cardinal/storage/async_input_stream.h
++            RESULT_VARIABLE CARDINAL_ASYNC_HEADER_COPY_RESULT)
++    if (NOT CARDINAL_ASYNC_HEADER_COPY_RESULT EQUAL 0)
++        message(FATAL_ERROR "Failed to install Cardinal async_input_stream.h")
++    endif()
++
++    execute_process(
++            COMMAND git apply --check ${CARDINAL_ASYNC_PATCH}
++            WORKING_DIRECTORY ${CARDINAL_ROOT}
++            RESULT_VARIABLE CARDINAL_ASYNC_PATCH_CHECK_RESULT
++            OUTPUT_QUIET
++            ERROR_QUIET)
++    if (CARDINAL_ASYNC_PATCH_CHECK_RESULT EQUAL 0)
++        execute_process(
++                COMMAND git apply ${CARDINAL_ASYNC_PATCH}
++                WORKING_DIRECTORY ${CARDINAL_ROOT}
++                RESULT_VARIABLE CARDINAL_ASYNC_PATCH_APPLY_RESULT)
++        if (NOT CARDINAL_ASYNC_PATCH_APPLY_RESULT EQUAL 0)
++            message(FATAL_ERROR "Failed to apply Cardinal async no-fetch-pool patch")
++        endif()
++    else()
++        execute_process(
++                COMMAND git apply --reverse --check ${CARDINAL_ASYNC_PATCH}
++                WORKING_DIRECTORY ${CARDINAL_ROOT}
++                RESULT_VARIABLE CARDINAL_ASYNC_PATCH_REVERSE_CHECK_RESULT
++                OUTPUT_QUIET
++                ERROR_QUIET)
++        if (NOT CARDINAL_ASYNC_PATCH_REVERSE_CHECK_RESULT EQUAL 0)
++            message(FATAL_ERROR "Cardinal async no-fetch-pool patch is neither applicable nor already applied")
++        endif()
++    endif()
++else()
++    message(STATUS "Cardinal async read-path patch files not found; using upstream Cardinal")
++endif()
++
+ include(${CARDINAL_ROOT}/know/libcardinal.cmake)

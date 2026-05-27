@@ -1,7 +1,9 @@
 package etcd
 
 import (
+	"errors"
 	"sync"
+	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/server/v3/embed"
@@ -53,6 +55,15 @@ func InitEtcdServer(
 			if err != nil {
 				log.Error("failed to init embedded Etcd server", zap.Error(err))
 				initError = err
+				return
+			}
+			select {
+			case <-e.Server.ReadyNotify():
+				log.Info("embedded Etcd server is ready")
+			case <-time.After(60 * time.Second):
+				e.Server.Stop()
+				initError = errors.New("embedded Etcd took too long to start")
+				return
 			}
 			etcdServer = e
 			log.Info("finish init Etcd config", zap.String("path", path), zap.String("data", dataDir))

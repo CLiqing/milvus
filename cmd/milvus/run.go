@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"go.uber.org/zap"
@@ -32,6 +34,7 @@ func (c *run) execute(args []string, flags *flag.FlagSet) {
 
 	serverType := args[2]
 	roles := GetMilvusRoles(args, flags)
+	c.configureS3ReadPath(flags.Output())
 	// setup config for embedded milvus
 
 	runtimeDir := createRuntimeDir(serverType)
@@ -108,5 +111,64 @@ func (c *run) injectVariablesToEnv() {
 	if err != nil {
 		log.Warn(fmt.Sprintf("failed to inject %s to environment variable", metricsinfo.MilvusUsedGoVersion),
 			zap.Error(err))
+	}
+}
+
+func (c *run) configureS3ReadPath(w io.Writer) {
+	path := strings.ToLower(strings.TrimSpace(s3ReadPathConfig.path))
+	if path == "" {
+		return
+	}
+
+	switch path {
+	case "baseline", "sync":
+		unsetS3ReadPathEnv("MILVUS_S3_GETOBJECT_ASYNC")
+		unsetS3ReadPathEnv("MILVUS_S3_CLIENT_COROUTINE")
+		unsetS3ReadPathEnv("MILVUS_S3_CLIENT_CRT")
+		unsetS3ReadPathEnv("MILVUS_S3_ASYNC_MAX_INFLIGHT")
+		unsetS3ReadPathEnv("MILVUS_S3_CLIENT_COROUTINE_EVENTLOOPS")
+		unsetS3ReadPathEnv("MILVUS_S3_CLIENT_CRT_EVENTLOOPS")
+		unsetS3ReadPathEnv("MILVUS_S3_CLIENT_CRT_MAX_CONNECTIONS")
+		unsetS3ReadPathEnv("MILVUS_S3_CLIENT_CRT_THROUGHPUT_GBPS")
+		fmt.Fprintln(w, "S3ReadPath: baseline")
+	case "curl_multi", "curl-multi", "curl":
+		setS3ReadPathEnv("MILVUS_S3_GETOBJECT_ASYNC", "1")
+		setS3ReadPathEnv("MILVUS_S3_CLIENT_COROUTINE", "1")
+		unsetS3ReadPathEnv("MILVUS_S3_CLIENT_CRT")
+		setS3ReadPathEnv("MILVUS_S3_ASYNC_MAX_INFLIGHT", strconv.FormatUint(s3ReadPathConfig.maxInflight, 10))
+		setS3ReadPathEnv("MILVUS_S3_CLIENT_COROUTINE_EVENTLOOPS", strconv.FormatUint(s3ReadPathConfig.eventLoops, 10))
+		fmt.Fprintf(w, "S3ReadPath: curl_multi max_inflight=%d eventloops=%d\n",
+			s3ReadPathConfig.maxInflight, s3ReadPathConfig.eventLoops)
+	case "crt", "awscrt", "aws-crt":
+		setS3ReadPathEnv("MILVUS_S3_GETOBJECT_ASYNC", "1")
+		unsetS3ReadPathEnv("MILVUS_S3_CLIENT_COROUTINE")
+		setS3ReadPathEnv("MILVUS_S3_CLIENT_CRT", "1")
+		setS3ReadPathEnv("MILVUS_S3_ASYNC_MAX_INFLIGHT", strconv.FormatUint(s3ReadPathConfig.maxInflight, 10))
+		setS3ReadPathEnv("MILVUS_S3_CLIENT_CRT_EVENTLOOPS", strconv.FormatUint(s3ReadPathConfig.eventLoops, 10))
+		setS3ReadPathEnv("MILVUS_S3_CLIENT_CRT_MAX_CONNECTIONS", strconv.FormatUint(s3ReadPathConfig.crtMaxConnections, 10))
+		if s3ReadPathConfig.crtThroughputGbps != "" {
+			setS3ReadPathEnv("MILVUS_S3_CLIENT_CRT_THROUGHPUT_GBPS", s3ReadPathConfig.crtThroughputGbps)
+		}
+		fmt.Fprintf(w, "S3ReadPath: crt max_inflight=%d eventloops=%d crt_max_connections=%d",
+			s3ReadPathConfig.maxInflight, s3ReadPathConfig.eventLoops, s3ReadPathConfig.crtMaxConnections)
+		if s3ReadPathConfig.crtThroughputGbps != "" {
+			fmt.Fprintf(w, " crt_throughput_gbps=%s", s3ReadPathConfig.crtThroughputGbps)
+		}
+		fmt.Fprintln(w)
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown --s3-read-path=%s, expected baseline, curl_multi, or crt\n", s3ReadPathConfig.path)
+		os.Exit(-1)
+	}
+}
+
+func setS3ReadPathEnv(name string, value string) {
+	if err := os.Setenv(name, value); err != nil {
+		log.Warn(fmt.Sprintf("failed to set %s for S3 read path", name), zap.Error(err))
+	}
+}
+
+func unsetS3ReadPathEnv(name string) {
+	if err := os.Unsetenv(name); err != nil {
+		log.Warn(fmt.Sprintf("failed to unset %s for S3 read path", name), zap.Error(err))
 	}
 }

@@ -13,16 +13,20 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <deque>
 #include <future>
 #include <memory>
+#include <mutex>
 
 #include "arrow/io/interfaces.h"
+#include "filemanager/AsyncInputStream.h"
 #include "filemanager/InputStream.h"
 #include "storage/RemoteAsyncReadResult.h"
 
 namespace milvus::storage {
 
-class RemoteInputStream : public milvus::InputStream {
+class RemoteInputStream : public milvus::InputStream,
+                          public milvus::AsyncInputStream {
  public:
     explicit RemoteInputStream(
         std::shared_ptr<arrow::io::RandomAccessFile>&& remote_file);
@@ -39,10 +43,19 @@ class RemoteInputStream : public milvus::InputStream {
     ReadAt(void* data, size_t offset, size_t size) override;
 
     bool
-    SupportsAsyncReadAt() const;
+    SupportsAsyncReadAt() const override;
 
     std::future<RemoteAsyncReadResult>
-    ReadAtAsync(size_t offset, size_t size);
+    ReadAtAsync(size_t offset, size_t size) override;
+
+    void
+    ConfigureAsyncReadAtLimiter(size_t limiter_id, size_t max_inflight) override;
+
+    size_t
+    GetAsyncReadAtMaxInflight() const override;
+
+    size_t
+    GetAsyncReadAtCurrentInflight() const override;
 
     size_t
     Read(int fd, size_t size) override;
@@ -57,8 +70,34 @@ class RemoteInputStream : public milvus::InputStream {
     Seek(int64_t offset) override;
 
  private:
+    struct PendingAsyncRead {
+        std::shared_ptr<arrow::io::RandomAccessFile> remote_file;
+        size_t offset;
+        size_t size;
+        std::shared_ptr<std::promise<RemoteAsyncReadResult>> promise;
+        size_t limiter_id;
+    };
+
+    struct AsyncReadLimiter {
+        mutable std::mutex mutex;
+        size_t max_inflight = static_cast<size_t>(-1);
+        size_t inflight = 0;
+        std::deque<PendingAsyncRead> pending;
+    };
+
+    static AsyncReadLimiter&
+    GetAsyncReadLimiter(size_t limiter_id);
+
+    static void
+    StartAsyncRead(PendingAsyncRead request);
+
+    static void
+    FinishAsyncReadAndStartNext(size_t limiter_id);
+
     size_t file_size_;
     std::shared_ptr<arrow::io::RandomAccessFile> remote_file_;
+
+    size_t async_read_at_limiter_id_;
 };
 
 }  // namespace milvus::storage

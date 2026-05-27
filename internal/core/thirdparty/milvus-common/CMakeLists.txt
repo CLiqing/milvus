@@ -38,6 +38,15 @@ FetchContent_Declare(
 FetchContent_GetProperties( milvus-common )
 if ( NOT milvus-common_POPULATED )
     FetchContent_Populate( milvus-common )
+    execute_process(
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${CMAKE_CURRENT_SOURCE_DIR}/AsyncInputStream.h
+                    ${milvus-common_SOURCE_DIR}/include/filemanager/AsyncInputStream.h
+            RESULT_VARIABLE ASYNC_INPUT_STREAM_COPY_RESULT )
+    if ( NOT ASYNC_INPUT_STREAM_COPY_RESULT EQUAL 0 )
+        message( FATAL_ERROR "Failed to install AsyncInputStream.h into milvus-common source tree" )
+    endif()
+
     # Adding the following target:
     # milvus-common
     add_subdirectory( ${milvus-common_SOURCE_DIR}

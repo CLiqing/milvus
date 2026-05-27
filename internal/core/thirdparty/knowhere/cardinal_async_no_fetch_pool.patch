@@ -1,0 +1,565 @@
+diff --git a/cardinal/serialization/default_serializer.cpp b/cardinal/serialization/default_serializer.cpp
+index 21938b9b..1312b887 100644
+--- a/cardinal/serialization/default_serializer.cpp
++++ b/cardinal/serialization/default_serializer.cpp
+@@ -13,6 +13,7 @@
+ #include <cardinal/load_config.h>
+ #include <cardinal/local_mem_input_stream.h>
+ #include <cardinal/serialization/serialization.h>
++#include <cardinal/storage/async_input_stream.h>
+ #include <cardinal/typedef.h>
+ #include <cardinal/utils/log.h>
+ #include <cardinal/utils/utils.h>
+@@ -380,7 +381,8 @@ bool DefaultSerializer::SerializeMeta(
+  * This class wraps an underlying InputStream and allows reading only within
+  * a specified range defined by a starting offset and size.
+  */
+-class RangeInputStream : public milvus::InputStream {
++class RangeInputStream : public milvus::InputStream,
++                         public milvus::AsyncInputStream {
+ public:
+     /**
+      * @brief Construct a RangeInputStream
+@@ -391,6 +393,7 @@ public:
+      */
+     RangeInputStream(const std::shared_ptr<InputStream>& underlying, const size_t start_offset, const size_t range_size)
+         : underlying_(underlying),
++          async_underlying_(std::dynamic_pointer_cast<milvus::AsyncInputStream>(underlying)),
+           start_offset_(start_offset),
+           range_size_(range_size),
+           current_pos_(0) {}
+@@ -485,6 +488,37 @@ public:
+         return underlying_->ReadAt(ptr, start_offset_ + offset, to_read);
+     }
+
++    bool SupportsAsyncReadAt() const override {
++        return async_underlying_ != nullptr && async_underlying_->SupportsAsyncReadAt();
++    }
++
++    std::future<milvus::AsyncReadResult> ReadAtAsync(size_t offset, size_t size) override {
++        if (!SupportsAsyncReadAt() || offset >= range_size_) {
++            std::promise<milvus::AsyncReadResult> promise;
++            milvus::AsyncReadResult result;
++            promise.set_value(std::move(result));
++            return promise.get_future();
++        }
++
++        size_t available = range_size_ - offset;
++        size_t to_read = std::min(size, available);
++        return async_underlying_->ReadAtAsync(start_offset_ + offset, to_read);
++    }
++
++    void ConfigureAsyncReadAtLimiter(size_t limiter_id, size_t max_inflight) override {
++        if (async_underlying_ != nullptr) {
++            async_underlying_->ConfigureAsyncReadAtLimiter(limiter_id, max_inflight);
++        }
++    }
++
++    size_t GetAsyncReadAtMaxInflight() const override {
++        return async_underlying_ != nullptr ? async_underlying_->GetAsyncReadAtMaxInflight() : 0;
++    }
++
++    size_t GetAsyncReadAtCurrentInflight() const override {
++        return async_underlying_ != nullptr ? async_underlying_->GetAsyncReadAtCurrentInflight() : 0;
++    }
++
+     /**
+      * @brief Read data from the range to a file descriptor
+      *
+@@ -514,6 +548,7 @@ public:
+
+ private:
+     std::shared_ptr<InputStream> underlying_;
++    std::shared_ptr<milvus::AsyncInputStream> async_underlying_;
+     size_t start_offset_ = 0;
+     size_t range_size_ = 0;
+     size_t current_pos_ = 0;
+diff --git a/cardinal/storage/stream_reader.cpp b/cardinal/storage/stream_reader.cpp
+index 6727be62..a5350897 100644
+--- a/cardinal/storage/stream_reader.cpp
++++ b/cardinal/storage/stream_reader.cpp
+@@ -5,14 +5,26 @@
+ #include <atomic>
+ #include <cerrno>
+ #include <cstring>
++#include <future>
+ #include <mutex>
++#include <vector>
+
+ #include <fmt/format.h>
+
+ #include <cardinal/exception.h>
++#include <cardinal/storage/async_input_stream.h>
+ #include <cardinal/thread/task_pool.h>
+
+ namespace cardinalv2::storage {
++namespace {
++
++struct AsyncChunkRead {
++    size_t chunk_index = 0;
++    size_t chunk_size = 0;
++    std::future<milvus::AsyncReadResult> future;
++};
++
++}  // namespace
+
+ ConcurrentStreamReader::ConcurrentStreamReader(std::shared_ptr<milvus::InputStream> stream, size_t chunk_size)
+     : stream_(std::move(stream)),
+@@ -51,6 +63,85 @@ size_t ConcurrentStreamReader::ReadAndWriteToFile(int fd, size_t offset, size_t
+         fmt::format("Read range [{}, {}) exceeds stream size {}", offset, offset + size, stream_->Size())
+     );
+
++    if (auto async_stream = GetAsyncInputStream(stream_)) {
++        size_t num_chunks = (size + chunk_size_ - 1) / chunk_size_;
++        auto& stats = GetCardinalAsyncReadStats();
++        uint64_t batch_id = stats.NextTraceBatchId();
++        uint64_t batch_start_us = NowMicros();
++        stats.stream_batches.fetch_add(1, std::memory_order_relaxed);
++        stats.ObserveBatch(false, num_chunks, size);
++        stats.last_max_inflight.store(async_stream->GetAsyncReadAtMaxInflight(), std::memory_order_relaxed);
++
++        std::vector<AsyncChunkRead> reads;
++        reads.reserve(num_chunks);
++
++        for (size_t i = 0; i < num_chunks; ++i) {
++            size_t chunk_offset = offset + i * chunk_size_;
++            size_t chunk_size = std::min(chunk_size_, size - i * chunk_size_);
++            stats.submitted.fetch_add(1, std::memory_order_relaxed);
++            reads.push_back(AsyncChunkRead{
++                .chunk_index = i,
++                .chunk_size = chunk_size,
++                .future = async_stream->ReadAtAsync(chunk_offset, chunk_size),
++            });
++        }
++        uint64_t submit_done_us = NowMicros();
++        uint64_t inflight_after_submit = async_stream->GetAsyncReadAtCurrentInflight();
++
++        size_t total_written = 0;
++        for (auto& read : reads) {
++            try {
++                auto result = read.future.get();
++                InternalAssertInfo(
++                    result.bytes_read == read.chunk_size,
++                    fmt::format(
++                        "Failed to read {} bytes for chunk {}, only read {} bytes",
++                        read.chunk_size,
++                        read.chunk_index,
++                        result.bytes_read
++                    )
++                );
++
++                size_t file_offset = read.chunk_index * chunk_size_;
++                ssize_t bytes_written = ::pwrite(fd, result.data.data(), result.bytes_read, file_offset);
++                InternalAssertInfo(
++                    bytes_written >= 0 && static_cast<size_t>(bytes_written) == result.bytes_read,
++                    fmt::format(
++                        "Failed to write {} bytes to fd {} at offset {}, wrote {}, error: {}",
++                        result.bytes_read,
++                        fd,
++                        file_offset,
++                        bytes_written < 0 ? 0 : bytes_written,
++                        strerror(errno)
++                    )
++                );
++
++                total_written += result.bytes_read;
++                stats.completed.fetch_add(1, std::memory_order_relaxed);
++                stats.bytes.fetch_add(result.bytes_read, std::memory_order_relaxed);
++            } catch (...) {
++                stats.failed.fetch_add(1, std::memory_order_relaxed);
++                MaybeReportCardinalAsyncStats();
++                throw;
++            }
++            MaybeReportCardinalAsyncStats();
++        }
++        uint64_t wait_done_us = NowMicros();
++        stats.ObserveAsyncTiming(submit_done_us - batch_start_us,
++                                 wait_done_us - submit_done_us,
++                                 wait_done_us - batch_start_us,
++                                 inflight_after_submit);
++        stats.TraceBatch("async_stream_file",
++                         batch_id,
++                         num_chunks,
++                         size,
++                         submit_done_us - batch_start_us,
++                         wait_done_us - submit_done_us,
++                         wait_done_us - batch_start_us,
++                         inflight_after_submit);
++        return total_written;
++    }
++
+     std::atomic<size_t> total_written{0};
+     std::atomic<bool> has_error{false};
+     std::string error_msg;
+@@ -106,7 +197,19 @@ size_t ConcurrentStreamReader::ReadAndWriteToFile(int fd, size_t offset, size_t
+     });
+
+     // Execute tasks in parallel using FetchPool
++    auto sync_wait_start_us = NowMicros();
+     ParallelFetchTask(tasks);
++    auto sync_wait_done_us = NowMicros();
++    auto& stats = GetCardinalAsyncReadStats();
++    stats.ObserveSyncFetchBatch(tasks.size(), size, sync_wait_done_us - sync_wait_start_us);
++    stats.TraceBatch("sync_stream_file",
++                     stats.NextTraceBatchId(),
++                     tasks.size(),
++                     size,
++                     0,
++                     sync_wait_done_us - sync_wait_start_us,
++                     sync_wait_done_us - sync_wait_start_us,
++                     tasks.size());
+
+     // Check for errors
+     if (has_error.load()) {
+@@ -122,6 +225,72 @@ size_t ConcurrentStreamReader::ReadAndWriteToMemory(std::byte* buffer, size_t of
+         fmt::format("Read range [{}, {}) exceeds stream size {}", offset, offset + size, stream_->Size())
+     );
+
++    if (auto async_stream = GetAsyncInputStream(stream_)) {
++        size_t num_chunks = (size + chunk_size_ - 1) / chunk_size_;
++        auto& stats = GetCardinalAsyncReadStats();
++        uint64_t batch_id = stats.NextTraceBatchId();
++        uint64_t batch_start_us = NowMicros();
++        stats.stream_batches.fetch_add(1, std::memory_order_relaxed);
++        stats.ObserveBatch(false, num_chunks, size);
++        stats.last_max_inflight.store(async_stream->GetAsyncReadAtMaxInflight(), std::memory_order_relaxed);
++
++        std::vector<AsyncChunkRead> reads;
++        reads.reserve(num_chunks);
++
++        for (size_t i = 0; i < num_chunks; ++i) {
++            size_t chunk_offset = offset + i * chunk_size_;
++            size_t chunk_size = std::min(chunk_size_, size - i * chunk_size_);
++            stats.submitted.fetch_add(1, std::memory_order_relaxed);
++            reads.push_back(AsyncChunkRead{
++                .chunk_index = i,
++                .chunk_size = chunk_size,
++                .future = async_stream->ReadAtAsync(chunk_offset, chunk_size),
++            });
++        }
++        uint64_t submit_done_us = NowMicros();
++        uint64_t inflight_after_submit = async_stream->GetAsyncReadAtCurrentInflight();
++
++        size_t total_read = 0;
++        for (auto& read : reads) {
++            try {
++                auto result = read.future.get();
++                InternalAssertInfo(
++                    result.bytes_read == read.chunk_size,
++                    fmt::format(
++                        "Failed to read {} bytes for chunk {}, only read {} bytes",
++                        read.chunk_size,
++                        read.chunk_index,
++                        result.bytes_read
++                    )
++                );
++                std::memcpy(buffer + read.chunk_index * chunk_size_, result.data.data(), result.bytes_read);
++                total_read += result.bytes_read;
++                stats.completed.fetch_add(1, std::memory_order_relaxed);
++                stats.bytes.fetch_add(result.bytes_read, std::memory_order_relaxed);
++            } catch (...) {
++                stats.failed.fetch_add(1, std::memory_order_relaxed);
++                MaybeReportCardinalAsyncStats();
++                throw;
++            }
++            MaybeReportCardinalAsyncStats();
++        }
++        uint64_t wait_done_us = NowMicros();
++        stats.ObserveAsyncTiming(submit_done_us - batch_start_us,
++                                 wait_done_us - submit_done_us,
++                                 wait_done_us - batch_start_us,
++                                 inflight_after_submit);
++        stats.TraceBatch("async_stream_memory",
++                         batch_id,
++                         num_chunks,
++                         size,
++                         submit_done_us - batch_start_us,
++                         wait_done_us - submit_done_us,
++                         wait_done_us - batch_start_us,
++                         inflight_after_submit);
++
++        return total_read;
++    }
++
+     std::atomic<size_t> total_read{0};
+     std::atomic<bool> has_error{false};
+     std::string error_msg;
+@@ -158,7 +327,19 @@ size_t ConcurrentStreamReader::ReadAndWriteToMemory(std::byte* buffer, size_t of
+     });
+
+     // Execute tasks in parallel using FetchPool
++    auto sync_wait_start_us = NowMicros();
+     ParallelFetchTask(tasks);
++    auto sync_wait_done_us = NowMicros();
++    auto& stats = GetCardinalAsyncReadStats();
++    stats.ObserveSyncFetchBatch(tasks.size(), size, sync_wait_done_us - sync_wait_start_us);
++    stats.TraceBatch("sync_stream_memory",
++                     stats.NextTraceBatchId(),
++                     tasks.size(),
++                     size,
++                     0,
++                     sync_wait_done_us - sync_wait_start_us,
++                     sync_wait_done_us - sync_wait_start_us,
++                     tasks.size());
+
+     // Check for errors
+     if (has_error.load()) {
+diff --git a/cardinal/storage/translator/chunk_translator.h b/cardinal/storage/translator/chunk_translator.h
+index a03fe971..883e7487 100644
+--- a/cardinal/storage/translator/chunk_translator.h
++++ b/cardinal/storage/translator/chunk_translator.h
+@@ -4,6 +4,7 @@
+ #include <algorithm>
+ #include <cerrno>
+ #include <cstddef>
++#include <cstring>
+ #include <filesystem>
+ #include <future>
+ #include <memory>
+@@ -18,6 +19,7 @@
+ #include "cachinglayer/Translator.h"
+
+ #include <cardinal/storage/disk_storage.h>
++#include <cardinal/storage/async_input_stream.h>
+ #include <cardinal/storage/memory_storage.h>
+ #include <cardinal/storage/storage.h>
+ #include "common/common_type_c.h"
+@@ -128,6 +130,162 @@ public:
+         std::vector<std::pair<milvus::cachinglayer::cid_t, std::unique_ptr<StorageType>>> cells;
+         cells.resize(cids.size());
+
++        if (IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC")) {
++            struct CellRead {
++                milvus::cachinglayer::cid_t cid;
++                size_t index;
++                std::shared_ptr<DeserializerInterface> meta;
++                std::shared_ptr<milvus::InputStream> stream;
++                std::shared_ptr<milvus::AsyncInputStream> async_stream;
++                std::future<milvus::AsyncReadResult> future;
++            };
++
++            std::vector<CellRead> reads;
++            reads.reserve(cids.size());
++            bool all_remote_async = true;
++
++            for (size_t i = 0; i < cids.size(); i++) {
++                if (op_context != nullptr && op_context->cancellation_token.isCancellationRequested()) {
++                    throw CardinalException(fmt::format("CARDINAL: chunk {}_{} download process cancelled", key_, cids[i]));
++                }
++
++                const std::shared_ptr<DeserializerInterface> meta =
++                    chunk_meta_ptr_->GetChildPtr(std::to_string(cids[i]));
++
++                if (meta->GetKV<size_t>("capacity") == 0) {
++                    cells[i] = std::make_pair(cids[i], std::make_unique<StorageType>());
++                    continue;
++                }
++
++                auto stream = meta->GetInputStreamForTensor("data");
++                auto async_stream = GetAsyncInputStream(stream);
++                if (async_stream == nullptr) {
++                    all_remote_async = false;
++                    break;
++                }
++
++                reads.push_back(CellRead{
++                    .cid = cids[i],
++                    .index = i,
++                    .meta = meta,
++                    .stream = stream,
++                    .async_stream = async_stream,
++                });
++            }
++
++            if (all_remote_async) {
++                auto& stats = GetCardinalAsyncReadStats();
++                uint64_t batch_id = stats.NextTraceBatchId();
++                uint64_t batch_start_us = NowMicros();
++                stats.chunk_batches.fetch_add(1, std::memory_order_relaxed);
++                uint64_t batch_bytes = 0;
++                for (const auto& read : reads) {
++                    batch_bytes += read.stream->Size();
++                }
++                stats.ObserveBatch(true, reads.size(), batch_bytes);
++
++                for (auto& read : reads) {
++                    stats.last_max_inflight.store(read.async_stream->GetAsyncReadAtMaxInflight(), std::memory_order_relaxed);
++                    stats.submitted.fetch_add(1, std::memory_order_relaxed);
++                    read.future = read.async_stream->ReadAtAsync(0, read.stream->Size());
++                }
++                uint64_t submit_done_us = NowMicros();
++                uint64_t inflight_after_submit =
++                    reads.empty() ? 0 : reads.front().async_stream->GetAsyncReadAtCurrentInflight();
++
++                for (auto& read : reads) {
++                    try {
++                        auto result = read.future.get();
++                        InternalAssertInfo(
++                            result.bytes_read == read.stream->Size(),
++                            fmt::format(
++                                "Failed to read chunk {}_{}: expected {} bytes, got {} bytes",
++                                key_,
++                                read.cid,
++                                read.stream->Size(),
++                                result.bytes_read
++                            )
++                        );
++
++                        if (use_mmap_) {
++                            std::string local_index_path = fmt::format("{}_{}", index_path_, read.cid);
++                            io::File file(
++                                local_index_path,
++                                static_cast<int32_t>(io::File::OpenFlag::Create) |
++                                    static_cast<int32_t>(io::File::OpenFlag::ReadWrite)
++                            );
++                            auto nwrite = ::write(file.FileDescriptor(), result.data.data(), result.bytes_read);
++                            InternalAssertInfo(
++                                static_cast<size_t>(nwrite) == result.bytes_read,
++                                fmt::format(
++                                    "Failed to write {} bytes to {}, wrote {}, error: {}",
++                                    result.bytes_read,
++                                    local_index_path,
++                                    nwrite < 0 ? 0UL : static_cast<size_t>(nwrite),
++                                    strerror(errno)
++                                )
++                            );
++                            alloc::MmapAllocator mmap_allocator;
++                            auto mmap_data = mmap_allocator.Allocate(
++                                local_index_path,
++                                0,
++                                result.bytes_read,
++                                file.FileDescriptor(),
++                                use_mmap_pop_
++                            );
++                            cells[read.index] = std::make_pair(
++                                read.cid,
++                                std::make_unique<StorageType>(
++                                    storage::StorageConfig(
++                                        {.row = read.meta->template GetKV<size_t>("size"),
++                                         .length = read.meta->template GetKV<size_t>("length")}
++                                    ),
++                                    std::move(mmap_data)
++                                )
++                            );
++                        } else {
++                            alloc::HugePageAllocator allocator;
++                            auto data = allocator.Allocate(result.bytes_read);
++                            std::memcpy(data.Data(), result.data.data(), result.bytes_read);
++                            cells[read.index] = std::make_pair(
++                                read.cid,
++                                std::make_unique<StorageType>(
++                                    storage::StorageConfig(
++                                        {.row = read.meta->template GetKV<size_t>("size"),
++                                         .length = read.meta->template GetKV<size_t>("length")}
++                                    ),
++                                    std::move(data)
++                                )
++                            );
++                        }
++
++                        stats.completed.fetch_add(1, std::memory_order_relaxed);
++                        stats.bytes.fetch_add(result.bytes_read, std::memory_order_relaxed);
++                    } catch (...) {
++                        stats.failed.fetch_add(1, std::memory_order_relaxed);
++                        MaybeReportCardinalAsyncStats();
++                        throw;
++                    }
++                    MaybeReportCardinalAsyncStats();
++                }
++                uint64_t wait_done_us = NowMicros();
++                stats.ObserveAsyncTiming(submit_done_us - batch_start_us,
++                                         wait_done_us - submit_done_us,
++                                         wait_done_us - batch_start_us,
++                                         inflight_after_submit);
++                stats.TraceBatch("async_chunk",
++                                 batch_id,
++                                 reads.size(),
++                                 batch_bytes,
++                                 submit_done_us - batch_start_us,
++                                 wait_done_us - submit_done_us,
++                                 wait_done_us - batch_start_us,
++                                 inflight_after_submit);
++
++                return cells;
++            }
++        }
++
+         std::vector<std::function<void()>> tasks;
+         tasks.reserve(cids.size());
+
+@@ -217,7 +375,27 @@ public:
+             }
+         }
+
++        uint64_t sync_batch_bytes = 0;
++        for (auto cid : cids) {
++            const std::shared_ptr<DeserializerInterface> meta =
++                chunk_meta_ptr_->GetChildPtr(std::to_string(cid));
++            sync_batch_bytes += meta->GetKV<size_t>("capacity");
++        }
++        auto sync_wait_start_us = NowMicros();
+         ParallelFetchTask(tasks);
++        auto sync_wait_done_us = NowMicros();
++        auto& stats = GetCardinalAsyncReadStats();
++        stats.ObserveSyncFetchBatch(tasks.size(),
++                                    sync_batch_bytes,
++                                    sync_wait_done_us - sync_wait_start_us);
++        stats.TraceBatch("sync_chunk",
++                         stats.NextTraceBatchId(),
++                         tasks.size(),
++                         sync_batch_bytes,
++                         0,
++                         sync_wait_done_us - sync_wait_start_us,
++                         sync_wait_done_us - sync_wait_start_us,
++                         tasks.size());
+
+         return cells;
+     }
+diff --git a/know/cardinal_adapter.h b/know/cardinal_adapter.h
+index fb6251cd..398f01da 100644
+--- a/know/cardinal_adapter.h
++++ b/know/cardinal_adapter.h
+@@ -12,6 +12,7 @@
+ #pragma once
+
+ #include <cstdint>
++#include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+ #include <optional>
+@@ -250,6 +251,21 @@ inline std::optional<unsigned long> string2ul(const std::string& s) {
+     return num;
+ }
+
++inline std::optional<size_t> cardinalEnvSizeT(const char* name) {
++    const char* value = std::getenv(name);
++    if (value == nullptr || value[0] == '\0') {
++        return std::nullopt;
++    }
++    char* endptr = nullptr;
++    errno = 0;
++    unsigned long parsed = std::strtoul(value, &endptr, 10);
++    if (errno == ERANGE || endptr == value || *endptr != '\0' || parsed == 0) {
++        LOG_KNOWHERE_WARNING_ << "Ignore invalid Cardinal env override " << name << "=" << value;
++        return std::nullopt;
++    }
++    return static_cast<size_t>(parsed);
++}
++
+ // looks ugly, but this is C++ and strings :(
+ inline std::vector<uint32_t> saqParseAllowedBitsOrDefault(const std::string& s) {
+     std::stringstream ss(s);
+@@ -879,6 +895,13 @@ public:
+
+                 config.temp_config.enable_batch_4 = hnswConfig.enable_batch_4.value();
+
++                if constexpr (indexType == CardinalIndexType::IndexTiered) {
++                    if (auto beam_width = cardinalEnvSizeT("MILVUS_CARDINAL_SEARCH_BEAM_WIDTH")) {
++                        config.beam_width = *beam_width;
++                        LOG_KNOWHERE_INFO_ << "Override Cardinal tiered search beam_width to " << config.beam_width;
++                    }
++                }
++
+                 if (!config.search_quant_config.rbq_params.has_value()) {
+                     config.search_quant_config.rbq_params = cardinalv2::RBQv2Params();
+                 }

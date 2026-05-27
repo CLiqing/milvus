@@ -27,6 +27,14 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
+var s3ReadPathConfig struct {
+	path              string
+	maxInflight       uint64
+	eventLoops        uint64
+	crtMaxConnections uint64
+	crtThroughputGbps string
+}
+
 func makeRuntimeDir(dir string) error {
 	perm := os.FileMode(0o755)
 	// os.MkdirAll equal to `mkdir -p`
@@ -178,6 +186,11 @@ func formatFlags(args []string, flags *flag.FlagSet) (alias string, enableRootCo
 	enableDataCoord, enableQueryNode, enableDataNode, enableProxy bool, enableStreamingNode bool,
 ) {
 	flags.StringVar(&alias, "alias", "", "set alias")
+	flags.StringVar(&s3ReadPathConfig.path, "s3-read-path", "", "S3 read path: baseline, curl_multi, or crt")
+	flags.Uint64Var(&s3ReadPathConfig.maxInflight, "s3-read-max-inflight", 100, "max in-flight S3 async reads for async read paths")
+	flags.Uint64Var(&s3ReadPathConfig.eventLoops, "s3-read-eventloops", 8, "event loop threads for curl_multi or CRT S3 read paths")
+	flags.Uint64Var(&s3ReadPathConfig.crtMaxConnections, "s3-read-crt-max-connections", 100, "max S3 CRT connections for the CRT read path")
+	flags.StringVar(&s3ReadPathConfig.crtThroughputGbps, "s3-read-crt-throughput-gbps", "", "target throughput in Gbps for the CRT read path")
 	var enableIndexCoord bool
 	flags.BoolVar(&enableRootCoord, typeutil.RootCoordRole, false, "enable root coordinator")
 	flags.BoolVar(&enableQueryCoord, typeutil.QueryCoordRole, false, "enable query coordinator")

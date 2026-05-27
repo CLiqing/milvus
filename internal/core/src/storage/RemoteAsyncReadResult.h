@@ -16,14 +16,10 @@
 
 #pragma once
 
-#include <cstddef>
-#include <vector>
+#include "filemanager/AsyncInputStream.h"
 
 namespace milvus::storage {
 
-struct RemoteAsyncReadResult {
-    size_t bytes_read = 0;
-    std::vector<std::byte> data;
-};
+using RemoteAsyncReadResult = milvus::AsyncReadResult;
 
 }  // namespace milvus::storage
