@@ -81,6 +81,28 @@ crt:
 
 If `--s3-read-path` is omitted, existing environment-variable behavior is kept.
 
+For QTP/VDC Cloud instances, prefer runtime Milvus config parameters so one
+image can be reused across all paths:
+
+```text
+queryNode.s3ReadPath.mode=baseline
+queryNode.s3ReadPath.mode=curl_multi
+queryNode.s3ReadPath.mode=crt
+```
+
+Optional tuning parameters:
+
+```text
+queryNode.s3ReadPath.maxInflight=100
+queryNode.s3ReadPath.eventLoops=8
+queryNode.s3ReadPath.crtMaxConnections=100
+queryNode.s3ReadPath.crtThroughputGbps=30
+```
+
+Use QTP `ModifyParams` with `needRestart=true` after changing these values. If
+the CLI flag `--s3-read-path` is provided, it takes precedence over the config
+value.
+
 ## QTP Runtime Config
 
 For cold S3 reads, keep vector index warmup disabled:
@@ -91,6 +113,14 @@ queryNode:
     tieredStorage:
       warmup:
         vectorIndex: disable
+```
+
+Equivalent QTP `ModifyParams` keys:
+
+```text
+autoIndex.enable=false
+dataCoord.segment.maxSize=4096
+queryNode.segcore.tieredStorage.warmup.vectorIndex=disable
 ```
 
 S3 endpoint, bucket, root path, credentials, region, and virtual-host settings

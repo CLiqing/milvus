@@ -3411,6 +3411,12 @@ type queryNodeConfig struct {
 	TieredWarmupLoadingTimeoutMs    ParamItem `refreshable:"true"`
 	StorageUsageTrackingEnabled     ParamItem `refreshable:"true"`
 
+	S3ReadPathMode              ParamItem `refreshable:"false"`
+	S3ReadPathMaxInflight       ParamItem `refreshable:"false"`
+	S3ReadPathEventLoops        ParamItem `refreshable:"false"`
+	S3ReadPathCrtMaxConnections ParamItem `refreshable:"false"`
+	S3ReadPathCrtThroughputGbps ParamItem `refreshable:"false"`
+
 	KnowhereScoreConsistency ParamItem `refreshable:"false"`
 
 	// memory limit
@@ -3615,6 +3621,51 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 		Export:       true,
 	}
 	p.StatsPublishInterval.Init(base.mgr)
+
+	p.S3ReadPathMode = ParamItem{
+		Key:          "queryNode.s3ReadPath.mode",
+		Version:      "2.6.0",
+		DefaultValue: "",
+		Doc:          "S3 read path for Cardinal tiered index cold reads. Options: empty, baseline, curl_multi, crt. Empty keeps existing environment-variable behavior.",
+		Export:       true,
+	}
+	p.S3ReadPathMode.Init(base.mgr)
+
+	p.S3ReadPathMaxInflight = ParamItem{
+		Key:          "queryNode.s3ReadPath.maxInflight",
+		Version:      "2.6.0",
+		DefaultValue: "100",
+		Doc:          "Max in-flight S3 async reads for queryNode.s3ReadPath.mode=curl_multi or crt.",
+		Export:       true,
+	}
+	p.S3ReadPathMaxInflight.Init(base.mgr)
+
+	p.S3ReadPathEventLoops = ParamItem{
+		Key:          "queryNode.s3ReadPath.eventLoops",
+		Version:      "2.6.0",
+		DefaultValue: "8",
+		Doc:          "Event loop threads for queryNode.s3ReadPath.mode=curl_multi or crt.",
+		Export:       true,
+	}
+	p.S3ReadPathEventLoops.Init(base.mgr)
+
+	p.S3ReadPathCrtMaxConnections = ParamItem{
+		Key:          "queryNode.s3ReadPath.crtMaxConnections",
+		Version:      "2.6.0",
+		DefaultValue: "100",
+		Doc:          "Max S3 CRT connections for queryNode.s3ReadPath.mode=crt.",
+		Export:       true,
+	}
+	p.S3ReadPathCrtMaxConnections.Init(base.mgr)
+
+	p.S3ReadPathCrtThroughputGbps = ParamItem{
+		Key:          "queryNode.s3ReadPath.crtThroughputGbps",
+		Version:      "2.6.0",
+		DefaultValue: "30",
+		Doc:          "Target throughput in Gbps for queryNode.s3ReadPath.mode=crt.",
+		Export:       true,
+	}
+	p.S3ReadPathCrtThroughputGbps.Init(base.mgr)
 
 	p.TieredWarmupScalarField = ParamItem{
 		Key:          "queryNode.segcore.tieredStorage.warmup.scalarField",

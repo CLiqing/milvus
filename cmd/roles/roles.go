@@ -163,6 +163,8 @@ type MilvusRoles struct {
 
 	ServerType string
 
+	PostParamtableInit func()
+
 	closed chan struct{}
 	once   sync.Once
 }
@@ -414,6 +416,10 @@ func (mr *MilvusRoles) Run() {
 		}
 		paramtable.Init()
 		paramtable.SetRole(mr.ServerType)
+	}
+
+	if mr.PostParamtableInit != nil {
+		mr.PostParamtableInit()
 	}
 
 	// Persist immutable configurations at startup, such as mqType paramItem

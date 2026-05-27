@@ -17,6 +17,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 type run struct{}
@@ -34,7 +35,9 @@ func (c *run) execute(args []string, flags *flag.FlagSet) {
 
 	serverType := args[2]
 	roles := GetMilvusRoles(args, flags)
-	c.configureS3ReadPath(flags.Output())
+	roles.PostParamtableInit = func() {
+		c.configureS3ReadPath(flags.Output())
+	}
 	// setup config for embedded milvus
 
 	runtimeDir := createRuntimeDir(serverType)
@@ -115,7 +118,8 @@ func (c *run) injectVariablesToEnv() {
 }
 
 func (c *run) configureS3ReadPath(w io.Writer) {
-	path := strings.ToLower(strings.TrimSpace(s3ReadPathConfig.path))
+	cfg := c.effectiveS3ReadPathConfig()
+	path := strings.ToLower(strings.TrimSpace(cfg.path))
 	if path == "" {
 		return
 	}
@@ -135,30 +139,71 @@ func (c *run) configureS3ReadPath(w io.Writer) {
 		setS3ReadPathEnv("MILVUS_S3_GETOBJECT_ASYNC", "1")
 		setS3ReadPathEnv("MILVUS_S3_CLIENT_COROUTINE", "1")
 		unsetS3ReadPathEnv("MILVUS_S3_CLIENT_CRT")
-		setS3ReadPathEnv("MILVUS_S3_ASYNC_MAX_INFLIGHT", strconv.FormatUint(s3ReadPathConfig.maxInflight, 10))
-		setS3ReadPathEnv("MILVUS_S3_CLIENT_COROUTINE_EVENTLOOPS", strconv.FormatUint(s3ReadPathConfig.eventLoops, 10))
+		setS3ReadPathEnv("MILVUS_S3_ASYNC_MAX_INFLIGHT", strconv.FormatUint(cfg.maxInflight, 10))
+		setS3ReadPathEnv("MILVUS_S3_CLIENT_COROUTINE_EVENTLOOPS", strconv.FormatUint(cfg.eventLoops, 10))
 		fmt.Fprintf(w, "S3ReadPath: curl_multi max_inflight=%d eventloops=%d\n",
-			s3ReadPathConfig.maxInflight, s3ReadPathConfig.eventLoops)
+			cfg.maxInflight, cfg.eventLoops)
 	case "crt", "awscrt", "aws-crt":
 		setS3ReadPathEnv("MILVUS_S3_GETOBJECT_ASYNC", "1")
 		unsetS3ReadPathEnv("MILVUS_S3_CLIENT_COROUTINE")
 		setS3ReadPathEnv("MILVUS_S3_CLIENT_CRT", "1")
-		setS3ReadPathEnv("MILVUS_S3_ASYNC_MAX_INFLIGHT", strconv.FormatUint(s3ReadPathConfig.maxInflight, 10))
-		setS3ReadPathEnv("MILVUS_S3_CLIENT_CRT_EVENTLOOPS", strconv.FormatUint(s3ReadPathConfig.eventLoops, 10))
-		setS3ReadPathEnv("MILVUS_S3_CLIENT_CRT_MAX_CONNECTIONS", strconv.FormatUint(s3ReadPathConfig.crtMaxConnections, 10))
-		if s3ReadPathConfig.crtThroughputGbps != "" {
-			setS3ReadPathEnv("MILVUS_S3_CLIENT_CRT_THROUGHPUT_GBPS", s3ReadPathConfig.crtThroughputGbps)
+		setS3ReadPathEnv("MILVUS_S3_ASYNC_MAX_INFLIGHT", strconv.FormatUint(cfg.maxInflight, 10))
+		setS3ReadPathEnv("MILVUS_S3_CLIENT_CRT_EVENTLOOPS", strconv.FormatUint(cfg.eventLoops, 10))
+		setS3ReadPathEnv("MILVUS_S3_CLIENT_CRT_MAX_CONNECTIONS", strconv.FormatUint(cfg.crtMaxConnections, 10))
+		if cfg.crtThroughputGbps != "" {
+			setS3ReadPathEnv("MILVUS_S3_CLIENT_CRT_THROUGHPUT_GBPS", cfg.crtThroughputGbps)
 		}
 		fmt.Fprintf(w, "S3ReadPath: crt max_inflight=%d eventloops=%d crt_max_connections=%d",
-			s3ReadPathConfig.maxInflight, s3ReadPathConfig.eventLoops, s3ReadPathConfig.crtMaxConnections)
-		if s3ReadPathConfig.crtThroughputGbps != "" {
-			fmt.Fprintf(w, " crt_throughput_gbps=%s", s3ReadPathConfig.crtThroughputGbps)
+			cfg.maxInflight, cfg.eventLoops, cfg.crtMaxConnections)
+		if cfg.crtThroughputGbps != "" {
+			fmt.Fprintf(w, " crt_throughput_gbps=%s", cfg.crtThroughputGbps)
 		}
 		fmt.Fprintln(w)
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown --s3-read-path=%s, expected baseline, curl_multi, or crt\n", s3ReadPathConfig.path)
+		fmt.Fprintf(os.Stderr, "Unknown S3 read path=%s, expected baseline, curl_multi, or crt\n", cfg.path)
 		os.Exit(-1)
 	}
+}
+
+func (c *run) effectiveS3ReadPathConfig() struct {
+	path              string
+	maxInflight       uint64
+	eventLoops        uint64
+	crtMaxConnections uint64
+	crtThroughputGbps string
+} {
+	cfg := struct {
+		path              string
+		maxInflight       uint64
+		eventLoops        uint64
+		crtMaxConnections uint64
+		crtThroughputGbps string
+	}{
+		path:              s3ReadPathConfig.path,
+		maxInflight:       s3ReadPathConfig.maxInflight,
+		eventLoops:        s3ReadPathConfig.eventLoops,
+		crtMaxConnections: s3ReadPathConfig.crtMaxConnections,
+		crtThroughputGbps: s3ReadPathConfig.crtThroughputGbps,
+	}
+	if s3ReadPathConfig.pathSet {
+		return cfg
+	}
+
+	params := paramtable.Get()
+	cfg.path = params.QueryNodeCfg.S3ReadPathMode.GetValue()
+	if !s3ReadPathConfig.maxInflightSet {
+		cfg.maxInflight = params.QueryNodeCfg.S3ReadPathMaxInflight.GetAsUint64()
+	}
+	if !s3ReadPathConfig.eventLoopsSet {
+		cfg.eventLoops = params.QueryNodeCfg.S3ReadPathEventLoops.GetAsUint64()
+	}
+	if !s3ReadPathConfig.crtConnectionsSet {
+		cfg.crtMaxConnections = params.QueryNodeCfg.S3ReadPathCrtMaxConnections.GetAsUint64()
+	}
+	if !s3ReadPathConfig.crtThroughputSet {
+		cfg.crtThroughputGbps = params.QueryNodeCfg.S3ReadPathCrtThroughputGbps.GetValue()
+	}
+	return cfg
 }
 
 func setS3ReadPathEnv(name string, value string) {

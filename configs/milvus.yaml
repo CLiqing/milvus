@@ -467,6 +467,12 @@ queryCoord:
 queryNode:
   stats:
     publishInterval: 1000 # The interval that query node publishes the node statistics information, including segment status, cpu usage, memory usage, health status, etc. Unit: ms.
+  s3ReadPath:
+    mode:  # S3 read path for Cardinal tiered index cold reads. Options: baseline, curl_multi, crt. Empty keeps existing environment-variable behavior.
+    maxInflight: 100 # Max in-flight S3 async reads for curl_multi or crt.
+    eventLoops: 8 # Event loop threads for curl_multi or crt.
+    crtMaxConnections: 100 # Max S3 CRT connections for crt.
+    crtThroughputGbps: 30 # Target throughput in Gbps for crt.
   segcore:
     knowhereThreadPoolNumRatio: 4 # The number of threads in knowhere's thread pool. If disk is enabled, the pool size will multiply with knowhereThreadPoolNumRatio([1, 32]).
     chunkRows: 128 # Row count by which Segcore divides a segment into chunks.

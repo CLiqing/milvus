@@ -33,6 +33,11 @@ var s3ReadPathConfig struct {
 	eventLoops        uint64
 	crtMaxConnections uint64
 	crtThroughputGbps string
+	pathSet           bool
+	maxInflightSet    bool
+	eventLoopsSet     bool
+	crtConnectionsSet bool
+	crtThroughputSet  bool
 }
 
 func makeRuntimeDir(dir string) error {
@@ -185,6 +190,22 @@ func GetMilvusRoles(args []string, flags *flag.FlagSet) *roles.MilvusRoles {
 func formatFlags(args []string, flags *flag.FlagSet) (alias string, enableRootCoord, enableQueryCoord,
 	enableDataCoord, enableQueryNode, enableDataNode, enableProxy bool, enableStreamingNode bool,
 ) {
+	s3ReadPathConfig = struct {
+		path              string
+		maxInflight       uint64
+		eventLoops        uint64
+		crtMaxConnections uint64
+		crtThroughputGbps string
+		pathSet           bool
+		maxInflightSet    bool
+		eventLoopsSet     bool
+		crtConnectionsSet bool
+		crtThroughputSet  bool
+	}{
+		maxInflight:       100,
+		eventLoops:        8,
+		crtMaxConnections: 100,
+	}
 	flags.StringVar(&alias, "alias", "", "set alias")
 	flags.StringVar(&s3ReadPathConfig.path, "s3-read-path", "", "S3 read path: baseline, curl_multi, or crt")
 	flags.Uint64Var(&s3ReadPathConfig.maxInflight, "s3-read-max-inflight", 100, "max in-flight S3 async reads for async read paths")
@@ -209,6 +230,20 @@ func formatFlags(args []string, flags *flag.FlagSet) (alias string, enableRootCo
 	if err := flags.Parse(args[3:]); err != nil {
 		os.Exit(-1)
 	}
+	flags.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "s3-read-path":
+			s3ReadPathConfig.pathSet = true
+		case "s3-read-max-inflight":
+			s3ReadPathConfig.maxInflightSet = true
+		case "s3-read-eventloops":
+			s3ReadPathConfig.eventLoopsSet = true
+		case "s3-read-crt-max-connections":
+			s3ReadPathConfig.crtConnectionsSet = true
+		case "s3-read-crt-throughput-gbps":
+			s3ReadPathConfig.crtThroughputSet = true
+		}
+	})
 	return
 }
 
