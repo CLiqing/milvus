@@ -126,6 +126,7 @@ GcpChunkManager::GcpChunkManager(const StorageConfig& storage_config) {
     use_crc32c_checksum_ = storage_config.use_crc32c_checksum;
 
     if (storage_config.useIAM) {
+#ifdef ENABLE_GCP_NATIVE
         sdk_options_.httpOptions.httpClientFactory_create_fn = []() {
             auto credentials = std::make_shared<
                 google::cloud::oauth2_internal::GOOGLE_CLOUD_CPP_NS::
@@ -133,6 +134,9 @@ GcpChunkManager::GcpChunkManager(const StorageConfig& storage_config) {
             return Aws::MakeShared<GoogleHttpClientFactory>(
                 GOOGLE_CLIENT_FACTORY_ALLOCATION_TAG, credentials);
         };
+#else
+        ThrowInfo(S3Error, "GCP IAM storage requires ENABLE_GCP_NATIVE=ON");
+#endif
     }
 
     InitSDKAPIDefault(storage_config.log_level, storage_config.tls_min_version);

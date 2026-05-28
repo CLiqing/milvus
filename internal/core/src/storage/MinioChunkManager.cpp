@@ -110,6 +110,7 @@ MinioChunkManager::InitSDKAPI(RemoteStorageType type,
         bool need_tls =
             !tls_min_version.empty() && tls_min_version != "default";
         if (type == RemoteStorageType::GOOGLE_CLOUD && useIAM) {
+#ifdef ENABLE_GCP_NATIVE
             sdk_options_.httpOptions.httpClientFactory_create_fn = []() {
                 auto credentials = std::make_shared<
                     google::cloud::oauth2_internal::GOOGLE_CLOUD_CPP_NS::
@@ -117,6 +118,10 @@ MinioChunkManager::InitSDKAPI(RemoteStorageType type,
                 return Aws::MakeShared<GoogleHttpClientFactory>(
                     GOOGLE_CLIENT_FACTORY_ALLOCATION_TAG, credentials);
             };
+#else
+            ThrowInfo(S3Error,
+                      "GCP IAM storage requires ENABLE_GCP_NATIVE=ON");
+#endif
         } else if (need_tls) {
             sdk_options_.httpOptions.httpClientFactory_create_fn =
                 [tls_min_version]() {

@@ -31,12 +31,14 @@
 #include <aws/core/utils/logging/FormattedLogSystem.h>
 #include <aws/s3/S3Client.h>
 #include <fmt/core.h>
+#ifdef ENABLE_GCP_NATIVE
 #include <google/cloud/credentials.h>
 #include <google/cloud/internal/oauth2_credentials.h>
 #include <google/cloud/internal/oauth2_google_credentials.h>
 #include <google/cloud/storage/oauth2/compute_engine_credentials.h>
 #include <google/cloud/storage/oauth2/google_credentials.h>
 #include <google/cloud/status_or.h>
+#endif
 
 #include "common/EasyAssert.h"
 #include "common/Exception.h"
@@ -386,6 +388,7 @@ class TlsHttpClientFactory : public Aws::Http::HttpClientFactory {
 static const char* GOOGLE_CLIENT_FACTORY_ALLOCATION_TAG =
     "GoogleHttpClientFactory";
 
+#ifdef ENABLE_GCP_NATIVE
 class GoogleHttpClientFactory : public Aws::Http::HttpClientFactory {
  public:
     explicit GoogleHttpClientFactory(
@@ -449,5 +452,6 @@ class GoogleHttpClientFactory : public Aws::Http::HttpClientFactory {
     std::shared_ptr<google::cloud::oauth2_internal::Credentials> credentials_;
     std::string tls_min_version_;
 };
+#endif
 
 }  // namespace milvus::storage
