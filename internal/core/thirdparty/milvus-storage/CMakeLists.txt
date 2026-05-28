@@ -83,14 +83,14 @@ else()
         FetchContent_Populate( milvus-storage )
         set( MILVUS_STORAGE_S3_ASYNC_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/s3_async_read_path.patch )
         execute_process(
-                COMMAND git apply --check ${MILVUS_STORAGE_S3_ASYNC_PATCH}
+                COMMAND git apply --unidiff-zero --check ${MILVUS_STORAGE_S3_ASYNC_PATCH}
                 WORKING_DIRECTORY ${milvus-storage_SOURCE_DIR}
                 RESULT_VARIABLE MILVUS_STORAGE_S3_ASYNC_PATCH_CHECK_RESULT
                 OUTPUT_QUIET
                 ERROR_QUIET )
         if ( MILVUS_STORAGE_S3_ASYNC_PATCH_CHECK_RESULT EQUAL 0 )
             execute_process(
-                    COMMAND git apply ${MILVUS_STORAGE_S3_ASYNC_PATCH}
+                    COMMAND git apply --unidiff-zero ${MILVUS_STORAGE_S3_ASYNC_PATCH}
                     WORKING_DIRECTORY ${milvus-storage_SOURCE_DIR}
                     RESULT_VARIABLE MILVUS_STORAGE_S3_ASYNC_PATCH_APPLY_RESULT )
             if ( NOT MILVUS_STORAGE_S3_ASYNC_PATCH_APPLY_RESULT EQUAL 0 )
@@ -98,7 +98,7 @@ else()
             endif()
         else()
             execute_process(
-                    COMMAND git apply --reverse --check ${MILVUS_STORAGE_S3_ASYNC_PATCH}
+                    COMMAND git apply --unidiff-zero --reverse --check ${MILVUS_STORAGE_S3_ASYNC_PATCH}
                     WORKING_DIRECTORY ${milvus-storage_SOURCE_DIR}
                     RESULT_VARIABLE MILVUS_STORAGE_S3_ASYNC_PATCH_REVERSE_CHECK_RESULT
                     OUTPUT_QUIET

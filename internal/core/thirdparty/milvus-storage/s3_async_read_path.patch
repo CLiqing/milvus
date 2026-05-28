@@ -1,326 +1,87 @@
 diff --git a/cpp/CMakeLists.txt b/cpp/CMakeLists.txt
-index 14c5219..c8946b4 100644
+index 1c90ab7..e8fb686 100644
 --- a/cpp/CMakeLists.txt
 +++ b/cpp/CMakeLists.txt
-@@ -10,6 +10,7 @@ option(WITH_UT "Build the testing tree." OFF)
- option(WITH_ASAN "Build with address sanitizer." OFF)
- option(WITH_BENCHMARK "Build with micro benchmark." ON)
- option(WITH_AZURE_FS "Build with azure file system." ON)
+@@ -12,0 +13 @@ option(WITH_AZURE_FS "Build with azure file system." ON)
 +option(WITH_GCP_FS "Build with GCP S3-compatible filesystem support." ON)
- option(WITH_JNI "Build with JNI library." OFF)
- option(WITH_PYTHON_BINDING "Build for Python bindings with hidden symbols." OFF)
- option(WITH_FIU "Build with fault injection support (libfiu)." OFF)
-@@ -27,11 +28,16 @@ if (WITH_AZURE_FS)
-   add_compile_definitions(MILVUS_AZURE_FS)
- endif()
-
+@@ -29,0 +31,3 @@ endif()
 +if (WITH_GCP_FS)
 +  add_compile_definitions(MILVUS_GCP_FS)
 +endif()
-
- find_package(Boost REQUIRED)
- find_package(fmt REQUIRED)
- find_package(folly REQUIRED)
- find_package(Arrow REQUIRED)
+@@ -33,0 +38 @@ find_package(Arrow REQUIRED)
 +find_package(CURL REQUIRED)
-+find_library(AIO_LIBRARY aio REQUIRED)
- # Support both Conan (lowercase) and system (mixed-case) variable names
- if(NOT Arrow_INCLUDE_DIRS AND arrow_INCLUDE_DIRS)
-   set(Arrow_INCLUDE_DIRS ${arrow_INCLUDE_DIRS})
-@@ -39,7 +45,9 @@ endif()
- include_directories(${Arrow_INCLUDE_DIRS})
-
- find_package(Protobuf REQUIRED)
+@@ -37 +42,3 @@ find_package(Protobuf REQUIRED)
 -find_package(google-cloud-cpp REQUIRED)
 +if (WITH_GCP_FS)
 +  find_package(google-cloud-cpp REQUIRED)
 +endif()
- find_package(libavrocpp QUIET)
- if(NOT libavrocpp_FOUND)
-   find_package(avro-cpp REQUIRED)
-@@ -68,8 +76,12 @@ list(FILTER ALL_SRC_FILES EXCLUDE REGEX ".*/src/format/bridge/.*\\.(cpp|cc)$")
- list(FILTER ALL_SRC_FILES EXCLUDE REGEX ".*/src/jni/.*\\.cpp$")
-
- add_library(milvus-storage SHARED ${ALL_SRC_FILES})
-+set_source_files_properties(src/filesystem/s3/s3_filesystem.cpp PROPERTIES COMPILE_OPTIONS "-std=gnu++20")
-
--list(APPEND LINK_LIBS arrow::arrow Boost::boost protobuf::protobuf AWS::aws-sdk-cpp-identity-management google-cloud-cpp::storage ${AVRO_TARGET} Folly::folly fmt::fmt)
-+list(APPEND LINK_LIBS arrow::arrow Boost::boost protobuf::protobuf AWS::aws-sdk-cpp-identity-management AWS::aws-sdk-cpp-s3 AWS::aws-sdk-cpp-s3-crt ${AVRO_TARGET} Folly::folly fmt::fmt CURL::libcurl ${AIO_LIBRARY})
+@@ -67,0 +75,2 @@ add_library(milvus-storage SHARED ${ALL_SRC_FILES})
++set_source_files_properties(src/filesystem/s3/multi_part_upload_s3_fs.cpp
++  PROPERTIES COMPILE_OPTIONS "-std=gnu++20;-fcoroutines")
+@@ -69 +78,4 @@ add_library(milvus-storage SHARED ${ALL_SRC_FILES})
+-list(APPEND LINK_LIBS arrow::arrow Boost::boost protobuf::protobuf AWS::aws-sdk-cpp-identity-management google-cloud-cpp::storage libavrocpp::libavrocpp)
++list(APPEND LINK_LIBS arrow::arrow Boost::boost protobuf::protobuf AWS::aws-sdk-cpp-identity-management AWS::aws-sdk-cpp-s3 AWS::aws-sdk-cpp-s3-crt libavrocpp::libavrocpp CURL::libcurl)
 +if (WITH_GCP_FS)
 +  list(APPEND LINK_LIBS google-cloud-cpp::storage)
 +endif()
- list(APPEND INCLUDE_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
- # Fault injection support using libfiu
-@@ -255,4 +267,4 @@ install(DIRECTORY "${PROJECT_SOURCE_DIR}/include/milvus-storage"
-
- set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-
+@@ -167 +179 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 -set(CMAKE_INCLUDE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/include)
 \ No newline at end of file
 +set(CMAKE_INCLUDE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/include)
 diff --git a/cpp/conanfile.py b/cpp/conanfile.py
-index 6cb8f28..cd5302a 100644
+index f115e56..8005f04 100644
 --- a/cpp/conanfile.py
 +++ b/cpp/conanfile.py
-@@ -51,6 +51,7 @@ class StorageConan(ConanFile):
-         "gflags:shared": True,
-         "openssl:shared": True,
-         "aws-sdk-cpp:config": True,
+@@ -44,0 +45 @@ class StorageConan(ConanFile):
 +        "aws-sdk-cpp:s3-crt": True,
-         "aws-sdk-cpp:text-to-speech": False,
-         "aws-sdk-cpp:transfer": False,
-         "arrow:with_s3": True,
-diff --git a/cpp/include/milvus-storage/filesystem/fs.h b/cpp/include/milvus-storage/filesystem/fs.h
-index 65ac15f..caa1b38 100644
---- a/cpp/include/milvus-storage/filesystem/fs.h
-+++ b/cpp/include/milvus-storage/filesystem/fs.h
-@@ -71,7 +71,16 @@ class FileSystemProxy : public arrow::fs::SubTreeFileSystem,
-   arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> OpenInputFile(const std::string& path) override {
-     FIU_RETURN_ON(FIUKEY_FS_OPEN_INPUT_FAIL,
-                   arrow::Status::IOError(fmt::format("Injected fault: {}", FIUKEY_FS_OPEN_INPUT_FAIL)));
--    return SubTreeFileSystem::OpenInputFile(path);
-+    ARROW_ASSIGN_OR_RAISE(auto full_path, PrependBase(path));
-+    return base_fs()->OpenInputFile(full_path);
-+  }
-+
-+  arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> OpenInputFile(
-+      const arrow::fs::FileInfo& info) override {
-+    FIU_RETURN_ON(FIUKEY_FS_OPEN_INPUT_FAIL,
-+                  arrow::Status::IOError(fmt::format("Injected fault: {}", FIUKEY_FS_OPEN_INPUT_FAIL)));
-+    ARROW_ASSIGN_OR_RAISE(auto full_path, PrependBase(info.path()));
-+    return base_fs()->OpenInputFile(full_path);
-   }
-
-   arrow::Result<std::shared_ptr<arrow::io::OutputStream>> OpenConditionalOutputStream(
-diff --git a/cpp/include/milvus-storage/filesystem/s3/s3_filesystem_producer.h b/cpp/include/milvus-storage/filesystem/s3/s3_filesystem_producer.h
-index 37a3d20..ad5cffa 100644
---- a/cpp/include/milvus-storage/filesystem/s3/s3_filesystem_producer.h
-+++ b/cpp/include/milvus-storage/filesystem/s3/s3_filesystem_producer.h
-@@ -19,11 +19,13 @@
- #include <aws/core/http/HttpClientFactory.h>
- #include <aws/core/http/curl/CurlHttpClient.h>
- #include <aws/core/http/standard/StandardHttpRequest.h>
- #include <arrow/util/uri.h>
+diff --git a/cpp/include/milvus-storage/filesystem/s3/s3_fs.h b/cpp/include/milvus-storage/filesystem/s3/s3_fs.h
+index 15743da..d8d2d95 100644
+--- a/cpp/include/milvus-storage/filesystem/s3/s3_fs.h
++++ b/cpp/include/milvus-storage/filesystem/s3/s3_fs.h
+@@ -21,0 +22 @@
 +#ifdef MILVUS_GCP_FS
- #include <google/cloud/internal/oauth2_credentials.h>
- #include <google/cloud/internal/oauth2_google_credentials.h>
- #include <google/cloud/storage/oauth2/compute_engine_credentials.h>
- #include <google/cloud/storage/oauth2/google_credentials.h>
- #include <google/cloud/status_or.h>
+@@ -26,0 +28 @@
 +#endif
- #include <cstdlib>
- #include "milvus-storage/common/macro.h"
- #include "milvus-storage/filesystem/fs.h"
-diff --git a/cpp/src/filesystem/s3/s3_client.cpp b/cpp/src/filesystem/s3/s3_client.cpp
-index 5921c30..76af901 100644
---- a/cpp/src/filesystem/s3/s3_client.cpp
-+++ b/cpp/src/filesystem/s3/s3_client.cpp
-@@ -16,7 +16,9 @@
-
- #include <algorithm>
- #include <atomic>
+diff --git a/cpp/src/filesystem/s3/multi_part_upload_s3_fs.cpp b/cpp/src/filesystem/s3/multi_part_upload_s3_fs.cpp
+index d0b2f5a..bda209f 100644
+--- a/cpp/src/filesystem/s3/multi_part_upload_s3_fs.cpp
++++ b/cpp/src/filesystem/s3/multi_part_upload_s3_fs.cpp
+@@ -18,0 +19 @@
 +#include <cctype>
- #include <chrono>
-+#include <cstdlib>
- #include <memory>
- #include <mutex>
- #include <optional>
-@@ -35,6 +37,7 @@
- #include <aws/core/client/DefaultRetryStrategy.h>
- #include <aws/core/client/RetryStrategy.h>
- #include <aws/core/http/HttpResponse.h>
-+#include <aws/core/utils/threading/PooledThreadExecutor.h>
- #include <aws/core/utils/xml/XmlSerializer.h>
- #include <aws/core/internal/AWSHttpResourceClient.h>
- #include <aws/s3/S3Client.h>
-@@ -64,6 +67,36 @@ using ::milvus_storage::fs::internal::ToAwsString;
-
- namespace milvus_storage {
-
-+namespace {
-+
-+bool IsEnvEnabled(const char* name) {
-+  const char* value = std::getenv(name);
-+  if (value == nullptr || *value == '\0') {
-+    return false;
-+  }
-+  std::string text(value);
-+  std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
-+    return static_cast<char>(std::tolower(c));
-+  });
-+  return text == "1" || text == "true" || text == "on" || text == "yes";
-+}
-+
-+uint64_t GetUnsignedEnv(const char* name, uint64_t default_value) {
-+  const char* value = std::getenv(name);
-+  if (value == nullptr || *value == '\0') {
-+    return default_value;
-+  }
-+  try {
-+    size_t parsed = 0;
-+    auto result = std::stoull(value, &parsed, 10);
-+    return parsed == std::string(value).size() ? result : default_value;
-+  } catch (...) {
-+    return default_value;
-+  }
-+}
-+
-+}  // namespace
-+
- namespace S3Model = Aws::S3::Model;
- static inline constexpr auto kBucketRegionHeaderName = "x-amz-bucket-region";
-
-@@ -547,6 +580,15 @@ arrow::Result<std::shared_ptr<S3ClientHolder>> ClientBuilder::BuildClient(
-   }
-
-   client_config_.maxConnections = std::max(client_config_.maxConnections, options_.max_connections);
-+  if (IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC") &&
-+      !IsEnvEnabled("MILVUS_S3_CLIENT_COROUTINE") &&
-+      !IsEnvEnabled("MILVUS_S3_CLIENT_CRT")) {
-+    auto executor_threads =
-+        static_cast<size_t>(std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_S3_ASYNC_EXECUTOR_THREADS",
-+                                                                 client_config_.maxConnections)));
-+    client_config_.executor =
-+        Aws::MakeShared<Aws::Utils::Threading::PooledThreadExecutor>("MilvusS3AsyncExecutor", executor_threads);
-+  }
-
-   const bool use_virtual_addressing = options_.endpoint_override.empty() || options_.force_virtual_addressing;
-
-@@ -565,4 +607,4 @@ arrow::Result<std::shared_ptr<S3ClientHolder>> ClientBuilder::BuildClient(
-
- // ------------ Implementation of ClientBuilder End ------------
-
--}  // namespace milvus_storage
-\ No newline at end of file
-+}  // namespace milvus_storage
-diff --git a/cpp/src/filesystem/s3/s3_filesystem_producer.cpp b/cpp/src/filesystem/s3/s3_filesystem_producer.cpp
-index 07b365f..0b16c1b 100644
---- a/cpp/src/filesystem/s3/s3_filesystem_producer.cpp
-+++ b/cpp/src/filesystem/s3/s3_filesystem_producer.cpp
-@@ -16,8 +16,10 @@
- #include "milvus-storage/filesystem/fs.h"
-
- #include <cstdlib>
-+#ifdef MILVUS_GCP_FS
- #include <google/cloud/internal/rest_client.h>
- #include <google/cloud/options.h>
-+#endif
- #include <mutex>
- #include <sstream>
-
-@@ -130,6 +132,7 @@ class TlsHttpClientFactory : public Aws::Http::HttpClientFactory {
-   std::string tls_min_version_;
- };
-
-+#ifdef MILVUS_GCP_FS
- // GoogleHttpClientDelegator: Delegation-pattern HttpClient
- // Modifies request headers on MakeRequest, then delegates to the underlying CurlHttpClient
- class GoogleHttpClientDelegator : public Aws::Http::HttpClient {
-@@ -294,6 +297,7 @@ class GoogleHttpClientFactory : public Aws::Http::HttpClientFactory {
-   std::string secret_key_;
-   std::string tls_min_version_;
- };
-+#endif
-
- void S3FileSystemProducer::InitS3() {
-   static std::once_flag s3_init_flag;
-@@ -305,6 +309,7 @@ void S3FileSystemProducer::InitS3() {
-     // tls_min_version only takes effect when use_ssl is enabled
-     std::string tls_min_ver = (config_.use_ssl && !config_.tls_min_version.empty()) ? config_.tls_min_version : "";
-
-+#ifdef MILVUS_GCP_FS
-     if (config_.cloud_provider == kCloudProviderGCP) {
-       std::string ak = config_.access_key_id;
-       std::string sk = config_.access_key_value;
-@@ -329,6 +334,8 @@ void S3FileSystemProducer::InitS3() {
-       };
-       global_options.http_options = http_options;
-       global_options.override_default_http_options = true;
--    } else if (!tls_min_ver.empty()) {
-+    } else
-+#endif
-+    if (!tls_min_ver.empty()) {
-       // Non-GCP S3-compatible providers with TLS version override (only when use_ssl=true)
-       Aws::HttpOptions http_options;
-diff --git a/cpp/src/filesystem/s3/s3_filesystem.cpp b/cpp/src/filesystem/s3/s3_filesystem.cpp
-index 1d642fd..2e70125 100644
---- a/cpp/src/filesystem/s3/s3_filesystem.cpp
-+++ b/cpp/src/filesystem/s3/s3_filesystem.cpp
-@@ -17,12 +17,28 @@
-
- #include <algorithm>
- #include <atomic>
-+#include <cctype>
- #include <chrono>
+@@ -19,0 +21,5 @@
 +#include <cmath>
 +#include <coroutine>
-+#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
 +#include <deque>
-+#include <iostream>
- #include <memory>
- #include <mutex>
- #include <optional>
- #include <shared_mutex>
+@@ -23,0 +30 @@
 +#include <string>
- #include <thread>
+@@ -24,0 +32,6 @@
 +#include <unordered_map>
 +
 +#include <sys/epoll.h>
 +#include <sys/eventfd.h>
 +#include <sys/timerfd.h>
-+#include <pthread.h>
 +#include <unistd.h>
-
- #include <arrow/util/async_generator.h>
- #include <arrow/util/logging.h>
-@@ -41,15 +57,24 @@
- #include <aws/core/VersionConfig.h>
- #include <aws/core/auth/AWSCredentials.h>
- #include <aws/core/auth/AWSCredentialsProviderChain.h>
+@@ -42,0 +56 @@
 +#include <aws/core/auth/signer/AWSAuthV4Signer.h>
- #include <aws/core/auth/STSCredentialsProvider.h>
- #include <aws/core/client/DefaultRetryStrategy.h>
- #include <aws/core/client/RetryStrategy.h>
+@@ -45,0 +60 @@
 +#include <aws/core/http/HttpRequest.h>
- #include <aws/core/http/HttpResponse.h>
+@@ -46,0 +62,2 @@
 +#include <aws/core/http/URI.h>
 +#include <aws/core/http/standard/StandardHttpRequest.h>
- #include <aws/core/utils/logging/ConsoleLogSystem.h>
- #include <aws/core/utils/stream/PreallocatedStreamBuf.h>
- #include <aws/core/utils/xml/XmlSerializer.h>
- #include <aws/identity-management/auth/STSAssumeRoleCredentialsProvider.h>
+@@ -50,0 +68,3 @@
 +#include <aws/crt/io/Bootstrap.h>
 +#include <aws/crt/io/EventLoopGroup.h>
 +#include <aws/crt/io/HostResolver.h>
- #include <aws/s3/S3Client.h>
+@@ -51,0 +72,2 @@
 +#include <aws/s3-crt/S3CrtClient.h>
 +#include <aws/s3-crt/model/GetObjectRequest.h>
- #include <aws/s3/model/AbortMultipartUploadRequest.h>
- #include <aws/s3/model/CompleteMultipartUploadRequest.h>
- #include <aws/s3/model/CompletedMultipartUpload.h>
-@@ -68,6 +93,7 @@
- #include <aws/s3/model/ObjectCannedACL.h>
- #include <aws/s3/model/PutObjectRequest.h>
- #include <aws/s3/model/UploadPartRequest.h>
+@@ -69,0 +92 @@
 +#include <curl/curl.h>
-
- #include "milvus-storage/common/fiu_local.h"
- #include "milvus-storage/common/path_util.h"
-@@ -78,6 +104,7 @@
-
- using ::arrow::Buffer;
- using ::arrow::Future;
+@@ -81,0 +105 @@ using ::arrow::Future;
 +using ::arrow::ResizableBuffer;
- using ::arrow::Result;
- using ::arrow::Status;
- using ::arrow::fs::FileInfo;
-@@ -105,6 +132,381 @@ using ::milvus_storage::fs::internal::ToAwsString;
- namespace S3Model = Aws::S3::Model;
-
- namespace milvus_storage {
+@@ -108,0 +133,45 @@ namespace milvus_storage {
 +
 +namespace {
 +
@@ -364,345 +125,9 @@ index 1d642fd..2e70125 100644
 +  }
 +}
 +
-+void UpdateMax(std::atomic<uint64_t>& target, uint64_t value) {
-+  auto current = target.load(std::memory_order_relaxed);
-+  while (current < value &&
-+         !target.compare_exchange_weak(current,
-+                                       value,
-+                                       std::memory_order_relaxed,
-+                                       std::memory_order_relaxed)) {
-+  }
-+}
-+
-+uint64_t NowMicros() {
-+  return static_cast<uint64_t>(
-+      std::chrono::duration_cast<std::chrono::microseconds>(
-+          std::chrono::steady_clock::now().time_since_epoch())
-+          .count());
-+}
-+
-+struct CurlMultiStats {
-+  std::atomic<uint64_t> executor_inits{0};
-+  std::atomic<uint64_t> configured_event_loops{0};
-+  std::atomic<uint64_t> read_async_calls{0};
-+  std::atomic<uint64_t> read_async_disabled_fallback{0};
-+  std::atomic<uint64_t> read_async_coroutine_branch{0};
-+  std::atomic<uint64_t> read_async_crt_branch{0};
-+  std::atomic<uint64_t> read_async_aws_async_branch{0};
-+  std::atomic<uint64_t> submitted{0};
-+  std::atomic<uint64_t> wake_calls{0};
-+  std::atomic<uint64_t> epoll_wait_returns{0};
-+  std::atomic<uint64_t> epoll_events{0};
-+  std::atomic<uint64_t> eventfd_wakes{0};
-+  std::atomic<uint64_t> timerfd_wakes{0};
-+  std::atomic<uint64_t> socket_wakes{0};
-+  std::atomic<uint64_t> add_pending_batches{0};
-+  std::atomic<uint64_t> add_pending_requests{0};
-+  std::atomic<uint64_t> started{0};
-+  std::atomic<uint64_t> completed{0};
-+  std::atomic<uint64_t> failed{0};
-+  std::atomic<uint64_t> resumed{0};
-+  std::atomic<uint64_t> completed_bytes{0};
-+  std::atomic<uint64_t> max_pending{0};
-+  std::atomic<uint64_t> max_active{0};
-+  std::atomic<uint64_t> active_global{0};
-+  std::atomic<uint64_t> max_active_global{0};
-+  std::atomic<uint64_t> last_reported_done{0};
-+  std::atomic<uint64_t> window_last_us{0};
-+  std::atomic<uint64_t> window_last_submitted{0};
-+  std::atomic<uint64_t> window_last_started{0};
-+  std::atomic<uint64_t> window_last_completed{0};
-+  std::atomic<uint64_t> window_last_failed{0};
-+  std::atomic<uint64_t> window_last_completed_bytes{0};
-+  std::atomic<uint64_t> window_last_add_pending_batches{0};
-+  std::atomic<uint64_t> window_last_add_pending_requests{0};
-+
-+  ~CurlMultiStats() {
-+    if (!IsEnvEnabled("MILVUS_S3_CURL_MULTI_STATS")) {
-+      return;
-+    }
-+    Print("process_exit");
-+  }
-+
-+  void Print(const char* reason) const {
-+    std::cerr << "[MILVUS_S3_CURL_MULTI_STATS]"
-+              << " reason=" << reason
-+              << " executor_inits=" << executor_inits.load(std::memory_order_relaxed)
-+              << " configured_event_loops=" << configured_event_loops.load(std::memory_order_relaxed)
-+              << " read_async_calls=" << read_async_calls.load(std::memory_order_relaxed)
-+              << " read_async_disabled_fallback="
-+              << read_async_disabled_fallback.load(std::memory_order_relaxed)
-+              << " read_async_coroutine_branch="
-+              << read_async_coroutine_branch.load(std::memory_order_relaxed)
-+              << " read_async_crt_branch="
-+              << read_async_crt_branch.load(std::memory_order_relaxed)
-+              << " read_async_aws_async_branch="
-+              << read_async_aws_async_branch.load(std::memory_order_relaxed)
-+              << " submitted=" << submitted.load(std::memory_order_relaxed)
-+              << " wake_calls=" << wake_calls.load(std::memory_order_relaxed)
-+              << " epoll_wait_returns=" << epoll_wait_returns.load(std::memory_order_relaxed)
-+              << " epoll_events=" << epoll_events.load(std::memory_order_relaxed)
-+              << " eventfd_wakes=" << eventfd_wakes.load(std::memory_order_relaxed)
-+              << " timerfd_wakes=" << timerfd_wakes.load(std::memory_order_relaxed)
-+              << " socket_wakes=" << socket_wakes.load(std::memory_order_relaxed)
-+              << " add_pending_batches=" << add_pending_batches.load(std::memory_order_relaxed)
-+              << " add_pending_requests=" << add_pending_requests.load(std::memory_order_relaxed)
-+              << " started=" << started.load(std::memory_order_relaxed)
-+              << " completed=" << completed.load(std::memory_order_relaxed)
-+              << " failed=" << failed.load(std::memory_order_relaxed)
-+              << " resumed=" << resumed.load(std::memory_order_relaxed)
-+              << " completed_bytes=" << completed_bytes.load(std::memory_order_relaxed)
-+              << " max_pending=" << max_pending.load(std::memory_order_relaxed)
-+              << " max_active=" << max_active.load(std::memory_order_relaxed)
-+              << " active_global=" << active_global.load(std::memory_order_relaxed)
-+              << " max_active_global=" << max_active_global.load(std::memory_order_relaxed)
-+              << std::endl;
-+  }
-+
-+  void MaybePrintWindow(const char* reason) {
-+    if (!IsEnvEnabled("MILVUS_READ_PATH_WINDOW_STATS")) {
-+      return;
-+    }
-+    const auto now_us = NowMicros();
-+    const auto interval_us =
-+        std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_READ_PATH_WINDOW_MS", 250)) * 1000;
-+    auto last_us = window_last_us.load(std::memory_order_relaxed);
-+    if (last_us == 0) {
-+      window_last_us.compare_exchange_strong(last_us,
-+                                             now_us,
-+                                             std::memory_order_relaxed,
-+                                             std::memory_order_relaxed);
-+      return;
-+    }
-+    if (now_us <= last_us || now_us - last_us < interval_us) {
-+      return;
-+    }
-+    if (!window_last_us.compare_exchange_strong(last_us,
-+                                                now_us,
-+                                                std::memory_order_relaxed,
-+                                                std::memory_order_relaxed)) {
-+      return;
-+    }
-+
-+    const auto submitted_now = submitted.load(std::memory_order_relaxed);
-+    const auto started_now = started.load(std::memory_order_relaxed);
-+    const auto completed_now = completed.load(std::memory_order_relaxed);
-+    const auto failed_now = failed.load(std::memory_order_relaxed);
-+    const auto bytes_now = completed_bytes.load(std::memory_order_relaxed);
-+    const auto add_batches_now = add_pending_batches.load(std::memory_order_relaxed);
-+    const auto add_requests_now = add_pending_requests.load(std::memory_order_relaxed);
-+    const auto submitted_prev =
-+        window_last_submitted.exchange(submitted_now, std::memory_order_relaxed);
-+    const auto started_prev =
-+        window_last_started.exchange(started_now, std::memory_order_relaxed);
-+    const auto completed_prev =
-+        window_last_completed.exchange(completed_now, std::memory_order_relaxed);
-+    const auto failed_prev =
-+        window_last_failed.exchange(failed_now, std::memory_order_relaxed);
-+    const auto bytes_prev =
-+        window_last_completed_bytes.exchange(bytes_now, std::memory_order_relaxed);
-+    const auto add_batches_prev =
-+        window_last_add_pending_batches.exchange(add_batches_now, std::memory_order_relaxed);
-+    const auto add_requests_prev =
-+        window_last_add_pending_requests.exchange(add_requests_now, std::memory_order_relaxed);
-+
-+    std::cerr << "[MILVUS_READ_PATH_WINDOW]"
-+              << " layer=curl_multi"
-+              << " reason=" << reason
-+              << " ts_us=" << now_us
-+              << " delta_us=" << (now_us - last_us)
-+              << " active_global=" << active_global.load(std::memory_order_relaxed)
-+              << " submitted_total=" << submitted_now
-+              << " started_total=" << started_now
-+              << " completed_total=" << completed_now
-+              << " failed_total=" << failed_now
-+              << " completed_bytes_total=" << bytes_now
-+              << " add_pending_batches_total=" << add_batches_now
-+              << " add_pending_requests_total=" << add_requests_now
-+              << " submitted_delta=" << (submitted_now - submitted_prev)
-+              << " started_delta=" << (started_now - started_prev)
-+              << " completed_delta=" << (completed_now - completed_prev)
-+              << " failed_delta=" << (failed_now - failed_prev)
-+              << " completed_bytes_delta=" << (bytes_now - bytes_prev)
-+              << " add_pending_batches_delta=" << (add_batches_now - add_batches_prev)
-+              << " add_pending_requests_delta=" << (add_requests_now - add_requests_prev)
-+              << " max_pending=" << max_pending.load(std::memory_order_relaxed)
-+              << " max_active=" << max_active.load(std::memory_order_relaxed)
-+              << " max_active_global=" << max_active_global.load(std::memory_order_relaxed)
-+              << std::endl;
-+  }
-+};
-+
-+struct S3CrtStats {
-+  std::atomic<uint64_t> client_inits{0};
-+  std::atomic<uint64_t> configured_event_loops{0};
-+  std::atomic<uint64_t> max_connections{0};
-+  std::atomic<uint64_t> throughput_target_mbps{0};
-+  std::atomic<uint64_t> submitted{0};
-+  std::atomic<uint64_t> completed{0};
-+  std::atomic<uint64_t> failed{0};
-+  std::atomic<uint64_t> requested_bytes{0};
-+  std::atomic<uint64_t> completed_bytes{0};
-+  std::atomic<uint64_t> active{0};
-+  std::atomic<uint64_t> max_active{0};
-+  std::atomic<uint64_t> last_reported_done{0};
-+  std::atomic<uint64_t> window_last_us{0};
-+  std::atomic<uint64_t> window_last_submitted{0};
-+  std::atomic<uint64_t> window_last_completed{0};
-+  std::atomic<uint64_t> window_last_failed{0};
-+  std::atomic<uint64_t> window_last_requested_bytes{0};
-+  std::atomic<uint64_t> window_last_completed_bytes{0};
-+
-+  ~S3CrtStats() {
-+    if (!IsEnvEnabled("MILVUS_S3_CRT_STATS")) {
-+      return;
-+    }
-+    Print("process_exit");
-+  }
-+
-+  void Print(const char* reason) const {
-+    std::cerr << "[MILVUS_S3_CRT_STATS]"
-+              << " reason=" << reason
-+              << " client_inits=" << client_inits.load(std::memory_order_relaxed)
-+              << " configured_event_loops=" << configured_event_loops.load(std::memory_order_relaxed)
-+              << " max_connections=" << max_connections.load(std::memory_order_relaxed)
-+              << " throughput_target_gbps="
-+              << (static_cast<double>(throughput_target_mbps.load(std::memory_order_relaxed)) / 1000.0)
-+              << " submitted=" << submitted.load(std::memory_order_relaxed)
-+              << " completed=" << completed.load(std::memory_order_relaxed)
-+              << " failed=" << failed.load(std::memory_order_relaxed)
-+              << " requested_bytes=" << requested_bytes.load(std::memory_order_relaxed)
-+              << " completed_bytes=" << completed_bytes.load(std::memory_order_relaxed)
-+              << " active=" << active.load(std::memory_order_relaxed)
-+              << " max_active=" << max_active.load(std::memory_order_relaxed)
-+              << std::endl;
-+  }
-+
-+  void MaybePrintWindow(const char* reason) {
-+    if (!IsEnvEnabled("MILVUS_READ_PATH_WINDOW_STATS")) {
-+      return;
-+    }
-+    const auto now_us = NowMicros();
-+    const auto interval_us =
-+        std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_READ_PATH_WINDOW_MS", 250)) * 1000;
-+    auto last_us = window_last_us.load(std::memory_order_relaxed);
-+    if (last_us == 0) {
-+      window_last_us.compare_exchange_strong(last_us,
-+                                             now_us,
-+                                             std::memory_order_relaxed,
-+                                             std::memory_order_relaxed);
-+      return;
-+    }
-+    if (now_us <= last_us || now_us - last_us < interval_us) {
-+      return;
-+    }
-+    if (!window_last_us.compare_exchange_strong(last_us,
-+                                                now_us,
-+                                                std::memory_order_relaxed,
-+                                                std::memory_order_relaxed)) {
-+      return;
-+    }
-+
-+    const auto submitted_now = submitted.load(std::memory_order_relaxed);
-+    const auto completed_now = completed.load(std::memory_order_relaxed);
-+    const auto failed_now = failed.load(std::memory_order_relaxed);
-+    const auto requested_bytes_now = requested_bytes.load(std::memory_order_relaxed);
-+    const auto completed_bytes_now = completed_bytes.load(std::memory_order_relaxed);
-+    const auto submitted_prev =
-+        window_last_submitted.exchange(submitted_now, std::memory_order_relaxed);
-+    const auto completed_prev =
-+        window_last_completed.exchange(completed_now, std::memory_order_relaxed);
-+    const auto failed_prev =
-+        window_last_failed.exchange(failed_now, std::memory_order_relaxed);
-+    const auto requested_bytes_prev =
-+        window_last_requested_bytes.exchange(requested_bytes_now, std::memory_order_relaxed);
-+    const auto completed_bytes_prev =
-+        window_last_completed_bytes.exchange(completed_bytes_now, std::memory_order_relaxed);
-+
-+    std::cerr << "[MILVUS_READ_PATH_WINDOW]"
-+              << " layer=crt"
-+              << " reason=" << reason
-+              << " ts_us=" << now_us
-+              << " delta_us=" << (now_us - last_us)
-+              << " active=" << active.load(std::memory_order_relaxed)
-+              << " submitted_total=" << submitted_now
-+              << " completed_total=" << completed_now
-+              << " failed_total=" << failed_now
-+              << " requested_bytes_total=" << requested_bytes_now
-+              << " completed_bytes_total=" << completed_bytes_now
-+              << " submitted_delta=" << (submitted_now - submitted_prev)
-+              << " completed_delta=" << (completed_now - completed_prev)
-+              << " failed_delta=" << (failed_now - failed_prev)
-+              << " requested_bytes_delta=" << (requested_bytes_now - requested_bytes_prev)
-+              << " completed_bytes_delta=" << (completed_bytes_now - completed_bytes_prev)
-+              << " max_active=" << max_active.load(std::memory_order_relaxed)
-+              << std::endl;
-+  }
-+};
-+
-+CurlMultiStats& GetCurlMultiStats() {
-+  static CurlMultiStats stats;
-+  return stats;
-+}
-+
-+S3CrtStats& GetS3CrtStats() {
-+  static S3CrtStats stats;
-+  return stats;
-+}
-+
-+void MaybeReportCurlMultiStats() {
-+  if (!IsEnvEnabled("MILVUS_S3_CURL_MULTI_STATS")) {
-+    return;
-+  }
-+  auto& stats = GetCurlMultiStats();
-+  const auto submitted = stats.submitted.load(std::memory_order_relaxed);
-+  const auto done = stats.completed.load(std::memory_order_relaxed) + stats.failed.load(std::memory_order_relaxed);
-+  if (submitted == 0 || done != submitted) {
-+    return;
-+  }
-+  auto last = stats.last_reported_done.load(std::memory_order_relaxed);
-+  while (last < done &&
-+         !stats.last_reported_done.compare_exchange_weak(last,
-+                                                         done,
-+                                                         std::memory_order_relaxed,
-+                                                         std::memory_order_relaxed)) {
-+  }
-+  if (last < done) {
-+    stats.Print("all_submitted_done");
-+  }
-+}
-+
-+void MaybeReportS3CrtStats() {
-+  if (!IsEnvEnabled("MILVUS_S3_CRT_STATS")) {
-+    return;
-+  }
-+  auto& stats = GetS3CrtStats();
-+  const auto submitted = stats.submitted.load(std::memory_order_relaxed);
-+  const auto done = stats.completed.load(std::memory_order_relaxed) + stats.failed.load(std::memory_order_relaxed);
-+  if (submitted == 0 || done != submitted) {
-+    return;
-+  }
-+  auto last = stats.last_reported_done.load(std::memory_order_relaxed);
-+  while (last < done &&
-+         !stats.last_reported_done.compare_exchange_weak(last,
-+                                                         done,
-+                                                         std::memory_order_relaxed,
-+                                                         std::memory_order_relaxed)) {
-+  }
-+  if (last < done) {
-+    stats.Print("all_submitted_done");
-+  }
-+}
-+
 +}  // namespace
 +
- // -----------------------------------------------------------------------
- // S3FileSystem implementation
-
-@@ -407,6 +809,763 @@ arrow::Result<S3Model::GetObjectResult> GetObjectRange(
-   return OutcomeToResult("GetObject", client->GetObject(req));
- }
-
+@@ -335,0 +405,679 @@ arrow::Result<S3Model::GetObjectResult> GetObjectRange(
 +struct CurlMultiResult {
 +  bool ok = false;
 +  int64_t bytes = 0;
@@ -749,11 +174,9 @@ index 1d642fd..2e70125 100644
 +    std::call_once(curl_global_init_once, []() { curl_global_init(CURL_GLOBAL_DEFAULT); });
 +
 +    event_loop_count = std::max<size_t>(event_loop_count, 1);
-+    GetCurlMultiStats().executor_inits.fetch_add(1, std::memory_order_relaxed);
-+    GetCurlMultiStats().configured_event_loops.store(event_loop_count, std::memory_order_relaxed);
 +    loops_.reserve(event_loop_count);
 +    for (size_t i = 0; i < event_loop_count; ++i) {
-+      loops_.push_back(std::make_unique<Loop>(*this, i));
++      loops_.push_back(std::make_unique<Loop>(*this));
 +    }
 +    for (auto& loop : loops_) {
 +      loop->Start();
@@ -792,7 +215,7 @@ index 1d642fd..2e70125 100644
 + private:
 +  class Loop {
 +   public:
-+    explicit Loop(CurlMultiReadExecutor& owner, size_t index) : owner_(owner), index_(index) {
++    explicit Loop(CurlMultiReadExecutor& owner) : owner_(owner) {
 +      epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
 +      if (epoll_fd_ < 0) {
 +        throw std::runtime_error(std::string("epoll_create1 failed: ") + std::strerror(errno));
@@ -834,14 +257,7 @@ index 1d642fd..2e70125 100644
 +      }
 +    }
 +
-+    void Start() {
-+      thread_ = std::thread([this]() {
-+        char name[16];
-+        std::snprintf(name, sizeof(name), "S3CURLM%02zu", index_ % 100);
-+        pthread_setname_np(pthread_self(), name);
-+        Run();
-+      });
-+    }
++    void Start() { thread_ = std::thread([this]() { Run(); }); }
 +
 +    void Stop() {
 +      bool expected = false;
@@ -854,13 +270,9 @@ index 1d642fd..2e70125 100644
 +    }
 +
 +    void Submit(std::shared_ptr<CurlMultiRequest> request) {
-+      auto& stats = GetCurlMultiStats();
-+      stats.submitted.fetch_add(1, std::memory_order_relaxed);
-+      stats.MaybePrintWindow("submit");
 +      {
 +        std::lock_guard<std::mutex> lock(mutex_);
 +        pending_.push_back(std::move(request));
-+        UpdateMax(stats.max_pending, pending_.size());
 +      }
 +      Wake();
 +    }
@@ -943,7 +355,6 @@ index 1d642fd..2e70125 100644
 +    }
 +
 +    void Wake() {
-+      GetCurlMultiStats().wake_calls.fetch_add(1, std::memory_order_relaxed);
 +      uint64_t value = 1;
 +      ssize_t ignored = write(event_fd_, &value, sizeof(value));
 +      (void)ignored;
@@ -975,14 +386,10 @@ index 1d642fd..2e70125 100644
 +          }
 +          break;
 +        }
-+        GetCurlMultiStats().epoll_wait_returns.fetch_add(1, std::memory_order_relaxed);
-+        GetCurlMultiStats().epoll_events.fetch_add(static_cast<uint64_t>(count),
-+                                                   std::memory_order_relaxed);
 +
 +        for (int i = 0; i < count; ++i) {
 +          int fd = events[i].data.fd;
 +          if (fd == event_fd_) {
-+            GetCurlMultiStats().eventfd_wakes.fetch_add(1, std::memory_order_relaxed);
 +            DrainFd(event_fd_);
 +            if (AddPending()) {
 +              int running = 0;
@@ -992,7 +399,6 @@ index 1d642fd..2e70125 100644
 +            continue;
 +          }
 +          if (fd == timer_fd_) {
-+            GetCurlMultiStats().timerfd_wakes.fetch_add(1, std::memory_order_relaxed);
 +            DrainFd(timer_fd_);
 +            int running = 0;
 +            curl_multi_socket_action(multi_, CURL_SOCKET_TIMEOUT, 0, &running);
@@ -1010,7 +416,6 @@ index 1d642fd..2e70125 100644
 +          if ((events[i].events & (EPOLLERR | EPOLLHUP)) != 0) {
 +            flags |= CURL_CSELECT_ERR;
 +          }
-+          GetCurlMultiStats().socket_wakes.fetch_add(1, std::memory_order_relaxed);
 +          int running = 0;
 +          curl_multi_socket_action(multi_, fd, flags, &running);
 +          CompleteFinished();
@@ -1030,12 +435,6 @@ index 1d642fd..2e70125 100644
 +        local.swap(pending_);
 +      }
 +
-+      if (!local.empty()) {
-+        auto& stats = GetCurlMultiStats();
-+        stats.add_pending_batches.fetch_add(1, std::memory_order_relaxed);
-+        stats.add_pending_requests.fetch_add(local.size(), std::memory_order_relaxed);
-+        stats.MaybePrintWindow("add_pending");
-+      }
 +      for (auto& request : local) {
 +        StartRequest(std::move(request));
 +      }
@@ -1043,9 +442,6 @@ index 1d642fd..2e70125 100644
 +    }
 +
 +    void StartRequest(std::shared_ptr<CurlMultiRequest> request) {
-+      auto& start_stats = GetCurlMultiStats();
-+      start_stats.started.fetch_add(1, std::memory_order_relaxed);
-+      start_stats.MaybePrintWindow("start");
 +      request->easy = curl_easy_init();
 +      if (request->easy == nullptr) {
 +        FinishWithoutCurl(std::move(request), "curl_easy_init failed");
@@ -1081,10 +477,6 @@ index 1d642fd..2e70125 100644
 +        return;
 +      }
 +      active_[request->easy] = std::move(request);
-+      UpdateMax(GetCurlMultiStats().max_active, active_.size());
-+      auto& stats = GetCurlMultiStats();
-+      const auto active_global = stats.active_global.fetch_add(1, std::memory_order_relaxed) + 1;
-+      UpdateMax(stats.max_active_global, active_global);
 +    }
 +
 +    void CompleteFinished() {
@@ -1105,20 +497,13 @@ index 1d642fd..2e70125 100644
 +
 +        auto request = std::move(iter->second);
 +        active_.erase(iter);
-+        GetCurlMultiStats().active_global.fetch_sub(1, std::memory_order_relaxed);
 +        curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &request->result.http_status);
 +        if (message->data.result == CURLE_OK && request->result.http_status >= 200 &&
 +            request->result.http_status < 300) {
 +          request->result.ok = true;
 +          request->result.bytes = request->bytes;
-+          GetCurlMultiStats().completed.fetch_add(1, std::memory_order_relaxed);
-+          GetCurlMultiStats().completed_bytes.fetch_add(static_cast<uint64_t>(request->bytes),
-+                                                        std::memory_order_relaxed);
-+          GetCurlMultiStats().MaybePrintWindow("complete");
 +        } else {
 +          request->result.ok = false;
-+          GetCurlMultiStats().failed.fetch_add(1, std::memory_order_relaxed);
-+          GetCurlMultiStats().MaybePrintWindow("fail");
 +          const char* curl_error = request->error_buffer[0] != '\0' ? request->error_buffer
 +                                                                    : curl_easy_strerror(message->data.result);
 +          request->result.error =
@@ -1128,21 +513,16 @@ index 1d642fd..2e70125 100644
 +        curl_easy_cleanup(easy);
 +        request->easy = nullptr;
 +        Resume(std::move(request));
-+        MaybeReportCurlMultiStats();
 +      }
 +    }
 +
 +    void FinishWithoutCurl(std::shared_ptr<CurlMultiRequest> request, const std::string& error) {
 +      request->result.ok = false;
 +      request->result.error = error;
-+      GetCurlMultiStats().failed.fetch_add(1, std::memory_order_relaxed);
-+      GetCurlMultiStats().MaybePrintWindow("fail_no_curl");
 +      Resume(std::move(request));
-+      MaybeReportCurlMultiStats();
 +    }
 +
 +    void Resume(std::shared_ptr<CurlMultiRequest> request) {
-+      GetCurlMultiStats().resumed.fetch_add(1, std::memory_order_relaxed);
 +      auto continuation = request->continuation;
 +      if (continuation) {
 +        continuation.resume();
@@ -1150,7 +530,6 @@ index 1d642fd..2e70125 100644
 +    }
 +
 +    CurlMultiReadExecutor& owner_;
-+    size_t index_ = 0;
 +    CURLM* multi_ = nullptr;
 +    int epoll_fd_ = -1;
 +    int event_fd_ = -1;
@@ -1209,7 +588,7 @@ index 1d642fd..2e70125 100644
 +    int64_t nbytes,
 +    const std::shared_ptr<ResizableBuffer>& buffer,
 +    std::shared_ptr<S3ClientLock> client_lock_holder) {
-+  if (options.cloud_provider != kCloudProviderAWS) {
++  if (options.cloud_provider != "aws") {
 +    return arrow::Status::NotImplemented("curl_multi GetObject demo currently supports AWS S3 only");
 +  }
 +  if (!options.credentials_provider) {
@@ -1300,7 +679,7 @@ index 1d642fd..2e70125 100644
 +class S3CrtReadClient {
 + public:
 +  explicit S3CrtReadClient(const S3Options& options) {
-+    if (options.cloud_provider != kCloudProviderAWS) {
++    if (options.cloud_provider != "aws") {
 +      throw std::runtime_error("S3CrtClient GetObjectAsync demo currently supports AWS S3 only");
 +    }
 +    if (!options.credentials_provider) {
@@ -1330,10 +709,10 @@ index 1d642fd..2e70125 100644
 +      throw std::runtime_error("Invalid S3 connection scheme for S3CrtClient GetObjectAsync");
 +    }
 +    if (options.connect_timeout > 0) {
-+      config.connectTimeoutMs = static_cast<long>(ceil(options.connect_timeout * 1000));
++      config.connectTimeoutMs = static_cast<long>(std::ceil(options.connect_timeout * 1000));
 +    }
 +    if (options.request_timeout > 0) {
-+      config.requestTimeoutMs = static_cast<long>(ceil(options.request_timeout * 1000));
++      config.requestTimeoutMs = static_cast<long>(std::ceil(options.request_timeout * 1000));
 +    }
 +    config.maxConnections = static_cast<unsigned>(max_connections);
 +    config.throughputTargetGbps = throughput_gbps;
@@ -1352,13 +731,6 @@ index 1d642fd..2e70125 100644
 +        config,
 +        Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
 +        use_virtual_addressing);
-+
-+    auto& stats = GetS3CrtStats();
-+    stats.client_inits.fetch_add(1, std::memory_order_relaxed);
-+    stats.configured_event_loops.store(event_loops, std::memory_order_relaxed);
-+    stats.max_connections.store(max_connections, std::memory_order_relaxed);
-+    stats.throughput_target_mbps.store(static_cast<uint64_t>(throughput_gbps * 1000.0),
-+                                       std::memory_order_relaxed);
 +  }
 +
 +  Aws::S3Crt::S3CrtClient* get() const { return client_.get(); }
@@ -1397,13 +769,6 @@ index 1d642fd..2e70125 100644
 +    return;
 +  }
 +
-+  auto& stats = GetS3CrtStats();
-+  stats.submitted.fetch_add(1, std::memory_order_relaxed);
-+  stats.requested_bytes.fetch_add(static_cast<uint64_t>(nbytes), std::memory_order_relaxed);
-+  const auto active = stats.active.fetch_add(1, std::memory_order_relaxed) + 1;
-+  UpdateMax(stats.max_active, active);
-+  stats.MaybePrintWindow("submit");
-+
 +  auto request = std::make_shared<Aws::S3Crt::Model::GetObjectRequest>();
 +  request->SetBucket(ToAwsString(path.bucket));
 +  request->SetKey(ToAwsString(path.key));
@@ -1419,16 +784,8 @@ index 1d642fd..2e70125 100644
 +          const Aws::S3Crt::Model::GetObjectRequest&,
 +          Aws::S3Crt::Model::GetObjectOutcome outcome,
 +          const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) mutable {
-+        auto& stats = GetS3CrtStats();
-+        auto mark_done = [&stats]() {
-+          stats.active.fetch_sub(1, std::memory_order_relaxed);
-+          MaybeReportS3CrtStats();
-+        };
 +        if (!outcome.IsSuccess()) {
-+          stats.failed.fetch_add(1, std::memory_order_relaxed);
-+          stats.MaybePrintWindow("fail");
 +          future.MarkFinished(ErrorToStatus("GetObject", outcome.GetError()));
-+          mark_done();
 +          return;
 +        }
 +
@@ -1436,59 +793,34 @@ index 1d642fd..2e70125 100644
 +        stream.read(reinterpret_cast<char*>(buffer->mutable_data()), length);
 +        const auto bytes_read = static_cast<int64_t>(stream.gcount());
 +        if (bytes_read <= 0 || bytes_read > length) {
-+          stats.failed.fetch_add(1, std::memory_order_relaxed);
-+          stats.MaybePrintWindow("fail");
 +          future.MarkFinished(arrow::Status::IOError("S3CrtClient GetObjectAsync returned invalid byte count"));
-+          mark_done();
 +          return;
 +        }
 +
 +        auto resize_status = buffer->Resize(bytes_read);
 +        if (!resize_status.ok()) {
-+          stats.failed.fetch_add(1, std::memory_order_relaxed);
-+          stats.MaybePrintWindow("fail");
 +          future.MarkFinished(resize_status);
-+          mark_done();
 +          return;
 +        }
 +
-+        stats.completed.fetch_add(1, std::memory_order_relaxed);
-+        stats.completed_bytes.fetch_add(static_cast<uint64_t>(bytes_read), std::memory_order_relaxed);
-+        stats.MaybePrintWindow("complete");
 +        future.MarkFinished(std::static_pointer_cast<Buffer>(buffer));
-+        mark_done();
 +      });
 +}
 +
- template <typename ObjectResult>
- std::shared_ptr<const arrow::KeyValueMetadata> GetObjectMetadata(const ObjectResult& result) {
-   auto md = std::make_shared<arrow::KeyValueMetadata>();
-@@ -448,9 +1607,14 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
-   public:
-   ObjectInputFile(std::shared_ptr<S3ClientHolder> holder,
-                   const arrow::io::IOContext& io_context,
+@@ -367,0 +1116 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
 +                  S3Options options,
-                   const S3Path& path,
-                   int64_t size = kNoSize)
+@@ -370 +1119,5 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
 -      : holder_(std::move(holder)), io_context_(io_context), path_(path), content_length_(size) {}
 +      : holder_(std::move(holder)),
 +        io_context_(io_context),
 +        options_(std::move(options)),
 +        path_(path),
 +        content_length_(size) {}
-
-   arrow::Status Init() {
-     // Issue a HEAD Object to get the content-length and ensure any
-@@ -556,6 +1720,102 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
-     return stream.gcount();
-   }
-
+@@ -473,0 +1227,91 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
 +  Future<std::shared_ptr<Buffer>> ReadAsync(const arrow::io::IOContext& io_context,
 +                                            int64_t position,
 +                                            int64_t nbytes) override {
-+    GetCurlMultiStats().read_async_calls.fetch_add(1, std::memory_order_relaxed);
 +    if (!IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC")) {
-+      GetCurlMultiStats().read_async_disabled_fallback.fetch_add(1, std::memory_order_relaxed);
 +      return arrow::io::RandomAccessFile::ReadAsync(io_context, position, nbytes);
 +    }
 +
@@ -1527,12 +859,10 @@ index 1d642fd..2e70125 100644
 +
 +    auto future = Future<std::shared_ptr<Buffer>>::Make();
 +    if (IsEnvEnabled("MILVUS_S3_CLIENT_CRT")) {
-+      GetCurlMultiStats().read_async_crt_branch.fetch_add(1, std::memory_order_relaxed);
 +      RunS3CrtGetObject(options_, path_, position, nbytes, future, buffer, client_lock_holder);
 +      return future;
 +    }
 +    if (IsEnvEnabled("MILVUS_S3_CLIENT_COROUTINE")) {
-+      GetCurlMultiStats().read_async_coroutine_branch.fetch_add(1, std::memory_order_relaxed);
 +      auto maybe_request =
 +          BuildCurlMultiGetObjectRequest(options_, path_, position, nbytes, buffer, client_lock_holder);
 +      if (!maybe_request.ok()) {
@@ -1546,7 +876,6 @@ index 1d642fd..2e70125 100644
 +                            nbytes);
 +      return future;
 +    }
-+    GetCurlMultiStats().read_async_aws_async_branch.fetch_add(1, std::memory_order_relaxed);
 +
 +    S3Model::GetObjectRequest req;
 +    req.SetBucket(ToAwsString(path_.bucket));
@@ -1579,32 +908,84 @@ index 1d642fd..2e70125 100644
 +    return future;
 +  }
 +
-   arrow::Result<std::shared_ptr<Buffer>> ReadAt(int64_t position, int64_t nbytes) override {
-     FIU_RETURN_ON(FIUKEY_S3FS_READAT_FAIL,
-                   arrow::Status::IOError(fmt::format("Injected fault: {}", FIUKEY_S3FS_READAT_FAIL)));
-@@ -594,6 +1854,7 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
-   protected:
-   std::shared_ptr<S3ClientHolder> holder_;
-   const arrow::io::IOContext io_context_;
+@@ -505,0 +1350 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
 +  const S3Options options_;
-   S3Path path_;
-
-   bool closed_ = false;
-@@ -1921,7 +3182,7 @@ class S3FileSystem::Impl : public std::enable_shared_from_this<S3FileSystem::Imp
-
-     ARROW_RETURN_NOT_OK(CheckS3Initialized());
-
+@@ -1954 +2799 @@ class MultiPartUploadS3FS::Impl : public std::enable_shared_from_this<MultiPartU
 -    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), path);
 +    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), options(), path);
-     ARROW_RETURN_NOT_OK(ptr->Init());
-     return ptr;
-   }
-@@ -1940,7 +3201,7 @@ class S3FileSystem::Impl : public std::enable_shared_from_this<S3FileSystem::Imp
-
-     ARROW_RETURN_NOT_OK(CheckS3Initialized());
-
+@@ -1973 +2818 @@ class MultiPartUploadS3FS::Impl : public std::enable_shared_from_this<MultiPartU
 -    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), path, info.size());
 +    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), options(), path, info.size());
-     ARROW_RETURN_NOT_OK(ptr->Init());
-     return ptr;
-   }
+diff --git a/cpp/src/filesystem/s3/s3_client.cpp b/cpp/src/filesystem/s3/s3_client.cpp
+index 020698e..b4552a0 100644
+--- a/cpp/src/filesystem/s3/s3_client.cpp
++++ b/cpp/src/filesystem/s3/s3_client.cpp
+@@ -18,0 +19 @@
++#include <cctype>
+@@ -19,0 +21 @@
++#include <cstdlib>
+@@ -37,0 +40 @@
++#include <aws/core/utils/threading/PooledThreadExecutor.h>
+@@ -66,0 +70,30 @@ namespace milvus_storage {
++namespace {
++
++bool IsEnvEnabled(const char* name) {
++  const char* value = std::getenv(name);
++  if (value == nullptr || *value == '\0') {
++    return false;
++  }
++  std::string text(value);
++  std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
++    return static_cast<char>(std::tolower(c));
++  });
++  return text == "1" || text == "true" || text == "on" || text == "yes";
++}
++
++uint64_t GetUnsignedEnv(const char* name, uint64_t default_value) {
++  const char* value = std::getenv(name);
++  if (value == nullptr || *value == '\0') {
++    return default_value;
++  }
++  try {
++    size_t parsed = 0;
++    auto result = std::stoull(value, &parsed, 10);
++    return parsed == std::string(value).size() ? result : default_value;
++  } catch (...) {
++    return default_value;
++  }
++}
++
++}  // namespace
++
+@@ -549,0 +583,9 @@ arrow::Result<std::shared_ptr<S3ClientHolder>> ClientBuilder::BuildClient(
++  if (IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC") &&
++      !IsEnvEnabled("MILVUS_S3_CLIENT_COROUTINE") &&
++      !IsEnvEnabled("MILVUS_S3_CLIENT_CRT")) {
++    auto executor_threads =
++        static_cast<size_t>(std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_S3_ASYNC_EXECUTOR_THREADS",
++                                                                 client_config_.maxConnections)));
++    client_config_.executor =
++        Aws::MakeShared<Aws::Utils::Threading::PooledThreadExecutor>("MilvusS3AsyncExecutor", executor_threads);
++  }
+@@ -568 +610 @@ arrow::Result<std::shared_ptr<S3ClientHolder>> ClientBuilder::BuildClient(
+-}  // namespace milvus_storage
+\ No newline at end of file
++}  // namespace milvus_storage
+diff --git a/cpp/src/filesystem/s3/s3_fs.cpp b/cpp/src/filesystem/s3/s3_fs.cpp
+index f4d61f7..d5bb703 100644
+--- a/cpp/src/filesystem/s3/s3_fs.cpp
++++ b/cpp/src/filesystem/s3/s3_fs.cpp
+@@ -55,0 +56 @@ static std::unordered_map<std::string, S3LogLevel> LogLevel_Map = {
++#ifdef MILVUS_GCP_FS
+@@ -56,0 +58 @@ static const char* GOOGLE_CLIENT_FACTORY_ALLOCATION_TAG = "GoogleHttpClientFacto
++#endif
+@@ -126,0 +129 @@ class TlsHttpClientFactory : public Aws::Http::HttpClientFactory {
++#ifdef MILVUS_GCP_FS
+@@ -170,0 +174 @@ class GoogleHttpClientFactory : public Aws::Http::HttpClientFactory {
++#endif
+@@ -181,0 +186 @@ void S3FileSystemProducer::InitS3() {
++#ifdef MILVUS_GCP_FS
+@@ -189,0 +195,3 @@ void S3FileSystemProducer::InitS3() {
++#else
++      throw std::invalid_argument("GCP IAM S3 filesystem requires MILVUS_GCP_FS");
++#endif
