@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,107 @@
 
 namespace milvus::query {
 namespace planpb = milvus::proto::plan;
+
+namespace {
+
+std::string
+ConsumeStringParam(knowhere::Json& params, const char* key) {
+    if (!params.contains(key)) {
+        return "";
+    }
+    auto value = params[key];
+    params.erase(key);
+    if (value.is_string()) {
+        return value.get<std::string>();
+    }
+    return value.dump();
+}
+
+std::optional<size_t>
+ConsumeSizeParam(knowhere::Json& params, const char* key) {
+    if (!params.contains(key)) {
+        return std::nullopt;
+    }
+    auto value = params[key];
+    params.erase(key);
+    if (value.is_number_unsigned()) {
+        return static_cast<size_t>(value.get<uint64_t>());
+    }
+    if (value.is_number_integer()) {
+        auto parsed = value.get<int64_t>();
+        if (parsed > 0) {
+            return static_cast<size_t>(parsed);
+        }
+    }
+    if (value.is_string()) {
+        try {
+            auto parsed = std::stoull(value.get<std::string>());
+            if (parsed > 0) {
+                return static_cast<size_t>(parsed);
+            }
+        } catch (...) {
+        }
+    }
+    ThrowInfo(ConfigInvalid, "{} must be a positive integer", key);
+    return std::nullopt;
+}
+
+std::optional<double>
+ConsumeDoubleParam(knowhere::Json& params, const char* key) {
+    if (!params.contains(key)) {
+        return std::nullopt;
+    }
+    auto value = params[key];
+    params.erase(key);
+    if (value.is_number()) {
+        auto parsed = value.get<double>();
+        if (parsed > 0) {
+            return parsed;
+        }
+    }
+    if (value.is_string()) {
+        try {
+            auto parsed = std::stod(value.get<std::string>());
+            if (parsed > 0) {
+                return parsed;
+            }
+        } catch (...) {
+        }
+    }
+    ThrowInfo(ConfigInvalid, "{} must be a positive number", key);
+    return std::nullopt;
+}
+
+void
+ConsumeS3ReadPathParams(SearchInfo& search_info) {
+    auto& params = search_info.search_params_;
+    auto mode = ConsumeStringParam(params, "s3_read_path");
+    if (mode.empty()) {
+        return;
+    }
+    if (mode != "baseline" && mode != "curl_multi" && mode != "curl-multi" &&
+        mode != "curl" && mode != "crt") {
+        ThrowInfo(ConfigInvalid,
+                  "s3_read_path={} not supported, expected baseline, curl_multi, or crt",
+                  mode);
+    }
+    if (mode == "curl-multi" || mode == "curl") {
+        mode = "curl_multi";
+    }
+
+    search_info.s3_read_path_config_.override_enabled = true;
+    search_info.s3_read_path_config_.mode = std::move(mode);
+    search_info.s3_read_path_config_.max_inflight =
+        ConsumeSizeParam(params, "s3_read_max_inflight");
+    search_info.s3_read_path_config_.event_loops =
+        ConsumeSizeParam(params, "s3_read_eventloops");
+    search_info.s3_read_path_config_.crt_max_connections =
+        ConsumeSizeParam(params, "s3_read_crt_max_connections");
+    search_info.s3_read_path_config_.crt_throughput_gbps =
+        ConsumeDoubleParam(params, "s3_read_crt_throughput_gbps");
+}
+
+}  // namespace
 
 void
 ProtoParser::PlanOptionsFromProto(
@@ -64,6 +166,7 @@ ProtoParser::PlanNodeFromProto(const planpb::PlanNode& plan_node_proto) {
         search_info.round_decimal_ = query_info_proto.round_decimal();
         search_info.search_params_ =
             nlohmann::json::parse(query_info_proto.search_params());
+        ConsumeS3ReadPathParams(search_info);
         search_info.materialized_view_involved =
             query_info_proto.materialized_view_involved();
         // currently, iterative filter does not support range search

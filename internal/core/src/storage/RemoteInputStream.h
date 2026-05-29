@@ -76,6 +76,7 @@ class RemoteInputStream : public milvus::InputStream,
         size_t size;
         std::shared_ptr<std::promise<RemoteAsyncReadResult>> promise;
         size_t limiter_id;
+        milvus::S3ReadPathConfig s3_read_path_config;
     };
 
     struct AsyncReadLimiter {

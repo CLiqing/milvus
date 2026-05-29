@@ -17,10 +17,13 @@
 #pragma once
 
 #include <memory>
+#include <optional>
+#include <string>
 
 #include "common/ArrayOffsets.h"
 #include "common/Tracer.h"
 #include "common/Types.h"
+#include "filemanager/AsyncInputStream.h"
 #include "knowhere/config.h"
 
 namespace milvus {
@@ -48,6 +51,7 @@ struct SearchInfo {
     std::optional<milvus::DataType> json_type_;
     bool strict_cast_{false};
     std::shared_ptr<const IArrayOffsets> array_offsets_{nullptr};
+    S3ReadPathConfig s3_read_path_config_;
 
     bool
     element_level() const {

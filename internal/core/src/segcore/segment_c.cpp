@@ -11,6 +11,8 @@
 
 #include "segcore/segment_c.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <limits>
 
@@ -289,6 +291,23 @@ AsyncSearch(CTraceContext c_trace,
 
             segment->LazyCheckSchema(plan->schema_);
 
+            milvus::ScopedS3ReadPathConfig s3_read_path_scope(
+                plan->plan_node_->search_info_.s3_read_path_config_);
+            const auto& s3_read_path_config =
+                plan->plan_node_->search_info_.s3_read_path_config_;
+            const char* s3_read_path_log =
+                std::getenv("MILVUS_S3_READ_PATH_LOG");
+            if (s3_read_path_config.override_enabled &&
+                s3_read_path_log != nullptr &&
+                std::strcmp(s3_read_path_log, "1") == 0) {
+                LOG_INFO(
+                    "[MILVUS_S3_READ_PATH] layer=segcore_async_search mode={} max_inflight={} eventloops={} crt_max_connections={} crt_throughput_gbps={}",
+                    s3_read_path_config.mode,
+                    s3_read_path_config.max_inflight.value_or(0),
+                    s3_read_path_config.event_loops.value_or(0),
+                    s3_read_path_config.crt_max_connections.value_or(0),
+                    s3_read_path_config.crt_throughput_gbps.value_or(0.0));
+            }
             auto search_result = segment->Search(plan,
                                                  phg_ptr,
                                                  timestamp,

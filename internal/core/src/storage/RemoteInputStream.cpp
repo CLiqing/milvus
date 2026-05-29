@@ -23,6 +23,18 @@
 #include "common/Consts.h"
 #include "common/EasyAssert.h"
 
+extern "C" void
+milvus_storage_set_s3_read_path_context(const char* mode,
+                                        uint64_t max_inflight,
+                                        uint64_t event_loops,
+                                        uint64_t crt_max_connections,
+                                        double crt_throughput_gbps,
+                                        bool has_crt_throughput_gbps)
+    __attribute__((weak));
+
+extern "C" void
+milvus_storage_clear_s3_read_path_context() __attribute__((weak));
+
 namespace milvus::storage {
 namespace {
 
@@ -53,6 +65,64 @@ GetUnsignedEnv(const char* name, uint64_t default_value) {
         return default_value;
     }
 }
+
+bool
+IsS3AsyncReadPathEnabled() {
+    const auto& config = milvus::GetS3ReadPathConfig();
+    if (config.override_enabled) {
+        return config.mode == "curl_multi" || config.mode == "crt";
+    }
+    return IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC");
+}
+
+bool
+ShouldPrintS3ReadPathLog() {
+    static std::atomic<uint64_t> printed{0};
+    return IsEnvEnabled("MILVUS_S3_READ_PATH_LOG") &&
+           printed.fetch_add(1, std::memory_order_relaxed) < 64;
+}
+
+class ScopedMilvusStorageS3ReadPathContext {
+ public:
+    explicit ScopedMilvusStorageS3ReadPathContext(
+        const milvus::S3ReadPathConfig& config)
+        : active_(config.override_enabled &&
+                  milvus_storage_set_s3_read_path_context != nullptr &&
+                  milvus_storage_clear_s3_read_path_context != nullptr) {
+        if (!active_) {
+            return;
+        }
+        milvus_storage_set_s3_read_path_context(
+            config.mode.c_str(),
+            static_cast<uint64_t>(config.max_inflight.value_or(0)),
+            static_cast<uint64_t>(config.event_loops.value_or(0)),
+            static_cast<uint64_t>(config.crt_max_connections.value_or(0)),
+            config.crt_throughput_gbps.value_or(0.0),
+            config.crt_throughput_gbps.has_value());
+        if (ShouldPrintS3ReadPathLog()) {
+            std::cerr << "[MILVUS_S3_READ_PATH]"
+                      << " layer=remote_input_stream"
+                      << " mode=" << config.mode
+                      << " storage_context=true"
+                      << " max_inflight=" << config.max_inflight.value_or(0)
+                      << " eventloops=" << config.event_loops.value_or(0)
+                      << " crt_max_connections="
+                      << config.crt_max_connections.value_or(0)
+                      << " crt_throughput_gbps="
+                      << config.crt_throughput_gbps.value_or(0.0)
+                      << std::endl;
+        }
+    }
+
+    ~ScopedMilvusStorageS3ReadPathContext() {
+        if (active_) {
+            milvus_storage_clear_s3_read_path_context();
+        }
+    }
+
+ private:
+    bool active_;
+};
 
 uint64_t
 NowMicros() {
@@ -267,7 +337,7 @@ RemoteInputStream::ReadAt(void* data, size_t offset, size_t size) {
 
 bool
 RemoteInputStream::SupportsAsyncReadAt() const {
-    return IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC");
+    return IsS3AsyncReadPathEnabled();
 }
 
 std::future<RemoteAsyncReadResult>
@@ -280,7 +350,12 @@ RemoteInputStream::ReadAtAsync(size_t offset, size_t size) {
     auto promise = std::make_shared<std::promise<RemoteAsyncReadResult>>();
     auto future = promise->get_future();
     PendingAsyncRead request{
-        remote_file_, offset, size, promise, async_read_at_limiter_id_};
+        remote_file_,
+        offset,
+        size,
+        promise,
+        async_read_at_limiter_id_,
+        milvus::GetS3ReadPathConfig()};
     bool start_now = false;
     auto& limiter = GetAsyncReadLimiter(request.limiter_id);
     {
@@ -360,6 +435,8 @@ RemoteInputStream::StartAsyncRead(PendingAsyncRead request) {
     GetAsyncReadStats().started.fetch_add(1, std::memory_order_relaxed);
     GetAsyncReadStats().MaybePrintWindow("start");
     try {
+        ScopedMilvusStorageS3ReadPathContext storage_context(
+            request.s3_read_path_config);
         auto arrow_future =
             request.remote_file->ReadAsync(static_cast<int64_t>(request.offset),
                                            static_cast<int64_t>(request.size));
