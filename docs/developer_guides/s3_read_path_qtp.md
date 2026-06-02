@@ -10,7 +10,7 @@ Use the Milvus repository and commit as the QTP entry point:
 ```text
 Repo owner: CLiqing
 Repo: milvus
-Branch: feat/milvus-s3-async-no-fetch-pool-demo
+Branch: tmp/s3-readpath-upstream-2.6-check
 Build command: make jobs=4 index_engine=cardinal install
 Dockerfile: ./build/docker/milvus/ubuntu22.04/Dockerfile
 OS: ubuntu22.04
@@ -28,12 +28,12 @@ The build intentionally keeps dependency changes in the Milvus repo:
 
 ```text
 Milvus
-  -> knowhere@b20270cf507d6d3fb943a9c1d89a4093762a7b53
-       -> cardinal@8c664848bb052cd857ee6de0adbc6ed97345a099
+  -> knowhere@v2.6.14
+       -> zilliztech/cardinal@v2.6.10
           plus internal/core/thirdparty/knowhere/cardinal_async_*.patch/header
-  -> milvus-common@e16257c
+  -> milvus-common@9dc0923
        plus internal/core/thirdparty/milvus-common/AsyncInputStream.h
-  -> milvus-storage@9b817b1
+  -> milvus-storage@ddc6ec7
        plus internal/core/thirdparty/milvus-storage/s3_async_read_path.patch
 ```
 

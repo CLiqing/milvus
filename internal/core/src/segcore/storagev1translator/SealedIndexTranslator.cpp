@@ -152,6 +152,24 @@ SealedIndexTranslator::get_cells(milvus::OpContext* ctx,
 
     // Check for cancellation before loading index data
     CheckCancellation(ctx, segment_id, "LoadIndex");
+    if (ctx != nullptr && ctx->s3_read_path_config.override_enabled) {
+        const auto& s3_config = ctx->s3_read_path_config;
+        config_["s3_read_path"] = s3_config.mode;
+        if (s3_config.max_inflight.has_value()) {
+            config_["s3_read_max_inflight"] = *s3_config.max_inflight;
+        }
+        if (s3_config.event_loops.has_value()) {
+            config_["s3_read_eventloops"] = *s3_config.event_loops;
+        }
+        if (s3_config.crt_max_connections.has_value()) {
+            config_["s3_read_crt_max_connections"] =
+                *s3_config.crt_max_connections;
+        }
+        if (s3_config.crt_throughput_gbps.has_value()) {
+            config_["s3_read_crt_throughput_gbps"] =
+                *s3_config.crt_throughput_gbps;
+        }
+    }
 
     // Check scalar index engine version for V3 routing
     auto scalar_version =

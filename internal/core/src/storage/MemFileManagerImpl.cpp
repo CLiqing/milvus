@@ -37,7 +37,8 @@ namespace milvus::storage {
 MemFileManagerImpl::MemFileManagerImpl(
     const FileManagerContext& fileManagerContext)
     : FileManagerImpl(fileManagerContext.fieldDataMeta,
-                      fileManagerContext.indexMeta) {
+                      fileManagerContext.indexMeta,
+                      fileManagerContext.s3_read_path_config) {
     rcm_ = fileManagerContext.chunkManagerPtr;
     fs_ = fileManagerContext.fs;
     loon_ffi_properties_ = fileManagerContext.loon_ffi_properties;

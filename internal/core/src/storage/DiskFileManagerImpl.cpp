@@ -55,7 +55,8 @@ namespace milvus::storage {
 DiskFileManagerImpl::DiskFileManagerImpl(
     const FileManagerContext& fileManagerContext)
     : FileManagerImpl(fileManagerContext.fieldDataMeta,
-                      fileManagerContext.indexMeta) {
+                      fileManagerContext.indexMeta,
+                      fileManagerContext.s3_read_path_config) {
     rcm_ = fileManagerContext.chunkManagerPtr;
     fs_ = fileManagerContext.fs;
     plugin_context_ = fileManagerContext.plugin_context;

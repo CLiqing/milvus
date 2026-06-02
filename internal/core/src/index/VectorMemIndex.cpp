@@ -47,6 +47,7 @@
 #include "common/Slice.h"
 #include "common/RangeSearchHelper.h"
 #include "common/Utils.h"
+#include "filemanager/AsyncInputStream.h"
 #include "log/Log.h"
 #include "storage/DataCodec.h"
 #include "storage/MemFileManagerImpl.h"
@@ -57,6 +58,30 @@
 #include "storage/FileWriter.h"
 
 namespace milvus::index {
+namespace {
+
+milvus::S3ReadPathConfig
+GetS3ReadPathConfigFromIndexLoadConfig(const Config& config) {
+    milvus::S3ReadPathConfig s3_config;
+    auto mode = GetValueFromConfig<std::string>(config, "s3_read_path");
+    if (!mode.has_value() || mode->empty()) {
+        return s3_config;
+    }
+
+    s3_config.override_enabled = true;
+    s3_config.mode = *mode;
+    s3_config.max_inflight =
+        GetValueFromConfig<size_t>(config, "s3_read_max_inflight");
+    s3_config.event_loops =
+        GetValueFromConfig<size_t>(config, "s3_read_eventloops");
+    s3_config.crt_max_connections =
+        GetValueFromConfig<size_t>(config, "s3_read_crt_max_connections");
+    s3_config.crt_throughput_gbps =
+        GetValueFromConfig<double>(config, "s3_read_crt_throughput_gbps");
+    return s3_config;
+}
+
+}  // namespace
 
 template <typename T>
 VectorMemIndex<T>::VectorMemIndex(
@@ -192,6 +217,10 @@ template <typename T>
 void
 VectorMemIndex<T>::Load(milvus::tracer::TraceContext ctx,
                         const Config& config) {
+    if (file_manager_ != nullptr) {
+        file_manager_->SetS3ReadPathConfig(
+            GetS3ReadPathConfigFromIndexLoadConfig(config));
+    }
     if (config.contains(MMAP_FILE_PATH)) {
         return LoadFromFile(config);
     }

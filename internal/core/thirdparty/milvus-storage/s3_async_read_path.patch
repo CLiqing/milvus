@@ -43,67 +43,58 @@ index 15743da..d8d2d95 100644
 @@ -26,0 +28 @@
 +#endif
 diff --git a/cpp/src/filesystem/s3/multi_part_upload_s3_fs.cpp b/cpp/src/filesystem/s3/multi_part_upload_s3_fs.cpp
-index d0b2f5a..bda209f 100644
+index d0b2f5a..8c8ca2f 100644
 --- a/cpp/src/filesystem/s3/multi_part_upload_s3_fs.cpp
 +++ b/cpp/src/filesystem/s3/multi_part_upload_s3_fs.cpp
-@@ -18,0 +19 @@
+@@ -18,0 +19,7 @@
 +#include <cctype>
-@@ -18,0 +20 @@
 +#include <atomic>
-@@ -19,0 +21,5 @@
 +#include <cmath>
 +#include <coroutine>
 +#include <cstdlib>
 +#include <cstring>
 +#include <deque>
-@@ -23,0 +30 @@
+@@ -22,0 +30,8 @@
 +#include <string>
-@@ -23,0 +31 @@
 +#include <iostream>
-@@ -24,0 +32,6 @@
 +#include <unordered_map>
 +
 +#include <sys/epoll.h>
 +#include <sys/eventfd.h>
 +#include <sys/timerfd.h>
 +#include <unistd.h>
-@@ -42,0 +56 @@
+@@ -40,0 +56 @@
 +#include <aws/core/auth/signer/AWSAuthV4Signer.h>
-@@ -45,0 +60 @@
+@@ -43,0 +60 @@
 +#include <aws/core/http/HttpRequest.h>
-@@ -46,0 +62,2 @@
+@@ -44,0 +62,2 @@
 +#include <aws/core/http/URI.h>
 +#include <aws/core/http/standard/StandardHttpRequest.h>
-@@ -50,0 +68,3 @@
+@@ -48,0 +68,3 @@
 +#include <aws/crt/io/Bootstrap.h>
 +#include <aws/crt/io/EventLoopGroup.h>
 +#include <aws/crt/io/HostResolver.h>
-@@ -51,0 +72,2 @@
+@@ -49,0 +72,2 @@
 +#include <aws/s3-crt/S3CrtClient.h>
 +#include <aws/s3-crt/model/GetObjectRequest.h>
-@@ -69,0 +92 @@
+@@ -67,0 +92 @@
 +#include <curl/curl.h>
-@@ -81,0 +105 @@ using ::arrow::Future;
+@@ -79,0 +105 @@ static constexpr const char kSep = '/';
 +using ::arrow::ResizableBuffer;
-@@ -108,0 +133,173 @@ namespace milvus_storage {
-+
+@@ -107,0 +134,171 @@ namespace S3Model = Aws::S3::Model;
 +namespace {
 +
-+bool HasS3ReadPathContextOverride();
-+bool IsS3ReadPathContextEnabled(const char* name);
-+uint64_t GetUnsignedS3ReadPathContext(const char* name, uint64_t default_value);
-+double GetDoubleS3ReadPathContext(const char* name, double default_value);
++struct S3ReadPathContext {
++  bool override_enabled = false;
++  std::string mode;
++  uint64_t max_inflight = 0;
++  uint64_t event_loops = 0;
++  uint64_t crt_max_connections = 0;
++  double crt_throughput_gbps = 0.0;
++  bool has_crt_throughput_gbps = false;
++};
 +
 +bool IsEnvEnabled(const char* name) {
-+  if (IsS3ReadPathContextEnabled(name)) {
-+    return true;
-+  }
-+  if (HasS3ReadPathContextOverride() &&
-+      (std::strcmp(name, "MILVUS_S3_GETOBJECT_ASYNC") == 0 ||
-+       std::strcmp(name, "MILVUS_S3_CLIENT_COROUTINE") == 0 ||
-+       std::strcmp(name, "MILVUS_S3_CLIENT_CRT") == 0)) {
-+    return false;
-+  }
 +  const char* value = std::getenv(name);
 +  if (value == nullptr || *value == '\0') {
 +    return false;
@@ -116,10 +107,6 @@ index d0b2f5a..bda209f 100644
 +}
 +
 +uint64_t GetUnsignedEnv(const char* name, uint64_t default_value) {
-+  auto context_value = GetUnsignedS3ReadPathContext(name, default_value);
-+  if (context_value != default_value) {
-+    return context_value;
-+  }
 +  const char* value = std::getenv(name);
 +  if (value == nullptr || *value == '\0') {
 +    return default_value;
@@ -134,10 +121,6 @@ index d0b2f5a..bda209f 100644
 +}
 +
 +double GetDoubleEnv(const char* name, double default_value) {
-+  auto context_value = GetDoubleS3ReadPathContext(name, default_value);
-+  if (context_value != default_value) {
-+    return context_value;
-+  }
 +  const char* value = std::getenv(name);
 +  if (value == nullptr || *value == '\0') {
 +    return default_value;
@@ -151,87 +134,118 @@ index d0b2f5a..bda209f 100644
 +  }
 +}
 +
-+struct S3ReadPathContext {
-+  bool override_enabled = false;
-+  std::string mode;
-+  uint64_t max_inflight = 0;
-+  uint64_t event_loops = 0;
-+  uint64_t crt_max_connections = 0;
-+  double crt_throughput_gbps = 0.0;
-+  bool has_crt_throughput_gbps = false;
-+};
-+
-+thread_local S3ReadPathContext s3_read_path_context;
-+
-+bool HasS3ReadPathContextOverride() {
-+  return s3_read_path_context.override_enabled;
-+}
-+
-+bool IsS3ReadPathContextEnabled(const char* name) {
-+  if (!s3_read_path_context.override_enabled) {
++bool IsS3ReadPathContextEnabled(const S3ReadPathContext& context, const char* name) {
++  if (!context.override_enabled) {
 +    return false;
 +  }
 +  if (std::strcmp(name, "MILVUS_S3_GETOBJECT_ASYNC") == 0) {
-+    return s3_read_path_context.mode == "curl_multi" || s3_read_path_context.mode == "crt";
++    return context.mode == "curl_multi" || context.mode == "crt";
 +  }
 +  if (std::strcmp(name, "MILVUS_S3_CLIENT_COROUTINE") == 0) {
-+    return s3_read_path_context.mode == "curl_multi";
++    return context.mode == "curl_multi";
 +  }
 +  if (std::strcmp(name, "MILVUS_S3_CLIENT_CRT") == 0) {
-+    return s3_read_path_context.mode == "crt";
++    return context.mode == "crt";
 +  }
 +  return false;
 +}
 +
-+uint64_t GetUnsignedS3ReadPathContext(const char* name, uint64_t default_value) {
-+  if (!s3_read_path_context.override_enabled) {
++bool IsEnvEnabled(const char* name, const S3ReadPathContext& context) {
++  if (IsS3ReadPathContextEnabled(context, name)) {
++    return true;
++  }
++  if (context.override_enabled &&
++      (std::strcmp(name, "MILVUS_S3_GETOBJECT_ASYNC") == 0 ||
++       std::strcmp(name, "MILVUS_S3_CLIENT_COROUTINE") == 0 ||
++       std::strcmp(name, "MILVUS_S3_CLIENT_CRT") == 0)) {
++    return false;
++  }
++  return IsEnvEnabled(name);
++}
++
++uint64_t GetUnsignedS3ReadPathContext(const S3ReadPathContext& context, const char* name, uint64_t default_value) {
++  if (!context.override_enabled) {
 +    return default_value;
 +  }
 +  if (std::strcmp(name, "MILVUS_S3_ASYNC_MAX_INFLIGHT") == 0 &&
-+      s3_read_path_context.max_inflight > 0) {
-+    return s3_read_path_context.max_inflight;
++      context.max_inflight > 0) {
++    return context.max_inflight;
 +  }
 +  if ((std::strcmp(name, "MILVUS_S3_CLIENT_COROUTINE_EVENTLOOPS") == 0 ||
 +       std::strcmp(name, "MILVUS_S3_CLIENT_CRT_EVENTLOOPS") == 0) &&
-+      s3_read_path_context.event_loops > 0) {
-+    return s3_read_path_context.event_loops;
++      context.event_loops > 0) {
++    return context.event_loops;
 +  }
 +  if (std::strcmp(name, "MILVUS_S3_CLIENT_CRT_MAX_CONNECTIONS") == 0 &&
-+      s3_read_path_context.crt_max_connections > 0) {
-+    return s3_read_path_context.crt_max_connections;
++      context.crt_max_connections > 0) {
++    return context.crt_max_connections;
 +  }
 +  return default_value;
 +}
 +
-+double GetDoubleS3ReadPathContext(const char* name, double default_value) {
-+  if (s3_read_path_context.override_enabled &&
++uint64_t GetUnsignedEnv(const char* name, uint64_t default_value, const S3ReadPathContext& context) {
++  auto context_value = GetUnsignedS3ReadPathContext(context, name, default_value);
++  if (context_value != default_value) {
++    return context_value;
++  }
++  return GetUnsignedEnv(name, default_value);
++}
++
++double GetDoubleS3ReadPathContext(const S3ReadPathContext& context, const char* name, double default_value) {
++  if (context.override_enabled &&
 +      std::strcmp(name, "MILVUS_S3_CLIENT_CRT_THROUGHPUT_GBPS") == 0 &&
-+      s3_read_path_context.has_crt_throughput_gbps) {
-+    return s3_read_path_context.crt_throughput_gbps;
++      context.has_crt_throughput_gbps) {
++    return context.crt_throughput_gbps;
 +  }
 +  return default_value;
 +}
 +
-+void PrintS3ReadPathSelection(const char* selected_path, int64_t position, int64_t nbytes) {
-+  if (!s3_read_path_context.override_enabled) {
++double GetDoubleEnv(const char* name, double default_value, const S3ReadPathContext& context) {
++  auto context_value = GetDoubleS3ReadPathContext(context, name, default_value);
++  if (context_value != default_value) {
++    return context_value;
++  }
++  return GetDoubleEnv(name, default_value);
++}
++
++bool IsS3ReadPathLogEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("MILVUS_S3_READ_PATH_LOG");
++    return value != nullptr && std::strcmp(value, "1") == 0;
++  }();
++  return enabled;
++}
++
++void PrintS3ReadPathSelection(const char* selected_path,
++                              const S3ReadPathContext& context,
++                              int64_t position,
++                              int64_t nbytes) {
++  if (!context.override_enabled) {
 +    return;
 +  }
-+  const char* log_enabled = std::getenv("MILVUS_S3_READ_PATH_LOG");
-+  if (log_enabled == nullptr || std::strcmp(log_enabled, "1") != 0) {
++  if (!IsS3ReadPathLogEnabled()) {
 +    return;
 +  }
-+  static std::atomic<uint64_t> printed{0};
-+  if (printed.fetch_add(1, std::memory_order_relaxed) >= 64) {
++  static std::atomic<uint64_t> last_print_us{0};
++  const auto now_us = static_cast<uint64_t>(
++      std::chrono::duration_cast<std::chrono::microseconds>(
++          std::chrono::steady_clock::now().time_since_epoch()).count());
++  auto last_us = last_print_us.load(std::memory_order_relaxed);
++  if (last_us != 0 && now_us <= last_us + 1000000) {
++    return;
++  }
++  if (!last_print_us.compare_exchange_strong(
++          last_us, now_us, std::memory_order_relaxed, std::memory_order_relaxed)) {
 +    return;
 +  }
 +  std::cerr << "[MILVUS_S3_READ_PATH]"
 +            << " layer=milvus_storage_s3"
-+            << " requested_mode=" << s3_read_path_context.mode
++            << " requested_mode=" << context.mode
 +            << " selected_path=" << selected_path
-+            << " max_inflight=" << s3_read_path_context.max_inflight
-+            << " eventloops=" << s3_read_path_context.event_loops
-+            << " crt_max_connections=" << s3_read_path_context.crt_max_connections
-+            << " crt_throughput_gbps=" << s3_read_path_context.crt_throughput_gbps
++            << " max_inflight=" << context.max_inflight
++            << " eventloops=" << context.event_loops
++            << " crt_max_connections=" << context.crt_max_connections
++            << " crt_throughput_gbps=" << context.crt_throughput_gbps
 +            << " position=" << position
 +            << " nbytes=" << nbytes
 +            << std::endl;
@@ -239,29 +253,7 @@ index d0b2f5a..bda209f 100644
 +
 +}  // namespace
 +
-+extern "C" void milvus_storage_set_s3_read_path_context(
-+    const char* mode,
-+    uint64_t max_inflight,
-+    uint64_t event_loops,
-+    uint64_t crt_max_connections,
-+    double crt_throughput_gbps,
-+    bool has_crt_throughput_gbps) {
-+  s3_read_path_context.override_enabled = true;
-+  s3_read_path_context.mode = mode == nullptr ? std::string() : std::string(mode);
-+  s3_read_path_context.max_inflight = max_inflight;
-+  s3_read_path_context.event_loops = event_loops;
-+  s3_read_path_context.crt_max_connections = crt_max_connections;
-+  s3_read_path_context.crt_throughput_gbps = crt_throughput_gbps;
-+  s3_read_path_context.has_crt_throughput_gbps = has_crt_throughput_gbps;
-+}
-+
-+extern "C" void milvus_storage_clear_s3_read_path_context() {
-+  s3_read_path_context = S3ReadPathContext{};
-+}
-+
-@@ -322,2 +392,681 @@ Aws::IOStreamFactory AwsWriteableStreamFactory(void* data, int64_t nbytes) {
-   return [=]() { return Aws::New<StringViewStream>("", data, nbytes); };
- }
+@@ -324,0 +522,681 @@ Aws::IOStreamFactory AwsWriteableStreamFactory(void* data, int64_t nbytes) {
 +struct CurlMultiResult {
 +  bool ok = false;
 +  int64_t bytes = 0;
@@ -685,13 +677,13 @@ index d0b2f5a..bda209f 100644
 +  std::atomic<size_t> next_loop_{0};
 +};
 +
-+std::shared_ptr<CurlMultiReadExecutor> GetCurlMultiReadExecutor() {
++std::shared_ptr<CurlMultiReadExecutor> GetCurlMultiReadExecutor(const S3ReadPathContext& context) {
 +  static std::mutex mutex;
 +  static std::shared_ptr<CurlMultiReadExecutor> executor;
 +  std::lock_guard<std::mutex> lock(mutex);
 +  if (!executor) {
 +    auto event_loops = static_cast<size_t>(
-+        std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_S3_CLIENT_COROUTINE_EVENTLOOPS", 2)));
++        std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_S3_CLIENT_COROUTINE_EVENTLOOPS", 2, context)));
 +    executor = std::make_shared<CurlMultiReadExecutor>(event_loops);
 +  }
 +  return executor;
@@ -812,7 +804,7 @@ index d0b2f5a..bda209f 100644
 +
 +class S3CrtReadClient {
 + public:
-+  explicit S3CrtReadClient(const S3Options& options) {
++  explicit S3CrtReadClient(const S3Options& options, const S3ReadPathContext& context) {
 +    if (options.cloud_provider != "aws") {
 +      throw std::runtime_error("S3CrtClient GetObjectAsync demo currently supports AWS S3 only");
 +    }
@@ -821,10 +813,10 @@ index d0b2f5a..bda209f 100644
 +    }
 +
 +    const auto event_loops =
-+        std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_S3_CLIENT_CRT_EVENTLOOPS", 2));
++        std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_S3_CLIENT_CRT_EVENTLOOPS", 2, context));
 +    const auto max_connections =
-+        std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_S3_CLIENT_CRT_MAX_CONNECTIONS", options.max_connections));
-+    const auto throughput_gbps = GetDoubleEnv("MILVUS_S3_CLIENT_CRT_THROUGHPUT_GBPS", 30.0);
++        std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_S3_CLIENT_CRT_MAX_CONNECTIONS", options.max_connections, context));
++    const auto throughput_gbps = GetDoubleEnv("MILVUS_S3_CLIENT_CRT_THROUGHPUT_GBPS", 30.0, context);
 +
 +    Aws::S3Crt::ClientConfiguration config;
 +    if (!options.region.empty()) {
@@ -876,13 +868,14 @@ index d0b2f5a..bda209f 100644
 +  std::shared_ptr<Aws::S3Crt::S3CrtClient> client_;
 +};
 +
-+arrow::Result<std::shared_ptr<S3CrtReadClient>> GetS3CrtReadClient(const S3Options& options) {
++arrow::Result<std::shared_ptr<S3CrtReadClient>> GetS3CrtReadClient(const S3Options& options,
++                                                                   const S3ReadPathContext& context) {
 +  static std::mutex mutex;
 +  static std::shared_ptr<S3CrtReadClient> client;
 +  std::lock_guard<std::mutex> lock(mutex);
 +  if (!client) {
 +    try {
-+      client = std::make_shared<S3CrtReadClient>(options);
++      client = std::make_shared<S3CrtReadClient>(options, context);
 +    } catch (const std::exception& e) {
 +      return arrow::Status::Invalid(e.what());
 +    }
@@ -896,8 +889,9 @@ index d0b2f5a..bda209f 100644
 +                       int64_t nbytes,
 +                       Future<std::shared_ptr<Buffer>> future,
 +                       std::shared_ptr<ResizableBuffer> buffer,
-+                       std::shared_ptr<S3ClientLock> client_lock_holder) {
-+  auto maybe_client = GetS3CrtReadClient(options);
++                       std::shared_ptr<S3ClientLock> client_lock_holder,
++                       const S3ReadPathContext& context) {
++  auto maybe_client = GetS3CrtReadClient(options, context);
 +  if (!maybe_client.ok()) {
 +    future.MarkFinished(maybe_client.status());
 +    return;
@@ -941,26 +935,53 @@ index d0b2f5a..bda209f 100644
 +      });
 +}
 +
-@@ -365,5 +1114,10 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
-   ObjectInputFile(std::shared_ptr<S3ClientHolder> holder,
-                   const arrow::io::IOContext& io_context,
--                  const S3Path& path,
+@@ -367,0 +1246 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
 +                  S3Options options,
-+                  const S3Path& path,
-                   int64_t size = kNoSize)
+@@ -370 +1249,21 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
 -      : holder_(std::move(holder)), io_context_(io_context), path_(path), content_length_(size) {}
 +      : holder_(std::move(holder)),
 +        io_context_(io_context),
 +        options_(std::move(options)),
 +        path_(path),
 +        content_length_(size) {}
-@@ -473 +473,97 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
++
++  void SetS3ReadPathContext(const char* mode,
++                            uint64_t max_inflight,
++                            uint64_t event_loops,
++                            uint64_t crt_max_connections,
++                            double crt_throughput_gbps,
++                            bool has_crt_throughput_gbps) {
++    std::lock_guard<std::mutex> lock(s3_read_path_context_mutex_);
++    s3_read_path_context_.override_enabled = true;
++    s3_read_path_context_.mode = mode == nullptr ? std::string() : std::string(mode);
++    s3_read_path_context_.max_inflight = max_inflight;
++    s3_read_path_context_.event_loops = event_loops;
++    s3_read_path_context_.crt_max_connections = crt_max_connections;
++    s3_read_path_context_.crt_throughput_gbps = crt_throughput_gbps;
++    s3_read_path_context_.has_crt_throughput_gbps = has_crt_throughput_gbps;
++  }
+@@ -460,0 +1360,8 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
++    if (IsS3ReadPathLogEnabled()) {
++      S3ReadPathContext s3_read_path_context;
++      {
++        std::lock_guard<std::mutex> lock(s3_read_path_context_mutex_);
++        s3_read_path_context = s3_read_path_context_;
++      }
++      PrintS3ReadPathSelection("baseline", s3_read_path_context, position, nbytes);
++    }
+@@ -473,0 +1381,102 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
 +
 +  Future<std::shared_ptr<Buffer>> ReadAsync(const arrow::io::IOContext& io_context,
 +                                            int64_t position,
 +                                            int64_t nbytes) override {
-+    if (!IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC")) {
-+      PrintS3ReadPathSelection("baseline", position, nbytes);
++    S3ReadPathContext s3_read_path_context;
++    {
++      std::lock_guard<std::mutex> lock(s3_read_path_context_mutex_);
++      s3_read_path_context = s3_read_path_context_;
++    }
++
++    if (!IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC", s3_read_path_context)) {
++      PrintS3ReadPathSelection("baseline", s3_read_path_context, position, nbytes);
 +      return arrow::io::RandomAccessFile::ReadAsync(io_context, position, nbytes);
 +    }
 +
@@ -998,20 +1019,20 @@ index d0b2f5a..bda209f 100644
 +    auto client_lock_holder = std::make_shared<S3ClientLock>(std::move(client_lock));
 +
 +    auto future = Future<std::shared_ptr<Buffer>>::Make();
-+    if (IsEnvEnabled("MILVUS_S3_CLIENT_CRT")) {
-+      PrintS3ReadPathSelection("crt", position, nbytes);
-+      RunS3CrtGetObject(options_, path_, position, nbytes, future, buffer, client_lock_holder);
++    if (IsEnvEnabled("MILVUS_S3_CLIENT_CRT", s3_read_path_context)) {
++      PrintS3ReadPathSelection("crt", s3_read_path_context, position, nbytes);
++      RunS3CrtGetObject(options_, path_, position, nbytes, future, buffer, client_lock_holder, s3_read_path_context);
 +      return future;
 +    }
-+    if (IsEnvEnabled("MILVUS_S3_CLIENT_COROUTINE")) {
-+      PrintS3ReadPathSelection("curl_multi", position, nbytes);
++    if (IsEnvEnabled("MILVUS_S3_CLIENT_COROUTINE", s3_read_path_context)) {
++      PrintS3ReadPathSelection("curl_multi", s3_read_path_context, position, nbytes);
 +      auto maybe_request =
 +          BuildCurlMultiGetObjectRequest(options_, path_, position, nbytes, buffer, client_lock_holder);
 +      if (!maybe_request.ok()) {
 +        return Future<std::shared_ptr<Buffer>>::MakeFinished(
 +            arrow::Result<std::shared_ptr<Buffer>>(maybe_request.status()));
 +      }
-+      RunCurlMultiGetObject(GetCurlMultiReadExecutor(),
++      RunCurlMultiGetObject(GetCurlMultiReadExecutor(s3_read_path_context),
 +                            maybe_request.MoveValueUnsafe(),
 +                            future,
 +                            buffer,
@@ -1025,7 +1046,7 @@ index d0b2f5a..bda209f 100644
 +    req.SetRange(ToAwsString(FormatRange(position, nbytes)));
 +    req.SetResponseStreamFactory(AwsWriteableStreamFactory(buffer->mutable_data(), nbytes));
 +
-+    PrintS3ReadPathSelection("aws_async", position, nbytes);
++    PrintS3ReadPathSelection("aws_async", s3_read_path_context, position, nbytes);
 +    client->GetObjectAsync(
 +        req,
 +        [future, buffer, length = nbytes, client_lock_holder](
@@ -1051,17 +1072,37 @@ index d0b2f5a..bda209f 100644
 +    return future;
 +  }
 +
-   arrow::Result<std::shared_ptr<Buffer>> ReadAt(int64_t position, int64_t nbytes) override {
-@@ -503,4 +1263,5 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
-   protected:
-   std::shared_ptr<S3ClientHolder> holder_;
-   const arrow::io::IOContext io_context_;
+@@ -505,0 +1515 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
 +  const S3Options options_;
-   S3Path path_;
-@@ -1954 +2799 @@ class MultiPartUploadS3FS::Impl : public std::enable_shared_from_this<MultiPartU
+@@ -511,0 +1522,2 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
++  mutable std::mutex s3_read_path_context_mutex_;
++  S3ReadPathContext s3_read_path_context_;
+@@ -513,0 +1526,21 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
++extern "C" void milvus_storage_set_s3_read_path_context_for_file(
++    void* file,
++    const char* mode,
++    uint64_t max_inflight,
++    uint64_t event_loops,
++    uint64_t crt_max_connections,
++    double crt_throughput_gbps,
++    bool has_crt_throughput_gbps) {
++  auto* random_access_file = static_cast<arrow::io::RandomAccessFile*>(file);
++  auto* object_input_file = dynamic_cast<milvus_storage::ObjectInputFile*>(random_access_file);
++  if (object_input_file == nullptr) {
++    return;
++  }
++  object_input_file->SetS3ReadPathContext(mode,
++                                          max_inflight,
++                                          event_loops,
++                                          crt_max_connections,
++                                          crt_throughput_gbps,
++                                          has_crt_throughput_gbps);
++}
++
+@@ -1954 +2987 @@ class MultiPartUploadS3FS::Impl : public std::enable_shared_from_this<MultiPartU
 -    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), path);
 +    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), options(), path);
-@@ -1973 +2818 @@ class MultiPartUploadS3FS::Impl : public std::enable_shared_from_this<MultiPartU
+@@ -1973 +3006 @@ class MultiPartUploadS3FS::Impl : public std::enable_shared_from_this<MultiPartU
 -    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), path, info.size());
 +    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), options(), path, info.size());
 diff --git a/cpp/src/filesystem/s3/s3_client.cpp b/cpp/src/filesystem/s3/s3_client.cpp

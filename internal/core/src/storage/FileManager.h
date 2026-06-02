@@ -21,6 +21,7 @@
 #include <memory>
 
 #include "common/Consts.h"
+#include "filemanager/AsyncInputStream.h"
 #include "boost/filesystem/path.hpp"
 #include "filemanager/FileManager.h"
 #include "log/Log.h"
@@ -106,6 +107,7 @@ struct FileManagerContext {
     bool for_loading_index{false};
     std::shared_ptr<CPluginContext> plugin_context;
     std::shared_ptr<milvus_storage::api::Properties> loon_ffi_properties;
+    milvus::S3ReadPathConfig s3_read_path_config;
 };
 
 #define FILEMANAGER_TRY try {
@@ -123,8 +125,11 @@ struct FileManagerContext {
 class FileManagerImpl : public milvus::FileManager {
  public:
     explicit FileManagerImpl(const FieldDataMeta& field_mata,
-                             IndexMeta index_meta)
-        : field_meta_(field_mata), index_meta_(std::move(index_meta)) {
+                             IndexMeta index_meta,
+                             milvus::S3ReadPathConfig s3_read_path_config = {})
+        : field_meta_(field_mata),
+          index_meta_(std::move(index_meta)),
+          s3_read_path_config_(std::move(s3_read_path_config)) {
     }
 
  public:
@@ -190,7 +195,7 @@ class FileManagerImpl : public milvus::FileManager {
                    remote_file.status().ToString());
         return std::static_pointer_cast<milvus::InputStream>(
             std::make_shared<milvus::storage::RemoteInputStream>(
-                std::move(remote_file.ValueOrDie())));
+                std::move(remote_file.ValueOrDie()), s3_read_path_config_));
     }
 
     std::shared_ptr<OutputStream>
@@ -262,6 +267,11 @@ class FileManagerImpl : public milvus::FileManager {
     virtual ChunkManagerPtr
     GetChunkManager() const {
         return rcm_;
+    }
+
+    void
+    SetS3ReadPathConfig(milvus::S3ReadPathConfig config) {
+        s3_read_path_config_ = std::move(config);
     }
 
     virtual std::string
@@ -377,6 +387,7 @@ class FileManagerImpl : public milvus::FileManager {
     milvus_storage::ArrowFileSystemPtr fs_;
     std::shared_ptr<milvus_storage::api::Properties> loon_ffi_properties_;
     std::shared_ptr<CPluginContext> plugin_context_;
+    milvus::S3ReadPathConfig s3_read_path_config_;
 };
 
 using FileManagerImplPtr = std::shared_ptr<FileManagerImpl>;

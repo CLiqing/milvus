@@ -1,5 +1,5 @@
 diff --git a/cardinal/serialization/default_serializer.cpp b/cardinal/serialization/default_serializer.cpp
-index 21938b9b..1312b887 100644
+index 21938b9b..67b14f23 100644
 --- a/cardinal/serialization/default_serializer.cpp
 +++ b/cardinal/serialization/default_serializer.cpp
 @@ -13,6 +13,7 @@
@@ -28,12 +28,20 @@ index 21938b9b..1312b887 100644
            start_offset_(start_offset),
            range_size_(range_size),
            current_pos_(0) {}
-@@ -485,6 +488,37 @@ public:
+@@ -485,6 +488,59 @@ public:
          return underlying_->ReadAt(ptr, start_offset_ + offset, to_read);
      }
 
 +    bool SupportsAsyncReadAt() const override {
 +        return async_underlying_ != nullptr && async_underlying_->SupportsAsyncReadAt();
++    }
++
++    bool SupportsAsyncReadAt(const milvus::S3ReadPathConfig& config) const override {
++        return async_underlying_ != nullptr && async_underlying_->SupportsAsyncReadAt(config);
++    }
++
++    milvus::S3ReadPathConfig GetS3ReadPathConfig() const override {
++        return async_underlying_ != nullptr ? async_underlying_->GetS3ReadPathConfig() : milvus::S3ReadPathConfig{};
 +    }
 +
 +    std::future<milvus::AsyncReadResult> ReadAtAsync(size_t offset, size_t size) override {
@@ -47,6 +55,20 @@ index 21938b9b..1312b887 100644
 +        size_t available = range_size_ - offset;
 +        size_t to_read = std::min(size, available);
 +        return async_underlying_->ReadAtAsync(start_offset_ + offset, to_read);
++    }
++
++    std::future<milvus::AsyncReadResult> ReadAtAsync(
++        size_t offset, size_t size, const milvus::S3ReadPathConfig& config) override {
++        if (!SupportsAsyncReadAt(config) || offset >= range_size_) {
++            std::promise<milvus::AsyncReadResult> promise;
++            milvus::AsyncReadResult result;
++            promise.set_value(std::move(result));
++            return promise.get_future();
++        }
++
++        size_t available = range_size_ - offset;
++        size_t to_read = std::min(size, available);
++        return async_underlying_->ReadAtAsync(start_offset_ + offset, to_read, config);
 +    }
 +
 +    void ConfigureAsyncReadAtLimiter(size_t limiter_id, size_t max_inflight) override {
@@ -66,7 +88,7 @@ index 21938b9b..1312b887 100644
      /**
       * @brief Read data from the range to a file descriptor
       *
-@@ -514,6 +548,7 @@ public:
+@@ -514,6 +570,7 @@ public:
 
  private:
      std::shared_ptr<InputStream> underlying_;
@@ -75,7 +97,7 @@ index 21938b9b..1312b887 100644
      size_t range_size_ = 0;
      size_t current_pos_ = 0;
 diff --git a/cardinal/storage/stream_reader.cpp b/cardinal/storage/stream_reader.cpp
-index 6727be62..a5350897 100644
+index 6727be62..8bc2cea0 100644
 --- a/cardinal/storage/stream_reader.cpp
 +++ b/cardinal/storage/stream_reader.cpp
 @@ -5,14 +5,26 @@
@@ -105,11 +127,12 @@ index 6727be62..a5350897 100644
 
  ConcurrentStreamReader::ConcurrentStreamReader(std::shared_ptr<milvus::InputStream> stream, size_t chunk_size)
      : stream_(std::move(stream)),
-@@ -51,6 +63,85 @@ size_t ConcurrentStreamReader::ReadAndWriteToFile(int fd, size_t offset, size_t
+@@ -51,6 +63,86 @@ size_t ConcurrentStreamReader::ReadAndWriteToFile(int fd, size_t offset, size_t
          fmt::format("Read range [{}, {}) exceeds stream size {}", offset, offset + size, stream_->Size())
      );
 
-+    if (auto async_stream = GetAsyncInputStream(stream_)) {
++    const milvus::S3ReadPathConfig s3_read_path_config;
++    if (auto async_stream = GetAsyncInputStream(stream_, s3_read_path_config)) {
 +        size_t num_chunks = (size + chunk_size_ - 1) / chunk_size_;
 +        auto& stats = GetCardinalAsyncReadStats();
 +        uint64_t batch_id = stats.NextTraceBatchId();
@@ -128,7 +151,7 @@ index 6727be62..a5350897 100644
 +            reads.push_back(AsyncChunkRead{
 +                .chunk_index = i,
 +                .chunk_size = chunk_size,
-+                .future = async_stream->ReadAtAsync(chunk_offset, chunk_size),
++                .future = async_stream->ReadAtAsync(chunk_offset, chunk_size, s3_read_path_config),
 +            });
 +        }
 +        uint64_t submit_done_us = NowMicros();
@@ -191,7 +214,7 @@ index 6727be62..a5350897 100644
      std::atomic<size_t> total_written{0};
      std::atomic<bool> has_error{false};
      std::string error_msg;
-@@ -106,7 +197,19 @@ size_t ConcurrentStreamReader::ReadAndWriteToFile(int fd, size_t offset, size_t
+@@ -106,7 +198,19 @@ size_t ConcurrentStreamReader::ReadAndWriteToFile(int fd, size_t offset, size_t
      });
 
      // Execute tasks in parallel using FetchPool
@@ -211,11 +234,12 @@ index 6727be62..a5350897 100644
 
      // Check for errors
      if (has_error.load()) {
-@@ -122,6 +225,72 @@ size_t ConcurrentStreamReader::ReadAndWriteToMemory(std::byte* buffer, size_t of
+@@ -122,6 +226,73 @@ size_t ConcurrentStreamReader::ReadAndWriteToMemory(std::byte* buffer, size_t of
          fmt::format("Read range [{}, {}) exceeds stream size {}", offset, offset + size, stream_->Size())
      );
 
-+    if (auto async_stream = GetAsyncInputStream(stream_)) {
++    const milvus::S3ReadPathConfig s3_read_path_config;
++    if (auto async_stream = GetAsyncInputStream(stream_, s3_read_path_config)) {
 +        size_t num_chunks = (size + chunk_size_ - 1) / chunk_size_;
 +        auto& stats = GetCardinalAsyncReadStats();
 +        uint64_t batch_id = stats.NextTraceBatchId();
@@ -234,7 +258,7 @@ index 6727be62..a5350897 100644
 +            reads.push_back(AsyncChunkRead{
 +                .chunk_index = i,
 +                .chunk_size = chunk_size,
-+                .future = async_stream->ReadAtAsync(chunk_offset, chunk_size),
++                .future = async_stream->ReadAtAsync(chunk_offset, chunk_size, s3_read_path_config),
 +            });
 +        }
 +        uint64_t submit_done_us = NowMicros();
@@ -284,7 +308,7 @@ index 6727be62..a5350897 100644
      std::atomic<size_t> total_read{0};
      std::atomic<bool> has_error{false};
      std::string error_msg;
-@@ -158,7 +327,19 @@ size_t ConcurrentStreamReader::ReadAndWriteToMemory(std::byte* buffer, size_t of
+@@ -158,7 +329,19 @@ size_t ConcurrentStreamReader::ReadAndWriteToMemory(std::byte* buffer, size_t of
      });
 
      // Execute tasks in parallel using FetchPool
@@ -305,7 +329,7 @@ index 6727be62..a5350897 100644
      // Check for errors
      if (has_error.load()) {
 diff --git a/cardinal/storage/translator/chunk_translator.h b/cardinal/storage/translator/chunk_translator.h
-index a03fe971..883e7487 100644
+index 1b5617d2..06f9fd5f 100644
 --- a/cardinal/storage/translator/chunk_translator.h
 +++ b/cardinal/storage/translator/chunk_translator.h
 @@ -4,6 +4,7 @@
@@ -324,11 +348,17 @@ index a03fe971..883e7487 100644
  #include <cardinal/storage/memory_storage.h>
  #include <cardinal/storage/storage.h>
  #include "common/common_type_c.h"
-@@ -128,6 +130,162 @@ public:
+@@ -134,6 +136,171 @@ public:
          std::vector<std::pair<milvus::cachinglayer::cid_t, std::unique_ptr<StorageType>>> cells;
          cells.resize(cids.size());
 
-+        if (IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC")) {
++        const auto op_s3_read_path_config =
++            op_context == nullptr ? milvus::S3ReadPathConfig{} : op_context->s3_read_path_config;
++        const bool op_s3_async_enabled =
++            op_s3_read_path_config.override_enabled &&
++            (op_s3_read_path_config.mode == "curl_multi" ||
++             op_s3_read_path_config.mode == "crt");
++        if (IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC") || op_s3_async_enabled) {
 +            struct CellRead {
 +                milvus::cachinglayer::cid_t cid;
 +                size_t index;
@@ -336,6 +366,7 @@ index a03fe971..883e7487 100644
 +                std::shared_ptr<milvus::InputStream> stream;
 +                std::shared_ptr<milvus::AsyncInputStream> async_stream;
 +                std::future<milvus::AsyncReadResult> future;
++                milvus::S3ReadPathConfig s3_read_path_config;
 +            };
 +
 +            std::vector<CellRead> reads;
@@ -356,7 +387,7 @@ index a03fe971..883e7487 100644
 +                }
 +
 +                auto stream = meta->GetInputStreamForTensor("data");
-+                auto async_stream = GetAsyncInputStream(stream);
++                auto async_stream = GetAsyncInputStream(stream, op_s3_read_path_config);
 +                if (async_stream == nullptr) {
 +                    all_remote_async = false;
 +                    break;
@@ -368,6 +399,7 @@ index a03fe971..883e7487 100644
 +                    .meta = meta,
 +                    .stream = stream,
 +                    .async_stream = async_stream,
++                    .s3_read_path_config = op_s3_read_path_config,
 +                });
 +            }
 +
@@ -385,7 +417,8 @@ index a03fe971..883e7487 100644
 +                for (auto& read : reads) {
 +                    stats.last_max_inflight.store(read.async_stream->GetAsyncReadAtMaxInflight(), std::memory_order_relaxed);
 +                    stats.submitted.fetch_add(1, std::memory_order_relaxed);
-+                    read.future = read.async_stream->ReadAtAsync(0, read.stream->Size());
++                    read.future = read.async_stream->ReadAtAsync(
++                        0, read.stream->Size(), read.s3_read_path_config);
 +                }
 +                uint64_t submit_done_us = NowMicros();
 +                uint64_t inflight_after_submit =
@@ -487,7 +520,7 @@ index a03fe971..883e7487 100644
          std::vector<std::function<void()>> tasks;
          tasks.reserve(cids.size());
 
-@@ -217,7 +375,27 @@ public:
+@@ -223,7 +390,27 @@ public:
              }
          }
 
@@ -516,7 +549,7 @@ index a03fe971..883e7487 100644
          return cells;
      }
 diff --git a/know/cardinal_adapter.h b/know/cardinal_adapter.h
-index fb6251cd..398f01da 100644
+index eb5e8290..695631c8 100644
 --- a/know/cardinal_adapter.h
 +++ b/know/cardinal_adapter.h
 @@ -12,6 +12,7 @@
@@ -549,7 +582,7 @@ index fb6251cd..398f01da 100644
  // looks ugly, but this is C++ and strings :(
  inline std::vector<uint32_t> saqParseAllowedBitsOrDefault(const std::string& s) {
      std::stringstream ss(s);
-@@ -879,6 +895,13 @@ public:
+@@ -878,6 +894,13 @@ public:
 
                  config.temp_config.enable_batch_4 = hnswConfig.enable_batch_4.value();
 

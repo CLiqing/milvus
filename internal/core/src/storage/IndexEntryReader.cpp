@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -55,8 +56,7 @@ IsEnvEnabled(const char* name) {
 }
 
 bool
-IsS3AsyncReadPathEnabled() {
-    const auto& config = milvus::GetS3ReadPathConfig();
+IsS3AsyncReadPathEnabled(const milvus::S3ReadPathConfig& config) {
     if (config.override_enabled) {
         return config.mode == "curl_multi" || config.mode == "crt";
     }
@@ -65,9 +65,24 @@ IsS3AsyncReadPathEnabled() {
 
 bool
 ShouldPrintS3ReadPathLog() {
-    static std::atomic<uint64_t> printed{0};
-    return IsEnvEnabled("MILVUS_S3_READ_PATH_LOG") &&
-           printed.fetch_add(1, std::memory_order_relaxed) < 64;
+    static const bool enabled = IsEnvEnabled("MILVUS_S3_READ_PATH_LOG");
+    if (!enabled) {
+        return false;
+    }
+    static std::atomic<uint64_t> last_print_us{0};
+    const auto now_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    auto last_us = last_print_us.load(std::memory_order_relaxed);
+    if (last_us != 0 && now_us <= last_us + 1000000) {
+        return false;
+    }
+    return last_print_us.compare_exchange_strong(
+        last_us,
+        now_us,
+        std::memory_order_relaxed,
+        std::memory_order_relaxed);
 }
 
 const uint8_t*
@@ -77,8 +92,11 @@ AsBytes(const std::vector<std::byte>& data) {
 
 std::shared_ptr<RemoteInputStream>
 GetAsyncRemoteInputStream(const std::shared_ptr<milvus::InputStream>& input) {
-    const auto& config = milvus::GetS3ReadPathConfig();
-    if (!IsS3AsyncReadPathEnabled()) {
+    auto remote_input = std::dynamic_pointer_cast<RemoteInputStream>(input);
+    const auto config =
+        remote_input == nullptr ? milvus::S3ReadPathConfig{}
+                                : remote_input->GetS3ReadPathConfig();
+    if (!IsS3AsyncReadPathEnabled(config)) {
         if (config.override_enabled && ShouldPrintS3ReadPathLog()) {
             std::cerr << "[MILVUS_S3_READ_PATH]"
                       << " layer=index_entry_reader"
@@ -88,7 +106,6 @@ GetAsyncRemoteInputStream(const std::shared_ptr<milvus::InputStream>& input) {
         }
         return nullptr;
     }
-    auto remote_input = std::dynamic_pointer_cast<RemoteInputStream>(input);
     if (remote_input == nullptr || !remote_input->SupportsAsyncReadAt()) {
         if (config.override_enabled && ShouldPrintS3ReadPathLog()) {
             std::cerr << "[MILVUS_S3_READ_PATH]"
@@ -134,7 +151,7 @@ void
 ConfigureAsyncReadAtConcurrency(
     const std::shared_ptr<RemoteInputStream>& remote_input,
     ThreadPoolPriority priority) {
-    const auto& config = milvus::GetS3ReadPathConfig();
+    const auto config = remote_input->GetS3ReadPathConfig();
     if (config.override_enabled && config.max_inflight.has_value()) {
         remote_input->ConfigureAsyncReadAtLimiter(
             static_cast<size_t>(priority), *config.max_inflight);

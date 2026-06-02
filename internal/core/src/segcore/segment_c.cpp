@@ -11,6 +11,8 @@
 
 #include "segcore/segment_c.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -51,6 +53,34 @@
 #include "common/GeometryCache.h"
 
 //////////////////////////////    common interfaces    //////////////////////////////
+
+namespace {
+
+bool
+ShouldPrintS3ReadPathLog() {
+    const char* value = std::getenv("MILVUS_S3_READ_PATH_LOG");
+    static const bool enabled =
+        value != nullptr && std::strcmp(value, "1") == 0;
+    if (!enabled) {
+        return false;
+    }
+    static std::atomic<uint64_t> last_print_us{0};
+    const auto now_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    auto last_us = last_print_us.load(std::memory_order_relaxed);
+    if (last_us != 0 && now_us <= last_us + 1000000) {
+        return false;
+    }
+    return last_print_us.compare_exchange_strong(
+        last_us,
+        now_us,
+        std::memory_order_relaxed,
+        std::memory_order_relaxed);
+}
+
+}  // namespace
 
 /**
  * @brief Create a segment from a collection.
@@ -291,15 +321,10 @@ AsyncSearch(CTraceContext c_trace,
 
             segment->LazyCheckSchema(plan->schema_);
 
-            milvus::ScopedS3ReadPathConfig s3_read_path_scope(
-                plan->plan_node_->search_info_.s3_read_path_config_);
             const auto& s3_read_path_config =
                 plan->plan_node_->search_info_.s3_read_path_config_;
-            const char* s3_read_path_log =
-                std::getenv("MILVUS_S3_READ_PATH_LOG");
             if (s3_read_path_config.override_enabled &&
-                s3_read_path_log != nullptr &&
-                std::strcmp(s3_read_path_log, "1") == 0) {
+                ShouldPrintS3ReadPathLog()) {
                 LOG_INFO(
                     "[MILVUS_S3_READ_PATH] layer=segcore_async_search mode={} max_inflight={} eventloops={} crt_max_connections={} crt_throughput_gbps={}",
                     s3_read_path_config.mode,
