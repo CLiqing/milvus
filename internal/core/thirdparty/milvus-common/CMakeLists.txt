@@ -47,6 +47,15 @@ if ( NOT milvus-common_POPULATED )
         message( FATAL_ERROR "Failed to install AsyncInputStream.h into milvus-common source tree" )
     endif()
 
+    execute_process(
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${CMAKE_CURRENT_SOURCE_DIR}/OpContext.h
+                    ${milvus-common_SOURCE_DIR}/include/common/OpContext.h
+            RESULT_VARIABLE OP_CONTEXT_COPY_RESULT )
+    if ( NOT OP_CONTEXT_COPY_RESULT EQUAL 0 )
+        message( FATAL_ERROR "Failed to install OpContext.h into milvus-common source tree" )
+    endif()
+
     # Adding the following target:
     # milvus-common
     add_subdirectory( ${milvus-common_SOURCE_DIR}

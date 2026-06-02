@@ -196,6 +196,7 @@ ExecPlanNodeVisitor::visit(VectorPlanNode& node) {
 
     // Set op context to query context
     auto op_context = milvus::OpContext(cancel_token_);
+    op_context.s3_read_path_config = node.search_info_.s3_read_path_config_;
     query_context->set_op_context(&op_context);
 
     // Do plan fragment task work

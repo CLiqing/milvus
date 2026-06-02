@@ -41,7 +41,52 @@ This avoids depending on local dirty worktrees during QTP image builds.
 
 ## Runtime Path Selection
 
-The Milvus binary accepts one flag to select the S3 read path:
+Preferred mode for this experiment is per-search selection. One image and one
+instance can serve all three paths, and the same collection/index data can be
+reused across path comparisons.
+
+Use search params:
+
+```text
+baseline:
+  {"s3_read_path": "baseline"}
+
+curl_multi:
+  {"s3_read_path": "curl_multi",
+   "s3_read_max_inflight": 100,
+   "s3_read_eventloops": 8}
+
+crt:
+  {"s3_read_path": "crt",
+   "s3_read_max_inflight": 100,
+   "s3_read_eventloops": 8,
+   "s3_read_crt_max_connections": 100,
+   "s3_read_crt_throughput_gbps": 30}
+```
+
+For PyMilvus:
+
+```python
+search_params = {
+    "metric_type": "COSINE",
+    "params": {
+        "search_list_size": 100,
+        "search_level": 1,
+        "s3_read_path": "curl_multi",
+        "s3_read_max_inflight": 100,
+        "s3_read_eventloops": 8,
+    },
+}
+collection.search(vectors, "vec", search_params, limit=100)
+```
+
+The search-param path is propagated through `SearchInfo` and `OpContext`, then
+restored at the Knowhere/Cardinal thread-pool boundary before the real S3 read
+selector is reached. Do not use a process-global mutable variable for path
+selection; concurrent searches may carry different params.
+
+The older instance-startup flags are still useful for coarse smoke testing or
+single-path instances. The Milvus binary accepts:
 
 ```bash
 milvus run standalone --s3-read-path=baseline
@@ -81,8 +126,10 @@ crt:
 
 If `--s3-read-path` is omitted, existing environment-variable behavior is kept.
 
-For QTP/VDC Cloud instances, prefer runtime Milvus config parameters so one
-image can be reused across all paths:
+For QTP/VDC Cloud instances, avoid changing runtime Milvus config just to switch
+between the three experiment paths. Runtime config makes the whole instance
+path-specific and usually requires restart. Keep it only as a fallback for
+single-path debugging:
 
 ```text
 queryNode.s3ReadPath.mode=baseline
@@ -99,9 +146,9 @@ queryNode.s3ReadPath.crtMaxConnections=100
 queryNode.s3ReadPath.crtThroughputGbps=30
 ```
 
-Use QTP `ModifyParams` with `needRestart=true` after changing these values. If
-the CLI flag `--s3-read-path` is provided, it takes precedence over the config
-value.
+Use QTP `ModifyParams` with `needRestart=true` after changing these fallback
+values. If the CLI flag `--s3-read-path` is provided, it takes precedence over
+the config value. Search params take precedence for the experiment comparison.
 
 ## QTP Runtime Config
 
@@ -133,7 +180,9 @@ Before comparing QTP performance metrics:
 
 ```text
 1. Recall and first10 result IDs must match baseline.
-2. curl_multi/CRT must report async path evidence in logs or metrics.
+2. curl_multi/CRT must report async path evidence in logs or metrics from the
+   real Cardinal/MCL/milvus-storage S3 read path, not only from segcore param
+   parsing.
 3. Async path max in-flight must be capped at the same value as baseline fetch pool pressure, normally 100.
 4. Compare QPS, latency, process CPU, thread count, context switches, S3 bandwidth, and page faults under the same dataset and cold-load procedure.
 ```

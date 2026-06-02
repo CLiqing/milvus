@@ -101,6 +101,33 @@ if ( NOT knowhere_POPULATED )
         endif()
     endif()
 
+    set( KNOWHERE_S3_READ_PATH_CONTEXT_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/knowhere_s3_read_path_context.patch )
+    execute_process(
+            COMMAND git apply --unidiff-zero --check ${KNOWHERE_S3_READ_PATH_CONTEXT_PATCH}
+            WORKING_DIRECTORY ${knowhere_SOURCE_DIR}
+            RESULT_VARIABLE KNOWHERE_S3_READ_PATH_CONTEXT_PATCH_CHECK_RESULT
+            OUTPUT_QUIET
+            ERROR_QUIET )
+    if ( KNOWHERE_S3_READ_PATH_CONTEXT_PATCH_CHECK_RESULT EQUAL 0 )
+        execute_process(
+                COMMAND git apply --unidiff-zero ${KNOWHERE_S3_READ_PATH_CONTEXT_PATCH}
+                WORKING_DIRECTORY ${knowhere_SOURCE_DIR}
+                RESULT_VARIABLE KNOWHERE_S3_READ_PATH_CONTEXT_PATCH_APPLY_RESULT )
+        if ( NOT KNOWHERE_S3_READ_PATH_CONTEXT_PATCH_APPLY_RESULT EQUAL 0 )
+            message( FATAL_ERROR "Failed to apply Knowhere S3 read path context patch" )
+        endif()
+    else()
+        execute_process(
+                COMMAND git apply --unidiff-zero --reverse --check ${KNOWHERE_S3_READ_PATH_CONTEXT_PATCH}
+                WORKING_DIRECTORY ${knowhere_SOURCE_DIR}
+                RESULT_VARIABLE KNOWHERE_S3_READ_PATH_CONTEXT_PATCH_REVERSE_CHECK_RESULT
+                OUTPUT_QUIET
+                ERROR_QUIET )
+        if ( NOT KNOWHERE_S3_READ_PATH_CONTEXT_PATCH_REVERSE_CHECK_RESULT EQUAL 0 )
+            message( FATAL_ERROR "Knowhere S3 read path context patch is neither applicable nor already applied" )
+        endif()
+    endif()
+
     # Adding the following target:
     # knowhere
     add_subdirectory( ${knowhere_SOURCE_DIR}

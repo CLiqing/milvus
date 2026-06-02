@@ -92,7 +92,20 @@ GetAsyncInputStream(const std::shared_ptr<milvus::InputStream>& stream) {
     const auto& config = milvus::GetS3ReadPathConfig();
     auto async_stream =
         std::dynamic_pointer_cast<milvus::AsyncInputStream>(stream);
+    auto print_probe = [&](bool supported, uint64_t max_inflight) {
+        if (!ShouldPrintS3ReadPathLog()) {
+            return;
+        }
+        std::cerr << "[MILVUS_S3_READ_PATH]"
+                  << " layer=cardinal_async_input_stream_probe"
+                  << " override_enabled=" << config.override_enabled
+                  << " mode=" << config.mode
+                  << " async_stream_supported=" << supported
+                  << " max_inflight=" << max_inflight
+                  << std::endl;
+    };
     if (async_stream == nullptr || !async_stream->SupportsAsyncReadAt()) {
+        print_probe(false, 0);
         if (config.override_enabled && ShouldPrintS3ReadPathLog()) {
             std::cerr << "[MILVUS_S3_READ_PATH]"
                       << " layer=cardinal_async_input_stream"
@@ -106,6 +119,7 @@ GetAsyncInputStream(const std::shared_ptr<milvus::InputStream>& stream) {
     auto max_inflight = GetCardinalAsyncMaxInflight();
     async_stream->ConfigureAsyncReadAtLimiter(kCardinalFetchLimiterId,
                                               max_inflight);
+    print_probe(true, max_inflight);
     if (config.override_enabled && ShouldPrintS3ReadPathLog()) {
         std::cerr << "[MILVUS_S3_READ_PATH]"
                   << " layer=cardinal_async_input_stream"

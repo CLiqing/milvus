@@ -82,6 +82,24 @@ ShouldPrintS3ReadPathLog() {
            printed.fetch_add(1, std::memory_order_relaxed) < 64;
 }
 
+void
+PrintS3ReadPathProbe(const char* operation,
+                     const milvus::S3ReadPathConfig& config,
+                     size_t offset,
+                     size_t size) {
+    if (!ShouldPrintS3ReadPathLog()) {
+        return;
+    }
+    std::cerr << "[MILVUS_S3_READ_PATH]"
+              << " layer=remote_input_stream_probe"
+              << " operation=" << operation
+              << " override_enabled=" << config.override_enabled
+              << " mode=" << config.mode
+              << " offset=" << offset
+              << " size=" << size
+              << std::endl;
+}
+
 class ScopedMilvusStorageS3ReadPathContext {
  public:
     explicit ScopedMilvusStorageS3ReadPathContext(
@@ -330,6 +348,8 @@ RemoteInputStream::Read(void* data, size_t size) {
 
 size_t
 RemoteInputStream::ReadAt(void* data, size_t offset, size_t size) {
+    PrintS3ReadPathProbe(
+        "ReadAt", milvus::GetS3ReadPathConfig(), offset, size);
     auto status = remote_file_->ReadAt(offset, size, data);
     AssertInfo(status.ok(), "Failed to read from input stream");
     return static_cast<size_t>(status.ValueOrDie());
@@ -342,6 +362,8 @@ RemoteInputStream::SupportsAsyncReadAt() const {
 
 std::future<RemoteAsyncReadResult>
 RemoteInputStream::ReadAtAsync(size_t offset, size_t size) {
+    PrintS3ReadPathProbe(
+        "ReadAtAsync", milvus::GetS3ReadPathConfig(), offset, size);
     auto& stats = GetAsyncReadStats();
     stats.submitted.fetch_add(1, std::memory_order_relaxed);
     stats.requested_bytes.fetch_add(size, std::memory_order_relaxed);
