@@ -898,9 +898,34 @@ VectorDiskAnnIndex<T>::update_load_json(const Config& config) {
     knowhere::Json load_config;
     load_config.update(config);
 
-    // set data path
-    auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
-    load_config[DISK_ANN_PREFIX_PATH] = local_index_path_prefix;
+    // Demo compatibility: Cardinal re-appends "_mem.index.bin" to index_prefix
+    // while current Milvus may store the actual file under index_v1/.../_mem.index.bin.
+    // Use the real index file stem when it is available.
+    auto index_type = GetValueFromConfig<std::string>(config, INDEX_TYPE);
+    if (index_type.has_value() && index_type.value() == "CARDINAL_TIERED") {
+        auto index_files =
+            GetValueFromConfig<std::vector<std::string>>(config, INDEX_FILES);
+        if (index_files.has_value() && !index_files.value().empty()) {
+            constexpr const char* kCardinalMemIndexSuffix = "_mem.index.bin";
+            auto cardinal_index_prefix = index_files.value()[0];
+            auto suffix_len = strlen(kCardinalMemIndexSuffix);
+            if (cardinal_index_prefix.size() >= suffix_len &&
+                cardinal_index_prefix.compare(cardinal_index_prefix.size() -
+                                                  suffix_len,
+                                              suffix_len,
+                                              kCardinalMemIndexSuffix) == 0) {
+                cardinal_index_prefix.resize(cardinal_index_prefix.size() -
+                                             suffix_len);
+            }
+            load_config[DISK_ANN_PREFIX_PATH] = cardinal_index_prefix;
+        } else {
+            load_config[DISK_ANN_PREFIX_PATH] =
+                file_manager_->GetRemoteIndexObjectPrefix();
+        }
+    } else {
+        auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
+        load_config[DISK_ANN_PREFIX_PATH] = local_index_path_prefix;
+    }
 
     if (GetIndexType() == knowhere::IndexEnum::INDEX_DISKANN) {
         // set base info
