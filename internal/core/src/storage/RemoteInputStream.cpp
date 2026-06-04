@@ -348,8 +348,6 @@ size_t
 RemoteInputStream::ReadAt(void* data, size_t offset, size_t size) {
     PrintS3ReadPathProbe(
         "ReadAt", s3_read_path_config_, offset, size);
-    std::lock_guard<std::mutex> lock(*s3_read_path_context_mutex_);
-    ApplyS3ReadPathConfigForFile(remote_file_.get(), s3_read_path_config_);
     auto status = remote_file_->ReadAt(offset, size, data);
     AssertInfo(status.ok(), "Failed to read from input stream");
     return static_cast<size_t>(status.ValueOrDie());
