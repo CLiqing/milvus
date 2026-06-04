@@ -395,3 +395,78 @@ collection 为 `VDBBench`，10M rows，6 persistent segments，过滤条件
 - QPS：`2499.35 / 1313.57 = 1.90x`，提升约 `+90.3%`。
 - Avg RT：`45.68 ms -> 24.01 ms`。
 - TP99：`70.48 ms -> 37.12 ms`。
+
+## 正确性验证
+
+目标是验证 downpush 只改变过滤条件执行位置，不改变搜索语义。
+
+### RemoteClient 单 Query
+
+配置：
+
+- Query：`/home/ubuntu/workspace/RemoteClient/datasets/cohere_query_1vec.json`。
+- Filter：`id >= 5000000`。
+- TopK：`100`。
+- Search params：`metric_type=COSINE`，`ef=100`。
+
+结果文件：
+
+- Baseline：`/tmp/hnsw_baseline_top100.json`。
+- Downpush：`/tmp/hnsw_downpush_top100.json`。
+- 对比摘要：`/tmp/hnsw_correctness_compare_top100.json`。
+
+结果：
+
+- baseline 返回 `100` 条，downpush 返回 `100` 条。
+- baseline/downpush 都没有违反过滤条件的结果：`bad_filter=0`。
+- top100 id 顺序完全一致：`ordered_equal=true`。
+- top100 id 集合完全一致：`set_equal=true`。
+- overlap@100：`100/100`。
+- common id 的最大 score 差异：`0.0`。
+
+### Cohere 1000 Query
+
+配置：
+
+- Query：`/home/ubuntu/data/cohere/cohere_query.fbin`，共 `1000` 条，维度 `768`。
+- Filter：`id >= 5000000`。
+- TopK：`100`。
+- Search params：`metric_type=COSINE`，`ef=100`。
+- 分批 search：每批 `20` 条 query。
+
+结果文件：
+
+- Baseline top100 ids：`/tmp/hnsw_baseline_1000q_top100_ids.json`。
+- Downpush top100 ids：`/tmp/hnsw_downpush_1000q_top100_ids.json`。
+- topK 对比摘要：`/tmp/hnsw_correctness_compare_1000q_top100.json`。
+- GT recall 对比摘要：`/tmp/hnsw_correctness_recall_1000q_top100.json`。
+
+topK id 对比结果：
+
+- Query 数量：`1000`。
+- 每条 query 返回 topK：`100`。
+- baseline/downpush 都没有违反过滤条件的结果：`bad_filter=0`。
+- top100 id 顺序完全一致的 query 数：`1000/1000`。
+- top100 id 集合完全一致的 query 数：`1000/1000`。
+- min overlap@100：`100`。
+- avg overlap@100：`100`。
+- p50 overlap@100：`100`。
+- p99 overlap@100：`100`。
+- 首个 mismatch：无。
+
+GT recall 说明：
+
+- 本地 GT 文件：
+  `/home/ubuntu/data/cohere/cohere_query_COSINE_0.50_100.truth`。
+- 该 GT 的 id 是原始 cohere 1M 数据空间；当前 Milvus collection 是 10M 场景，
+  返回 id 位于 `0..9999999`，两者 id 空间不直接一致。
+- 因此 raw id recall 和简单 `id % 1000000` 映射 recall 的绝对值没有参考意义。
+- 但 baseline 和 downpush 的 recall 数字完全一致：
+  - raw id：avg recall@100 都是 `0.0`，per-query 最大差异 `0.0`。
+  - `id % 1000000`：avg recall@100 都是 `0.00006`，per-query 最大差异 `0.0`。
+
+结论：
+
+- 在固定 `id >= 5000000`、HNSW `ef=100`、topK=100 场景下，downpush 与
+  baseline 的 topK id 结果完全一致。
+- 这说明当前 demo 没有引入可观测的搜索语义差异；QPS 差异来自过滤执行位置变化。
