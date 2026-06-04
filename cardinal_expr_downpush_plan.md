@@ -225,3 +225,13 @@ Milvus 侧仍会校验实际表达式必须是主键 `INT64 % P < T`，且 searc
 - iterator/range search 路径会重新构造 filter view，如后续测试覆盖 iterator/range，需要补充桥接。
 - 静态无删除场景下过滤率可以由 search param 保证；正式 PR 需要考虑删除、segment 变化和表达式统计。
 - 当前旧 knowhere demo patch 不等同于 cardinal 方案，只能作为桥接思路参考。
+
+## 代码检视注意事项
+
+以下问题不影响当前 demo 的 happy path 验证，但后续扩大测试范围或走正式 PR 时需要处理：
+
+- `BuildCardinalExprDownpushSearchContext()` 如果构建失败，当前代码不会 fail fast，而是继续以全通过 bitset 搜索；当前测试需确保 sealed segment、INT64 PK 字段可 pin、普通 search 路径正常。
+- extra filter context 当前由 `VectorSearchNode::GetOutput()` 局部 `shared_ptr` 持有，并以裸指针传入 knowhere/cardinal；普通同步 search 路径生命周期足够，iterator、group-by、range 等会延后消费 iterator/filter view 的路径暂不支持。
+- `FilterCheckerView::Valid()` 的空过滤判断依赖 `filtered_out_count`；当前测试需保证显式传入或默认计算出的 filtered count 与表达式一致，避免 count 为 0 时绕过 callback。
+- 未显式传入 `filtered_out_count` 时，默认 count 按 row offset 分布估算；当前测试数据使用连续 PK 或显式传 count，非连续 PK、delete/TTL、组合 bitset 场景不依赖默认估算。
+- `CARDINAL_TIERED` load 兼容 patch 当前使用 `INDEX_FILES[0]` 推导 mem index prefix；当前测试产物顺序满足该假设，后续正式化应按 `_mem.index.bin` suffix 查找目标文件。
