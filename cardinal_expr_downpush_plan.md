@@ -23,8 +23,6 @@
 
 第一版暂不处理以下内容：
 
-- cardinal BF/IVF 路径。
-- `BitCompressBatch64()` 批量 bitset 压缩路径。
 - 高过滤率下 cardinal 自动切换搜索策略后的完整覆盖。
 - 通用表达式解析和任意 scalar 表达式执行。
 - 删除数据、动态 segment、复杂 MV/tenant 场景下的过滤率精确维护。
@@ -121,9 +119,10 @@ graph search 调用点：
 - [x] knowhere/cardinal adapter 桥接下沉上下文到 cardinal `FilterCheckerView`。
 - [x] cardinal `FilterCheckerView` 增加 demo 级 extra filter 能力。
 - [x] cardinal graph search 中通过 `Valid/Test` 执行 `pk % P < T` 判断。
+- [x] cardinal `BitCompressBatch64()` 批量 bitset 解码路径在 extra filter 开启时合并 callback 判断。
 - [x] 保证 `GetFilterRatio()` / `GetFilteredCount()` 与 baseline 一致，必要时直接使用 search param 传入值。
 - [x] 构建本地或镜像版本，确认 patch 进入实际运行二进制。
-- [ ] 正确性验证：baseline 与 downpush 对比 topK id 集合/recall。
+- [x] 正确性验证：baseline 与 downpush 对比 topK id 集合/recall。
 - [ ] 性能验证：baseline 与 downpush 对比 QPS、延迟、perf/flamegraph。
 
 ## 当前实现状态
@@ -163,6 +162,7 @@ Milvus 侧仍会校验实际表达式必须是主键 `INT64 % P < T`，且 searc
 - `VectorSearchNode` 在搜索前 pin 住 sealed segment 的 PK chunks，并向 knowhere `BitsetView` 设置 extra filter callback。
 - knowhere cardinal adapter 把 extra filter callback 桥接到 cardinal `FilterCheckerView`。
 - cardinal `FilterCheckerView::Test()` 先执行原 bitset 判断，再把 internal id 映射回外部 row offset，用 callback 判断 `pk % P < T`。
+- cardinal `FilterCheckerView::BitCompressBatch64()` 在 extra filter 开启时不再只按 bitmap 批量解码，而是在 64 个 id 的小窗口内逐个合并 bitmap 与 callback 判断，避免 BF/scan 类路径绕过下沉表达式。
 - `filtered_out_count` 会被传给 cardinal，用于保持搜索策略和 baseline 尽量一致。
 
 ### 编译验证
@@ -180,10 +180,30 @@ Milvus 侧仍会校验实际表达式必须是主键 `INT64 % P < T`，且 searc
 
 - `cmake --build cmake_build_cardinal --target knowhere -j 16`
 - `cmake --build cmake_build_cardinal --target milvus_exec -j 16`
+- `cmake --build cmake_build_cardinal --target milvus_core -j 16`
 
 补充检查：
 
 - `git diff --check` 通过。
+
+### 正确性验证
+
+脚本：
+
+- `/home/ubuntu/workspace/TmpWorker/milvus-expr-downpush/cardinal_correctness_check.py`
+
+结果文件：
+
+- `/home/ubuntu/workspace/TmpWorker/milvus-expr-downpush/cardinal_correctness_results_20260604.json`
+
+本地 standalone，`CARDINAL_TIERED`，`COSINE`，20,000 rows，50 queries，topK=20。对比方式为 baseline 与 downpush 的 topK id 顺序完全一致。
+
+结果：
+
+- 过滤 1%，表达式 `id % 100 < 99`：`mismatch_count=0`
+- 过滤 20%，表达式 `id % 100 < 80`：`mismatch_count=0`
+- 过滤 50%，表达式 `id % 4 < 2`：`mismatch_count=0`
+- 过滤 99%，表达式 `id % 100 < 1`：`mismatch_count=0`
 
 ## 过滤率说明
 
@@ -201,7 +221,7 @@ Milvus 侧仍会校验实际表达式必须是主键 `INT64 % P < T`，且 searc
 ## 已知风险
 
 - cardinal internal id 不能当作 PK 使用，必须通过已有 reorder map 转为外部 row offset 后读取 PK。
-- 如果 cardinal 自动切到 BF/IVF 或 batch bitset scan 路径，第一版下沉判断可能不覆盖；测试时需要固定或确认 graph path。
+- cardinal 自动切到 BF/IVF 或 batch bitset scan 路径时，当前 demo 已在 `BitCompressBatch64()` extra filter 分支补充正确性覆盖；性能表现仍需单独评估。
 - iterator/range search 路径会重新构造 filter view，如后续测试覆盖 iterator/range，需要补充桥接。
 - 静态无删除场景下过滤率可以由 search param 保证；正式 PR 需要考虑删除、segment 变化和表达式统计。
 - 当前旧 knowhere demo patch 不等同于 cardinal 方案，只能作为桥接思路参考。
