@@ -1,0 +1,38 @@
+{
+  "baseline_count": 100,
+  "downpush_count": 100,
+  "baseline_bad_filter": 0,
+  "downpush_bad_filter": 0,
+  "ordered_equal": true,
+  "set_equal": true,
+  "overlap_at_100": 100,
+  "overlap_ratio": 1.0,
+  "baseline_only": [],
+  "downpush_only": [],
+  "first_order_diff": null,
+  "max_score_delta_common_ids": 0.0,
+  "baseline_first10": [
+    8024994,
+    7937392,
+    7828776,
+    6398714,
+    7519878,
+    9295716,
+    5803417,
+    7110652,
+    7856608,
+    8095179
+  ],
+  "downpush_first10": [
+    8024994,
+    7937392,
+    7828776,
+    6398714,
+    7519878,
+    9295716,
+    5803417,
+    7110652,
+    7856608,
+    8095179
+  ]
+}

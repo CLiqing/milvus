@@ -1,0 +1,22 @@
+{
+  "raw": {
+    "baseline_avg_recall_at_100": 0.0,
+    "downpush_avg_recall_at_100": 0.0,
+    "baseline_min_recall_at_100": 0.0,
+    "downpush_min_recall_at_100": 0.0,
+    "baseline_p50_recall_at_100": 0.0,
+    "downpush_p50_recall_at_100": 0.0,
+    "max_abs_delta_per_query": 0.0,
+    "queries_with_recall_delta": 0
+  },
+  "mod_1m": {
+    "baseline_avg_recall_at_100": 6e-05,
+    "downpush_avg_recall_at_100": 6e-05,
+    "baseline_min_recall_at_100": 0.0,
+    "downpush_min_recall_at_100": 0.0,
+    "baseline_p50_recall_at_100": 0.0,
+    "downpush_p50_recall_at_100": 0.0,
+    "max_abs_delta_per_query": 0.0,
+    "queries_with_recall_delta": 0
+  }
+}

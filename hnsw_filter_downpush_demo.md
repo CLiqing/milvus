@@ -411,9 +411,9 @@ collection 为 `VDBBench`，10M rows，6 persistent segments，过滤条件
 
 结果文件：
 
-- Baseline：`/tmp/hnsw_baseline_top100.json`。
-- Downpush：`/tmp/hnsw_downpush_top100.json`。
-- 对比摘要：`/tmp/hnsw_correctness_compare_top100.json`。
+- Baseline：[`hnsw_baseline_top100.json`](hnsw_baseline_top100.json)。
+- Downpush：[`hnsw_downpush_top100.json`](hnsw_downpush_top100.json)。
+- 对比摘要：[`hnsw_correctness_compare_top100.json`](hnsw_correctness_compare_top100.json)。
 
 结果：
 
@@ -436,10 +436,10 @@ collection 为 `VDBBench`，10M rows，6 persistent segments，过滤条件
 
 结果文件：
 
-- Baseline top100 ids：`/tmp/hnsw_baseline_1000q_top100_ids.json`。
-- Downpush top100 ids：`/tmp/hnsw_downpush_1000q_top100_ids.json`。
-- topK 对比摘要：`/tmp/hnsw_correctness_compare_1000q_top100.json`。
-- GT recall 对比摘要：`/tmp/hnsw_correctness_recall_1000q_top100.json`。
+- Baseline top100 ids：[`hnsw_baseline_1000q_top100_ids.json`](hnsw_baseline_1000q_top100_ids.json)。
+- Downpush top100 ids：[`hnsw_downpush_1000q_top100_ids.json`](hnsw_downpush_1000q_top100_ids.json)。
+- topK 对比摘要：[`hnsw_correctness_compare_1000q_top100.json`](hnsw_correctness_compare_1000q_top100.json)。
+- GT recall 对比摘要：[`hnsw_correctness_recall_1000q_top100.json`](hnsw_correctness_recall_1000q_top100.json)。
 
 topK id 对比结果：
 

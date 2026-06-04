@@ -1,0 +1,14 @@
+{
+  "query_count": 1000,
+  "topk": 100,
+  "baseline_bad_filter": 0,
+  "downpush_bad_filter": 0,
+  "ordered_equal_queries": 1000,
+  "set_equal_queries": 1000,
+  "min_overlap_at_100": 100,
+  "avg_overlap_at_100": 100,
+  "p50_overlap_at_100": 100.0,
+  "p99_overlap_at_100": 100,
+  "first_mismatch": null,
+  "elapsed_downpush_sec": 1.195
+}
