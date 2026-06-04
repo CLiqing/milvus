@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -56,6 +57,58 @@
 #include "storage/Util.h"
 
 namespace milvus::index {
+
+namespace {
+
+bool
+DemoHnswFilterDownpushEnabled() {
+    const char* env = std::getenv("MILVUS_DEMO_HNSW_FILTER_DOWNPUSH");
+    return env != nullptr && std::string(env) == "1";
+}
+
+int64_t
+DemoHnswFilterThreshold() {
+    const char* env = std::getenv("MILVUS_DEMO_HNSW_FILTER_THRESHOLD");
+    if (env == nullptr || env[0] == '\0') {
+        return 5000000;
+    }
+    char* end = nullptr;
+    auto value = std::strtoll(env, &end, 10);
+    return end != env ? value : 5000000;
+}
+
+template <typename T>
+bool
+ShouldDemoSkipRangeBitmapBuild(const T& value, OpType op) {
+    if (!DemoHnswFilterDownpushEnabled() || op != OpType::GreaterEqual) {
+        return false;
+    }
+    if constexpr (std::is_integral_v<T>) {
+        return static_cast<int64_t>(value) == DemoHnswFilterThreshold();
+    } else {
+        return static_cast<long double>(value) ==
+               static_cast<long double>(DemoHnswFilterThreshold());
+    }
+}
+
+}  // namespace
+
+thread_local DemoHnswScalarFilterView g_demo_hnsw_scalar_filter_view;
+
+void
+SetDemoHnswScalarFilterView(const DemoHnswScalarFilterView& view) {
+    g_demo_hnsw_scalar_filter_view = view;
+}
+
+const DemoHnswScalarFilterView&
+GetDemoHnswScalarFilterView() {
+    return g_demo_hnsw_scalar_filter_view;
+}
+
+void
+ClearDemoHnswScalarFilterView() {
+    g_demo_hnsw_scalar_filter_view = DemoHnswScalarFilterView{};
+}
 
 const std::string MMAP_PATH_FOR_TEST = "/tmp/milvus/mmap_test";
 
@@ -519,6 +572,20 @@ ScalarIndexSort<T>::Range(const T& value, const OpType op) {
 
     size_t hit_count = ub - lb;
     size_t total_count = Count();
+
+    if (ShouldDemoSkipRangeBitmapBuild(value, op)) {
+        if constexpr (std::is_same_v<T, int64_t>) {
+            SetDemoHnswScalarFilterView(
+                DemoHnswScalarFilterView{data_ptr_,
+                                         idx_to_offsets_.data(),
+                                         &valid_bitset_,
+                                         static_cast<int64_t>(total_num_rows_),
+                                         DemoHnswFilterThreshold()});
+        } else {
+            ClearDemoHnswScalarFilterView();
+        }
+        return valid_bitset_.clone();
+    }
 
     if (hit_count > total_count / 2) {
         // Most elements are in range, initialize with `valid_bitset` and set non-matching to false

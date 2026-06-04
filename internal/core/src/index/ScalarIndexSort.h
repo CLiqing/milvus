@@ -49,6 +49,23 @@
 
 namespace milvus::index {
 
+struct DemoHnswScalarFilterView {
+    const IndexStructure<int64_t>* sorted_data = nullptr;
+    const int32_t* idx_to_offsets = nullptr;
+    const TargetBitmap* valid_bitset = nullptr;
+    int64_t row_count = 0;
+    int64_t threshold = 5000000;
+};
+
+void
+SetDemoHnswScalarFilterView(const DemoHnswScalarFilterView& view);
+
+const DemoHnswScalarFilterView&
+GetDemoHnswScalarFilterView();
+
+void
+ClearDemoHnswScalarFilterView();
+
 template <typename T>
 class ScalarIndexSort : public ScalarIndex<T> {
     static_assert(std::is_arithmetic_v<T>,

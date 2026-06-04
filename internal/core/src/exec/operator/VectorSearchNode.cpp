@@ -18,8 +18,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
+#include <optional>
 #include <ratio>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -33,6 +36,7 @@
 #include "exec/QueryContext.h"
 #include "exec/expression/Utils.h"
 #include "exec/operator/Utils.h"
+#include "index/ScalarIndexSort.h"
 #include "monitor/Monitor.h"
 #include "opentelemetry/trace/span.h"
 #include "plan/PlanNode.h"
@@ -42,6 +46,83 @@
 
 namespace milvus {
 namespace exec {
+
+namespace {
+
+bool
+DemoHnswFilterDownpushEnabled() {
+    const char* env = std::getenv("MILVUS_DEMO_HNSW_FILTER_DOWNPUSH");
+    return env != nullptr && std::string(env) == "1";
+}
+
+int64_t
+DemoHnswFilterThreshold() {
+    const char* env = std::getenv("MILVUS_DEMO_HNSW_FILTER_THRESHOLD");
+    if (env == nullptr || env[0] == '\0') {
+        return 5000000;
+    }
+    char* end = nullptr;
+    auto value = std::strtoll(env, &end, 10);
+    return end != env ? value : 5000000;
+}
+
+bool
+DemoHnswScalarIndexFilteredOut(void* raw_ctx, int64_t seg_offset) {
+    auto* ctx = static_cast<milvus::index::DemoHnswScalarFilterView*>(raw_ctx);
+    if (ctx == nullptr || ctx->sorted_data == nullptr ||
+        ctx->idx_to_offsets == nullptr || seg_offset < 0 ||
+        seg_offset >= ctx->row_count) {
+        return true;
+    }
+
+    if (ctx->valid_bitset != nullptr && !(*(ctx->valid_bitset))[seg_offset]) {
+        return true;
+    }
+
+    auto rank = ctx->idx_to_offsets[seg_offset];
+    if (rank < 0 || rank >= ctx->row_count) {
+        return true;
+    }
+    return ctx->sorted_data[rank].a_ < ctx->threshold;
+}
+
+size_t
+DemoEstimateFilteredOutCount(
+    const milvus::index::DemoHnswScalarFilterView& ctx) {
+    if (ctx.sorted_data == nullptr || ctx.row_count <= 0) {
+        return 0;
+    }
+    auto lb =
+        std::lower_bound(ctx.sorted_data,
+                         ctx.sorted_data + ctx.row_count,
+                         milvus::index::IndexStructure<int64_t>(ctx.threshold));
+    return static_cast<size_t>(lb - ctx.sorted_data);
+}
+
+bool
+DemoScalarFilterViewUsable(const milvus::index::DemoHnswScalarFilterView& ctx,
+                           int64_t active_count) {
+    if (ctx.sorted_data == nullptr || ctx.idx_to_offsets == nullptr ||
+        ctx.row_count <= 0 || ctx.row_count < active_count) {
+        return false;
+    }
+    return ctx.threshold == DemoHnswFilterThreshold();
+}
+
+size_t
+DemoEstimateFilteredOutCountForSearch(
+    const milvus::index::DemoHnswScalarFilterView& ctx, int64_t active_count) {
+    auto estimated = DemoEstimateFilteredOutCount(ctx);
+    if (active_count <= 0) {
+        return 0;
+    }
+    if (estimated > static_cast<size_t>(active_count)) {
+        return static_cast<size_t>(active_count);
+    }
+    return estimated;
+}
+
+}  // namespace
 
 static milvus::SearchResult
 empty_search_result(int64_t num_queries) {
@@ -115,6 +196,8 @@ PhyVectorSearchNode::GetOutput() {
     // Normal path: build BitsetView from the bitmap produced upstream.
     milvus::BitsetView search_view;
     int64_t data_cnt = active_count_;
+    std::optional<milvus::index::DemoHnswScalarFilterView>
+        demo_scalar_filter_context;
 
     if (query_context_->get_all_rows_visible() && !ph.element_level_) {
         // search_view stays default-constructed (empty)
@@ -166,6 +249,25 @@ PhyVectorSearchNode::GetOutput() {
     // Single search + metrics path
     milvus::SearchResult search_result;
     auto op_context = query_context_->get_op_context();
+    milvus::Defer demo_clear_filter_view([&]() {
+        if (DemoHnswFilterDownpushEnabled()) {
+            milvus::index::ClearDemoHnswScalarFilterView();
+        }
+    });
+
+    if (DemoHnswFilterDownpushEnabled() && !ph.element_level_ &&
+        !search_view.empty()) {
+        const auto& view = milvus::index::GetDemoHnswScalarFilterView();
+        if (DemoScalarFilterViewUsable(view, active_count_)) {
+            demo_scalar_filter_context.emplace(view);
+            search_view.set_extra_filter(
+                &demo_scalar_filter_context.value(),
+                DemoHnswScalarIndexFilteredOut,
+                DemoEstimateFilteredOutCountForSearch(
+                    demo_scalar_filter_context.value(), active_count_));
+        }
+    }
+
     segment_->vector_search(search_info_,
                             src_data,
                             src_offsets,

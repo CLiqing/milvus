@@ -1,0 +1,389 @@
+diff --git a/include/knowhere/bitsetview.h b/include/knowhere/bitsetview.h
+index ee6db3a..14cf5d7 100644
+--- a/include/knowhere/bitsetview.h
++++ b/include/knowhere/bitsetview.h
+@@ -12,6 +12,7 @@
+ #ifndef BITSET_H
+ #define BITSET_H
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <cstdint>
+ #include <optional>
+@@ -21,6 +22,8 @@
+ namespace knowhere {
+ class BitsetView {
+  public:
++    using ExtraFilterFunc = bool (*)(void*, int64_t);
++
+     BitsetView() = default;
+     ~BitsetView() = default;
+ 
+@@ -48,10 +51,16 @@ class BitsetView {
+     // return the number of filtered out bits. if with id mapping, return the number of filtered out ids.
+     size_t
+     count() const {
++        size_t base_count = 0;
+         if (out_ids_ != nullptr) {
+-            return num_filtered_out_ids_;
++            base_count = num_filtered_out_ids_;
++        } else {
++            base_count = num_filtered_out_bits_;
+         }
+-        return num_filtered_out_bits_;
++        if (extra_filter_func_ != nullptr) {
++            return std::min(size(), std::max(base_count, extra_filtered_out_count_));
++        }
++        return base_count;
+     }
+ 
+     size_t
+@@ -95,6 +104,13 @@ class BitsetView {
+         id_offset_ = id_offset;
+     }
+ 
++    void
++    set_extra_filter(void* ctx, ExtraFilterFunc func, size_t filtered_out_count) {
++        extra_filter_ctx_ = ctx;
++        extra_filter_func_ = func;
++        extra_filtered_out_count_ = filtered_out_count;
++    }
++
+     // if the test succeeds, then the index should be skipped during search; otherwise, it should be included.
+     bool
+     test(int64_t index) const {
+@@ -103,7 +119,11 @@ class BitsetView {
+             out_id = out_ids_[out_id];
+         }
+         // when index is larger than the max_offset, ignore it
+-        return (out_id >= static_cast<int64_t>(num_bits_)) || (bits_[out_id >> 3] & (0x1 << (out_id & 0x7)));
++        bool filtered = (out_id >= static_cast<int64_t>(num_bits_)) || (bits_[out_id >> 3] & (0x1 << (out_id & 0x7)));
++        if (!filtered && extra_filter_func_ != nullptr) {
++            filtered = extra_filter_func_(extra_filter_ctx_, out_id);
++        }
++        return filtered;
+     }
+     // return the filtered ratio. if with id mapping, calculated by internal_ids rather than bits.
+     float
+@@ -224,6 +244,10 @@ class BitsetView {
+     const uint32_t* out_ids_ = nullptr;
+     size_t num_internal_ids_ = 0;
+     size_t num_filtered_out_ids_ = 0;
++
++    void* extra_filter_ctx_ = nullptr;
++    ExtraFilterFunc extra_filter_func_ = nullptr;
++    size_t extra_filtered_out_count_ = 0;
+ };
+ }  // namespace knowhere
+ 
+diff --git a/include/knowhere/bitsetview_idselector.h b/include/knowhere/bitsetview_idselector.h
+index c09aba2..7e6babc 100644
+--- a/include/knowhere/bitsetview_idselector.h
++++ b/include/knowhere/bitsetview_idselector.h
+@@ -26,7 +26,7 @@ struct BitsetViewIDSelector final : faiss::IDSelector {
+     inline bool
+     is_member(faiss::idx_t id) const override final {
+         // it is by design that bitset_view.empty() is not tested here
+-        return (!bitset_view.test(id));
++        return !bitset_view.test(id);
+     }
+ };
+ 
+diff --git a/thirdparty/hnswlib/hnswlib/hnswalg.h b/thirdparty/hnswlib/hnswlib/hnswalg.h
+index 8b4e443..cf90436 100644
+--- a/thirdparty/hnswlib/hnswlib/hnswalg.h
++++ b/thirdparty/hnswlib/hnswlib/hnswalg.h
+@@ -19,14 +19,16 @@
+ #include <fcntl.h>
+ #include <stdlib.h>
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <list>
+ #include <random>
+ #include <unordered_set>
+ 
+ #ifdef KNOWHERE_WITH_CUVS
+-#include <raft/core/detail/mdspan_numpy_serializer.hpp>
+ #include <cuvs/distance/distance.hpp>
++#include <raft/core/detail/mdspan_numpy_serializer.hpp>
++
+ #include "common/cuvs/integration/type_mappers.hpp"
+ // cagra serialization version constant — was in raft/neighbors/detail/cagra/
+ // cagra_serialize.cuh (removed in RAFT 26.02, moved to cuVS internal source).
+@@ -58,6 +60,49 @@ constexpr float kHnswSearchKnnBFFilterThreshold = 0.93f;
+ constexpr float kHnswSearchRangeBFFilterThreshold = 0.97f;
+ constexpr float kHnswSearchBFTopkThreshold = 0.5f;
+ 
++inline bool
++DemoHnswFilterDownpushEnabled() {
++    static const bool enabled = [] {
++        const char* env = getenv("MILVUS_DEMO_HNSW_FILTER_DOWNPUSH");
++        return env != nullptr && env[0] == '1' && env[1] == '\0';
++    }();
++    return enabled;
++}
++
++inline int64_t
++DemoHnswFilterThreshold() {
++    static const int64_t threshold = [] {
++        const char* env = getenv("MILVUS_DEMO_HNSW_FILTER_THRESHOLD");
++        if (env == nullptr || env[0] == '\0') {
++            return int64_t{5000000};
++        }
++        char* end = nullptr;
++        auto value = strtoll(env, &end, 10);
++        return end != env ? static_cast<int64_t>(value) : int64_t{5000000};
++    }();
++    return threshold;
++}
++
++inline bool
++DemoHnswFilteredOut(const knowhere::BitsetView& bitset, labeltype id) {
++    return !bitset.empty() && bitset.test(static_cast<int64_t>(id));
++}
++
++inline size_t
++DemoHnswFilteredOutCount(const knowhere::BitsetView& bitset, size_t cur_element_count) {
++    auto bitset_count = bitset.empty() ? size_t{0} : bitset.count();
++    return std::min(bitset_count, cur_element_count);
++}
++
++inline float
++DemoHnswFilterRatio(const knowhere::BitsetView& bitset, size_t cur_element_count) {
++    if (cur_element_count == 0) {
++        return 0.0f;
++    }
++    return static_cast<float>(DemoHnswFilteredOutCount(bitset, cur_element_count)) /
++           static_cast<float>(cur_element_count);
++}
++
+ enum Metric {
+     L2 = 0,
+     INNER_PRODUCT = 1,
+@@ -443,7 +488,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+             metric_hops++;
+             metric_distance_computations += size;
+         }
+-        float kAlpha = bitset.filter_ratio() * 0.7f;
++        float kAlpha = DemoHnswFilterRatio(bitset, cur_element_count) * 0.7f;
+         for (size_t i = 1; i <= size; ++i) {
+             if (i + 1 <= size) {
+                 prefetchData(list[i + 1]);
+@@ -459,7 +504,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+             }
+             visited[v] = true;
+             int status = Neighbor::kValid;
+-            if (has_deletions && bitset.test((int64_t)v)) {
++            if (has_deletions && DemoHnswFilteredOut(bitset, v)) {
+                 status = Neighbor::kInvalid;
+ 
+                 accumulative_alpha += kAlpha;
+@@ -499,7 +544,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+         NeighborSetDoublePopList retset(ef);
+ 
+         dist_t dist = calcDistance(data_point, ep_id);
+-        if (!has_deletions || !bitset.test((int64_t)ep_id)) {
++        if (!has_deletions || !DemoHnswFilteredOut(bitset, ep_id)) {
+             retset.insert(Neighbor(ep_id, dist, Neighbor::kValid));
+         } else {
+             retset.insert(Neighbor(ep_id, dist, Neighbor::kInvalid));
+@@ -593,7 +638,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+                 int candidate_id = *(data + j);
+                 if (!visited[candidate_id]) {
+                     visited[candidate_id] = true;
+-                    if (bitset.empty() || !bitset.test((int64_t)candidate_id)) {
++                    if (!DemoHnswFilteredOut(bitset, candidate_id)) {
+                         dist_t dist = calcDistance(data_point, candidate_id);
+                         if (dist < radius) {
+                             radius_queue.push({dist, candidate_id});
+@@ -1054,16 +1099,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+     void
+     loadIndexFromGpuFormat(std::istream& input, size_t max_elements_i = 0) {
+         using idxt = cuvs_knowhere::cuvs_indexing_t<cuvs_proto::cuvs_index_kind::cagra>;
+-        
++
+         char dtype_string[4];
+         input.read(dtype_string, 4);
+         auto ver = raft::detail::numpy_serializer::deserialize_scalar<int>(input);
+         if (ver != cuvs_knowhere_detail::cagra_serialization_version) {
+-            throw std::runtime_error("serialization version mismatch, expected " + 
+-                                std::to_string(cuvs_knowhere_detail::cagra_serialization_version) +
+-                                ", got " + std::to_string(ver));
++            throw std::runtime_error("serialization version mismatch, expected " +
++                                     std::to_string(cuvs_knowhere_detail::cagra_serialization_version) + ", got " +
++                                     std::to_string(ver));
+         }
+-        
++
+         auto n_rows = raft::detail::numpy_serializer::deserialize_scalar<idxt>(input);
+         auto dim = raft::detail::numpy_serializer::deserialize_scalar<std::uint32_t>(input);
+         auto graph_degree = raft::detail::numpy_serializer::deserialize_scalar<std::uint32_t>(input);
+@@ -1112,7 +1157,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+         }
+         max_elements_ = max_elements;
+ 
+-        size_data_per_element_ = static_cast<std::size_t>(graph_degree * sizeof(idxt) + 4 + (n_rows > 0 ? dim * sizeof(data_t) : 0) + 8);
++        size_data_per_element_ =
++            static_cast<std::size_t>(graph_degree * sizeof(idxt) + 4 + (n_rows > 0 ? dim * sizeof(data_t) : 0) + 8);
+         label_offset_ = size_data_per_element_ - 8;
+         offsetData_ = graph_degree * sizeof(idxt) + 4;
+         maxlevel_ = 1;
+@@ -1122,11 +1168,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+         M_ = graph_degree / 2;
+         mult_ = 0.42424242;
+         ef_construction_ = 500;
+-        
++
+         data_level0_memory_ = (char*)malloc(max_elements * size_data_per_element_);  // NOLINT
+         if (data_level0_memory_ == nullptr)
+             throw std::runtime_error("Not enough memory: loadIndex failed to allocate level0");
+-        
++
+         [[maybe_unused]] auto header = raft::detail::numpy_serializer::read_header(input);
+         for (size_t i = 0; i < max_elements; i++) {
+             auto offset = i * size_data_per_element_;
+@@ -1136,11 +1182,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+         }
+         auto include_dataset = raft::detail::numpy_serializer::deserialize_scalar<bool>(input);
+         if (include_dataset) {
+-            constexpr uint32_t kSerializeEmptyDataset   = 1;
++            constexpr uint32_t kSerializeEmptyDataset = 1;
+             if (kSerializeEmptyDataset == raft::detail::numpy_serializer::deserialize_scalar<uint32_t>(input)) {
+-                [[maybe_unused]] auto suggested_dim = raft::detail::numpy_serializer::deserialize_scalar<uint32_t>(input);
++                [[maybe_unused]] auto suggested_dim =
++                    raft::detail::numpy_serializer::deserialize_scalar<uint32_t>(input);
+             } else {
+-                [[maybe_unused]] auto data_type = raft::detail::numpy_serializer::deserialize_scalar<cudaDataType_t>(input);
++                [[maybe_unused]] auto data_type =
++                    raft::detail::numpy_serializer::deserialize_scalar<cudaDataType_t>(input);
+                 [[maybe_unused]] auto n_rows = raft::detail::numpy_serializer::deserialize_scalar<int64_t>(input);
+                 auto dim = raft::detail::numpy_serializer::deserialize_scalar<uint32_t>(input);
+                 [[maybe_unused]] auto stride = raft::detail::numpy_serializer::deserialize_scalar<uint32_t>(input);
+@@ -1152,7 +1200,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+             }
+         }
+         for (size_t i = 0; i < max_elements; i++) {
+-            auto offset = i * size_data_per_element_ + sizeof(int) + graph_degree * sizeof(idxt) + (n_rows > 0 ? dim * sizeof(data_t) : 0);
++            auto offset = i * size_data_per_element_ + sizeof(int) + graph_degree * sizeof(idxt) +
++                          (n_rows > 0 ? dim * sizeof(data_t) : 0);
+             memcpy(data_level0_memory_ + offset, &i, sizeof(size_t));
+         }
+ 
+@@ -1435,7 +1484,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+     searchKnnBF(const void* query_data, size_t k, const knowhere::BitsetView bitset) const {
+         knowhere::ResultMaxHeap<dist_t, labeltype> max_heap(k);
+         for (labeltype id = 0; id < cur_element_count; ++id) {
+-            if (bitset.empty() || !bitset.test(id)) {
++            if (!DemoHnswFilteredOut(bitset, id)) {
+                 dist_t dist = calcDistance(query_data, id);
+                 max_heap.Push(dist, id);
+             }
+@@ -1520,7 +1569,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+     std::vector<std::pair<dist_t, labeltype>>
+     searchKnn(const void* query_data, size_t k, const knowhere::BitsetView bitset, const SearchParam* param = nullptr,
+               const knowhere::feder::hnsw::FederResultUniq& feder_result = nullptr) const {
+-        if (cur_element_count == 0 || bitset.count() == cur_element_count)
++        if (cur_element_count == 0 || DemoHnswFilteredOutCount(bitset, cur_element_count) == cur_element_count)
+             return {};
+ 
+         // do normalize for COSINE metric type
+@@ -1547,10 +1596,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+         }
+ 
+         // do bruteforce search when delete rate high
+-        if (!bitset.empty()) {
+-            const size_t filtered_out_num = bitset.count();
++        if (!bitset.empty() || DemoHnswFilterDownpushEnabled()) {
++            const size_t filtered_out_num = DemoHnswFilteredOutCount(bitset, cur_element_count);
+ #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
+-            double ratio = ((double)filtered_out_num) / bitset.size();
++            double ratio = ((double)filtered_out_num) / cur_element_count;
+             knowhere::knowhere_hnsw_bitset_ratio.Observe(ratio);
+ #endif
+             if (filtered_out_num >= (cur_element_count * kHnswSearchKnnBFFilterThreshold) ||
+@@ -1563,7 +1612,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+         NeighborSetDoublePopList retset;
+         size_t ef = param ? param->ef_ : this->ef_;
+         auto visited = visited_list_pool_->getFreeVisitedList();
+-        if (!bitset.empty()) {
++        if (!bitset.empty() || DemoHnswFilterDownpushEnabled()) {
+             retset = searchBaseLayerST<true, true>(currObj, query_data, std::max(ef, k), visited, bitset, feder_result);
+         } else {
+             retset =
+@@ -1595,7 +1644,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+ 
+     std::unique_ptr<IteratorWorkspace>
+     getIteratorWorkspace(const void* query_data, const size_t ef, const knowhere::BitsetView& bitset) const {
+-        auto accumulative_alpha = (bitset.count() >= (cur_element_count * kHnswSearchKnnBFFilterThreshold))
++        auto accumulative_alpha = (DemoHnswFilteredOutCount(bitset, cur_element_count) >=
++                                   (cur_element_count * kHnswSearchKnnBFFilterThreshold))
+                                       ? std::numeric_limits<float>::max()
+                                       : 1.0f;
+         std::unique_ptr<int8_t[]> query_data_copy = nullptr;
+@@ -1621,12 +1671,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+     getIteratorNextBatch(IteratorWorkspace* workspace,
+                          const knowhere::feder::hnsw::FederResultUniq& feder_result = nullptr) const {
+         workspace->dists.clear();
+-        if (cur_element_count == 0 || workspace->bitset.count() == cur_element_count) {
++        if (cur_element_count == 0 ||
++            DemoHnswFilteredOutCount(workspace->bitset, cur_element_count) == cur_element_count) {
+             return;
+         }
+         // TODO: add bruteforce
+         auto query_data = workspace->query_data;
+-        const bool has_deletions = !workspace->bitset.empty();
++        const bool has_deletions = !workspace->bitset.empty() || DemoHnswFilterDownpushEnabled();
+         if (!workspace->initial_search_done) {
+             tableint currObj = searchTopLayers(query_data, workspace->param.get()).first;
+             NeighborSetDoublePopList retset;
+@@ -1665,7 +1716,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+                     query_data, top, workspace->visited, workspace->accumulative_alpha, workspace->bitset,
+                     add_search_candidate, feder_result);
+             }
+-            if (!has_deletions || !workspace->bitset.test((int64_t)top.id)) {
++            if (!has_deletions || !DemoHnswFilteredOut(workspace->bitset, top.id)) {
+                 workspace->dists.emplace_back(top.id, top.distance);
+                 return;
+             }
+@@ -1676,7 +1727,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+     searchRangeBF(const void* query_data, float radius, const knowhere::BitsetView bitset) const {
+         std::vector<std::pair<dist_t, labeltype>> result;
+         for (labeltype id = 0; id < cur_element_count; ++id) {
+-            if (bitset.empty() || !bitset.test(id)) {
++            if (!DemoHnswFilteredOut(bitset, id)) {
+                 dist_t dist = calcDistance(query_data, id);
+                 if (dist < radius) {
+                     result.emplace_back(dist, id);
+@@ -1690,7 +1741,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+     searchRange(const void* query_data, float radius, const knowhere::BitsetView bitset,
+                 const SearchParam* param = nullptr,
+                 const knowhere::feder::hnsw::FederResultUniq& feder_result = nullptr) const {
+-        if (cur_element_count == 0 || bitset.count() == cur_element_count) {
++        if (cur_element_count == 0 || DemoHnswFilteredOutCount(bitset, cur_element_count) == cur_element_count) {
+             return {};
+         }
+ 
+@@ -1718,10 +1769,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+         }
+ 
+         // do bruteforce range search when delete rate high
+-        if (!bitset.empty()) {
+-            const size_t filtered_out_num = bitset.count();
++        if (!bitset.empty() || DemoHnswFilterDownpushEnabled()) {
++            const size_t filtered_out_num = DemoHnswFilteredOutCount(bitset, cur_element_count);
+ #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
+-            double ratio = ((double)filtered_out_num) / bitset.size();
++            double ratio = ((double)filtered_out_num) / cur_element_count;
+             knowhere::knowhere_hnsw_bitset_ratio.Observe(ratio);
+ #endif
+             if (filtered_out_num >= (cur_element_count * kHnswSearchRangeBFFilterThreshold) ||
+@@ -1733,7 +1784,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
+         auto [currObj, vec_hash] = searchTopLayers(query_data, param, feder_result);
+         NeighborSetDoublePopList retset;
+         auto visited = visited_list_pool_->getFreeVisitedList();
+-        if (!bitset.empty()) {
++        if (!bitset.empty() || DemoHnswFilterDownpushEnabled()) {
+             retset = searchBaseLayerST<true, true>(currObj, query_data, ef, visited, bitset, feder_result);
+         } else {
+             retset = searchBaseLayerST<false, true>(currObj, query_data, ef, visited, bitset, feder_result);
