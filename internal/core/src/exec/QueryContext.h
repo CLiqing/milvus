@@ -17,6 +17,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,13 @@
 namespace milvus::exec {
 
 enum class ContextScope { GLOBAL = 0, SESSION = 1, QUERY = 2, Executor = 3 };
+
+struct CardinalExprDownpushInfo {
+    FieldId field_id_;
+    int64_t modulus_{0};
+    int64_t threshold_{0};
+    int64_t filtered_out_count_{0};
+};
 
 class BaseConfig {
  public:
@@ -408,6 +416,16 @@ class QueryContext : public Context {
         return enable_sub_expr_cache_write_;
     }
 
+    void
+    set_cardinal_expr_downpush_info(CardinalExprDownpushInfo info) {
+        cardinal_expr_downpush_info_ = info;
+    }
+
+    const std::optional<CardinalExprDownpushInfo>&
+    get_cardinal_expr_downpush_info() const {
+        return cardinal_expr_downpush_info_;
+    }
+
  private:
     folly::Executor* executor_;
     //folly::Executor::KeepAlive<> executor_keepalive_;
@@ -458,6 +476,8 @@ class QueryContext : public Context {
     // avoid duplicating the cached full-filter bitmap with cached child
     // bitmaps in the same request path.
     bool enable_sub_expr_cache_write_ = true;
+
+    std::optional<CardinalExprDownpushInfo> cardinal_expr_downpush_info_;
 };
 
 // Represent the state of one thread of query execution.

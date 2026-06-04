@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <ratio>
 #include <utility>
 #include <vector>
@@ -28,6 +29,7 @@
 #include "common/BitsetView.h"
 #include "common/EasyAssert.h"
 #include "common/QueryResult.h"
+#include "common/Span.h"
 #include "common/Tracer.h"
 #include "common/Utils.h"
 #include "exec/QueryContext.h"
@@ -42,6 +44,80 @@
 
 namespace milvus {
 namespace exec {
+
+namespace {
+
+struct CardinalExprDownpushSearchContext {
+    std::vector<PinWrapper<Span<int64_t>>> pins_;
+    std::vector<const int64_t*> chunk_data_;
+    std::vector<int64_t> chunk_offsets_;
+    int64_t modulus_{0};
+    int64_t threshold_{0};
+
+    bool
+    FilteredOut(int64_t seg_offset) const {
+        if (seg_offset < 0 || chunk_offsets_.empty() ||
+            seg_offset >= chunk_offsets_.back()) {
+            return true;
+        }
+        auto it = std::upper_bound(
+            chunk_offsets_.begin(), chunk_offsets_.end(), seg_offset);
+        auto chunk_idx = static_cast<size_t>(
+            std::distance(chunk_offsets_.begin(), it) - 1);
+        auto inner_offset = seg_offset - chunk_offsets_[chunk_idx];
+        auto pk = chunk_data_[chunk_idx][inner_offset];
+        return pk % modulus_ >= threshold_;
+    }
+};
+
+bool
+CardinalExprDownpushFilteredOut(void* ctx, int64_t seg_offset) {
+    auto* downpush_ctx =
+        static_cast<CardinalExprDownpushSearchContext*>(ctx);
+    return downpush_ctx->FilteredOut(seg_offset);
+}
+
+std::shared_ptr<CardinalExprDownpushSearchContext>
+BuildCardinalExprDownpushSearchContext(
+    const segcore::SegmentInternalInterface* segment,
+    milvus::OpContext* op_context,
+    const CardinalExprDownpushInfo& info) {
+    if (segment == nullptr || segment->type() != SegmentType::Sealed) {
+        return nullptr;
+    }
+    auto& schema = segment->get_schema();
+    auto& field_meta = schema[info.field_id_];
+    if (field_meta.get_data_type() != DataType::INT64 ||
+        !segment->HasFieldData(info.field_id_)) {
+        return nullptr;
+    }
+
+    auto num_chunks = segment->num_chunk(info.field_id_);
+    if (num_chunks <= 0) {
+        return nullptr;
+    }
+
+    auto ctx = std::make_shared<CardinalExprDownpushSearchContext>();
+    ctx->modulus_ = info.modulus_;
+    ctx->threshold_ = info.threshold_;
+    ctx->pins_.reserve(num_chunks);
+    ctx->chunk_data_.reserve(num_chunks);
+    ctx->chunk_offsets_.reserve(num_chunks + 1);
+    ctx->chunk_offsets_.push_back(0);
+
+    for (int64_t chunk_id = 0; chunk_id < num_chunks; ++chunk_id) {
+        auto pin =
+            segment->chunk_data<int64_t>(op_context, info.field_id_, chunk_id);
+        const auto& span = pin.get();
+        ctx->chunk_data_.push_back(span.data());
+        ctx->chunk_offsets_.push_back(ctx->chunk_offsets_.back() +
+                                      span.row_count());
+        ctx->pins_.push_back(std::move(pin));
+    }
+    return ctx;
+}
+
+}  // namespace
 
 static milvus::SearchResult
 empty_search_result(int64_t num_queries) {
@@ -163,9 +239,22 @@ PhyVectorSearchNode::GetOutput() {
         data_cnt = search_view.size();
     }
 
+    auto op_context = query_context_->get_op_context();
+    std::shared_ptr<CardinalExprDownpushSearchContext> downpush_ctx;
+    const auto& downpush_info =
+        query_context_->get_cardinal_expr_downpush_info();
+    if (downpush_info.has_value() && !ph.element_level_) {
+        downpush_ctx = BuildCardinalExprDownpushSearchContext(
+            segment_, op_context, downpush_info.value());
+        if (downpush_ctx != nullptr) {
+            search_view.set_extra_filter(downpush_ctx.get(),
+                                         CardinalExprDownpushFilteredOut,
+                                         downpush_info->filtered_out_count_);
+        }
+    }
+
     // Single search + metrics path
     milvus::SearchResult search_result;
-    auto op_context = query_context_->get_op_context();
     segment_->vector_search(search_info_,
                             src_data,
                             src_offsets,

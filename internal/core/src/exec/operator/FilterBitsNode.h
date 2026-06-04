@@ -80,6 +80,8 @@ class PhyFilterBitsNode : public Operator {
     // Cache backend is the process-level ExprResCacheManager.
     bool enable_expr_cache_ = false;
     std::string expr_cache_key_;
+    bool cardinal_expr_downpush_enabled_ = false;
+    CardinalExprDownpushInfo cardinal_expr_downpush_info_;
 };
 }  // namespace exec
 }  // namespace milvus

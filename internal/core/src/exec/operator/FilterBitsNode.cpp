@@ -18,7 +18,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <ratio>
+#include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -39,6 +43,15 @@ namespace exec {
 
 namespace {
 
+constexpr const char* kCardinalExprDownpushParam = "cardinal_expr_downpush";
+constexpr const char* kLegacyHnswExprDownpushParam = "hnsw_expr_downpush";
+constexpr const char* kCardinalExprModPParam = "cardinal_expr_mod_p";
+constexpr const char* kCardinalExprModTParam = "cardinal_expr_mod_t";
+constexpr const char* kCardinalExprFilteredOutCountParam =
+    "cardinal_expr_filtered_out_count";
+constexpr const char* kCardinalExprFilterRatioParam =
+    "cardinal_expr_filter_ratio";
+
 std::string
 BuildExprCacheKey(const plan::FilterBitsNode& filter,
                   QueryContext* query_context) {
@@ -51,6 +64,138 @@ BuildExprCacheKey(const plan::FilterBitsNode& filter,
                            query_context->get_entity_ttl_physical_time_us());
     }
     return key;
+}
+
+template <typename T>
+std::optional<T>
+GetJsonNumber(const knowhere::Json& params, const char* key) {
+    if (!params.contains(key)) {
+        return std::nullopt;
+    }
+    const auto& value = params[key];
+    try {
+        if (value.is_number()) {
+            return value.get<T>();
+        }
+        if (value.is_string()) {
+            if constexpr (std::is_integral_v<T>) {
+                return static_cast<T>(std::stoll(value.get<std::string>()));
+            } else {
+                return static_cast<T>(std::stod(value.get<std::string>()));
+            }
+        }
+    } catch (...) {
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+bool
+GetJsonBool(const knowhere::Json& params, const char* key) {
+    if (!params.contains(key)) {
+        return false;
+    }
+    const auto& value = params[key];
+    if (value.is_boolean()) {
+        return value.get<bool>();
+    }
+    if (value.is_string()) {
+        return value.get<std::string>() == "true" ||
+               value.get<std::string>() == "1";
+    }
+    return false;
+}
+
+std::optional<int64_t>
+GetInt64Value(const proto::plan::GenericValue& value) {
+    if (value.val_case() != proto::plan::GenericValue::kInt64Val) {
+        return std::nullopt;
+    }
+    return value.int64_val();
+}
+
+std::optional<CardinalExprDownpushInfo>
+TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
+                                 QueryContext* query_context,
+                                 int64_t active_count) {
+    if (query_context == nullptr) {
+        return std::nullopt;
+    }
+    const auto& search_params = query_context->get_search_info().search_params_;
+    const auto enabled =
+        GetJsonBool(search_params, kCardinalExprDownpushParam) ||
+        GetJsonBool(search_params, kLegacyHnswExprDownpushParam);
+    if (!enabled) {
+        return std::nullopt;
+    }
+
+    auto* segment = query_context->get_segment();
+    if (segment == nullptr || segment->type() != SegmentType::Sealed) {
+        return std::nullopt;
+    }
+    auto primary_field_id = segment->get_schema().get_primary_field_id();
+    if (!primary_field_id.has_value()) {
+        return std::nullopt;
+    }
+
+    auto arith_expr =
+        std::dynamic_pointer_cast<const expr::BinaryArithOpEvalRangeExpr>(
+            filter);
+    if (arith_expr == nullptr) {
+        return std::nullopt;
+    }
+    if (arith_expr->column_.field_id_ != primary_field_id.value() ||
+        arith_expr->column_.data_type_ != DataType::INT64 ||
+        arith_expr->column_.element_level_) {
+        return std::nullopt;
+    }
+    if (arith_expr->arith_op_type_ != proto::plan::ArithOpType::Mod ||
+        arith_expr->op_type_ != proto::plan::OpType::LessThan) {
+        return std::nullopt;
+    }
+
+    auto expr_modulus = GetInt64Value(arith_expr->right_operand_);
+    auto expr_threshold = GetInt64Value(arith_expr->value_);
+    auto modulus = GetJsonNumber<int64_t>(search_params, kCardinalExprModPParam)
+                       .value_or(expr_modulus.value_or(0));
+    auto threshold =
+        GetJsonNumber<int64_t>(search_params, kCardinalExprModTParam)
+            .value_or(expr_threshold.value_or(0));
+    if (expr_modulus.has_value() && expr_modulus.value() != modulus) {
+        return std::nullopt;
+    }
+    if (expr_threshold.has_value() && expr_threshold.value() != threshold) {
+        return std::nullopt;
+    }
+    if (modulus <= 0 || threshold < 0 || threshold > modulus) {
+        return std::nullopt;
+    }
+
+    CardinalExprDownpushInfo info;
+    info.field_id_ = primary_field_id.value();
+    info.modulus_ = modulus;
+    info.threshold_ = threshold;
+    auto filtered_out_count =
+        GetJsonNumber<int64_t>(search_params, kCardinalExprFilteredOutCountParam);
+    if (filtered_out_count.has_value()) {
+        info.filtered_out_count_ =
+            std::clamp<int64_t>(filtered_out_count.value(), 0, active_count);
+    } else {
+        auto filter_ratio =
+            GetJsonNumber<double>(search_params, kCardinalExprFilterRatioParam);
+        if (filter_ratio.has_value()) {
+            auto ratio = std::clamp<double>(filter_ratio.value(), 0.0, 1.0);
+            info.filtered_out_count_ =
+                std::clamp<int64_t>(std::llround(active_count * ratio),
+                                    0,
+                                    active_count);
+        } else {
+            auto keep_count = (active_count / modulus) * threshold +
+                              std::min(active_count % modulus, threshold);
+            info.filtered_out_count_ = active_count - keep_count;
+        }
+    }
+    return info;
 }
 
 }  // namespace
@@ -72,8 +217,15 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
 
+    auto downpush_info = TryBuildCardinalExprDownpushInfo(
+        filter->filter(), query_context_, need_process_rows_);
+    if (downpush_info.has_value()) {
+        cardinal_expr_downpush_enabled_ = true;
+        cardinal_expr_downpush_info_ = downpush_info.value();
+    }
+
     enable_expr_cache_ = query_context_->get_enable_expr_cache();
-    if (enable_expr_cache_) {
+    if (enable_expr_cache_ && !cardinal_expr_downpush_enabled_) {
         expr_cache_key_ = BuildExprCacheKey(*filter, query_context_);
     }
 }
@@ -103,6 +255,17 @@ PhyFilterBitsNode::GetOutput() {
 
     if (AllInputProcessed()) {
         return nullptr;
+    }
+
+    if (cardinal_expr_downpush_enabled_) {
+        query_context_->set_cardinal_expr_downpush_info(
+            cardinal_expr_downpush_info_);
+        num_processed_rows_ = need_process_rows_;
+        std::vector<VectorPtr> col_res;
+        col_res.push_back(std::make_shared<ColumnVector>(
+            TargetBitmap(need_process_rows_, false),
+            TargetBitmap(need_process_rows_, true)));
+        return std::make_shared<RowVector>(col_res);
     }
 
     // Cache read: Stage 2 of two-stage search reuses the bitset cached by Stage 1.
