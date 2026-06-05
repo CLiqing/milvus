@@ -902,7 +902,9 @@ VectorDiskAnnIndex<T>::update_load_json(const Config& config) {
     // while current Milvus may store the actual file under index_v1/.../_mem.index.bin.
     // Use the real index file stem when it is available.
     auto index_type = GetValueFromConfig<std::string>(config, INDEX_TYPE);
-    if (index_type.has_value() && index_type.value() == "CARDINAL_TIERED") {
+    if (index_type.has_value() &&
+        (index_type.value() == "CARDINAL_TIERED" ||
+         index_type.value() == "HNSW")) {
         auto index_files =
             GetValueFromConfig<std::vector<std::string>>(config, INDEX_FILES);
         if (index_files.has_value() && !index_files.value().empty()) {
