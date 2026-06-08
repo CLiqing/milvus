@@ -38,8 +38,15 @@ namespace milvus::exec {
 
 enum class ContextScope { GLOBAL = 0, SESSION = 1, QUERY = 2, Executor = 3 };
 
+enum class CardinalExprDownpushPredicate {
+    ModLessThan = 0,
+    Int64GreaterEqual = 1,
+};
+
 struct CardinalExprDownpushInfo {
     FieldId field_id_;
+    CardinalExprDownpushPredicate predicate_{
+        CardinalExprDownpushPredicate::ModLessThan};
     int64_t modulus_{0};
     int64_t threshold_{0};
     int64_t filtered_out_count_{0};

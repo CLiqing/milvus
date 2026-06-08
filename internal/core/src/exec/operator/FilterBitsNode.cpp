@@ -47,6 +47,7 @@ constexpr const char* kCardinalExprDownpushParam = "cardinal_expr_downpush";
 constexpr const char* kLegacyHnswExprDownpushParam = "hnsw_expr_downpush";
 constexpr const char* kCardinalExprModPParam = "cardinal_expr_mod_p";
 constexpr const char* kCardinalExprModTParam = "cardinal_expr_mod_t";
+constexpr const char* kCardinalExprThresholdParam = "cardinal_expr_threshold";
 constexpr const char* kCardinalExprFilteredOutCountParam =
     "cardinal_expr_filtered_out_count";
 constexpr const char* kCardinalExprFilterRatioParam =
@@ -131,27 +132,98 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
 
     auto* segment = query_context->get_segment();
     if (segment == nullptr || segment->type() != SegmentType::Sealed) {
-        return std::nullopt;
+        ThrowInfo(UnexpectedError,
+                  "cardinal expr downpush requires sealed segment");
     }
-    auto primary_field_id = segment->get_schema().get_primary_field_id();
-    if (!primary_field_id.has_value()) {
-        return std::nullopt;
+
+    auto filtered_out_count = GetJsonNumber<int64_t>(
+        search_params, kCardinalExprFilteredOutCountParam);
+    auto filter_ratio =
+        GetJsonNumber<double>(search_params, kCardinalExprFilterRatioParam);
+    if (!filtered_out_count.has_value() && !filter_ratio.has_value()) {
+        ThrowInfo(UnexpectedError,
+                  "cardinal expr downpush requires {} or {}",
+                  kCardinalExprFilteredOutCountParam,
+                  kCardinalExprFilterRatioParam);
+    }
+
+    auto set_filtered_count = [&](CardinalExprDownpushInfo& info) {
+        if (filtered_out_count.has_value()) {
+            info.filtered_out_count_ = std::clamp<int64_t>(
+                filtered_out_count.value(), 0, active_count);
+        } else {
+            auto ratio = std::clamp<double>(filter_ratio.value(), 0.0, 1.0);
+            info.filtered_out_count_ = std::clamp<int64_t>(
+                std::llround(active_count * ratio), 0, active_count);
+        }
+    };
+
+    auto unary_expr =
+        std::dynamic_pointer_cast<const expr::UnaryRangeFilterExpr>(filter);
+    if (unary_expr != nullptr) {
+        if (unary_expr->column_.data_type_ != DataType::INT64 ||
+            unary_expr->column_.element_level_) {
+            ThrowInfo(UnexpectedError,
+                      "cardinal expr downpush only supports non-element INT64 "
+                      "range filter");
+        }
+        auto& field_meta = segment->get_schema()[unary_expr->column_.field_id_];
+        if (field_meta.get_name().get() != "id") {
+            ThrowInfo(UnexpectedError,
+                      "cardinal expr downpush only supports id >= threshold, "
+                      "got field {}",
+                      field_meta.get_name().get());
+        }
+        if (unary_expr->op_type_ != proto::plan::OpType::GreaterEqual) {
+            ThrowInfo(UnexpectedError,
+                      "cardinal expr downpush only supports id >= threshold");
+        }
+        auto expr_threshold = GetInt64Value(unary_expr->val_);
+        if (!expr_threshold.has_value()) {
+            ThrowInfo(UnexpectedError,
+                      "cardinal expr downpush id >= threshold requires INT64 "
+                      "threshold");
+        }
+        auto threshold =
+            GetJsonNumber<int64_t>(search_params, kCardinalExprThresholdParam)
+                .value_or(expr_threshold.value());
+        if (threshold != expr_threshold.value()) {
+            ThrowInfo(UnexpectedError,
+                      "cardinal expr downpush threshold param {} mismatches "
+                      "expression value {}",
+                      threshold,
+                      expr_threshold.value());
+        }
+
+        CardinalExprDownpushInfo info;
+        info.field_id_ = unary_expr->column_.field_id_;
+        info.predicate_ = CardinalExprDownpushPredicate::Int64GreaterEqual;
+        info.threshold_ = threshold;
+        set_filtered_count(info);
+        return info;
     }
 
     auto arith_expr =
         std::dynamic_pointer_cast<const expr::BinaryArithOpEvalRangeExpr>(
             filter);
     if (arith_expr == nullptr) {
-        return std::nullopt;
+        ThrowInfo(UnexpectedError,
+                  "cardinal expr downpush only supports id >= threshold or "
+                  "pk % P < T demo expression");
     }
-    if (arith_expr->column_.field_id_ != primary_field_id.value() ||
+    auto primary_field_id = segment->get_schema().get_primary_field_id();
+    if (!primary_field_id.has_value() ||
+        arith_expr->column_.field_id_ != primary_field_id.value() ||
         arith_expr->column_.data_type_ != DataType::INT64 ||
         arith_expr->column_.element_level_) {
-        return std::nullopt;
+        ThrowInfo(UnexpectedError,
+                  "cardinal expr downpush mod demo requires INT64 primary "
+                  "field");
     }
     if (arith_expr->arith_op_type_ != proto::plan::ArithOpType::Mod ||
         arith_expr->op_type_ != proto::plan::OpType::LessThan) {
-        return std::nullopt;
+        ThrowInfo(UnexpectedError,
+                  "cardinal expr downpush mod demo only supports pk % P < T");
     }
 
     auto expr_modulus = GetInt64Value(arith_expr->right_operand_);
@@ -162,39 +234,33 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
         GetJsonNumber<int64_t>(search_params, kCardinalExprModTParam)
             .value_or(expr_threshold.value_or(0));
     if (expr_modulus.has_value() && expr_modulus.value() != modulus) {
-        return std::nullopt;
+        ThrowInfo(UnexpectedError,
+                  "cardinal expr downpush modulus param {} mismatches "
+                  "expression value {}",
+                  modulus,
+                  expr_modulus.value());
     }
     if (expr_threshold.has_value() && expr_threshold.value() != threshold) {
-        return std::nullopt;
+        ThrowInfo(UnexpectedError,
+                  "cardinal expr downpush mod threshold param {} mismatches "
+                  "expression value {}",
+                  threshold,
+                  expr_threshold.value());
     }
     if (modulus <= 0 || threshold < 0 || threshold > modulus) {
-        return std::nullopt;
+        ThrowInfo(UnexpectedError,
+                  "invalid cardinal expr downpush mod params: modulus={}, "
+                  "threshold={}",
+                  modulus,
+                  threshold);
     }
 
     CardinalExprDownpushInfo info;
     info.field_id_ = primary_field_id.value();
+    info.predicate_ = CardinalExprDownpushPredicate::ModLessThan;
     info.modulus_ = modulus;
     info.threshold_ = threshold;
-    auto filtered_out_count =
-        GetJsonNumber<int64_t>(search_params, kCardinalExprFilteredOutCountParam);
-    if (filtered_out_count.has_value()) {
-        info.filtered_out_count_ =
-            std::clamp<int64_t>(filtered_out_count.value(), 0, active_count);
-    } else {
-        auto filter_ratio =
-            GetJsonNumber<double>(search_params, kCardinalExprFilterRatioParam);
-        if (filter_ratio.has_value()) {
-            auto ratio = std::clamp<double>(filter_ratio.value(), 0.0, 1.0);
-            info.filtered_out_count_ =
-                std::clamp<int64_t>(std::llround(active_count * ratio),
-                                    0,
-                                    active_count);
-        } else {
-            auto keep_count = (active_count / modulus) * threshold +
-                              std::min(active_count % modulus, threshold);
-            info.filtered_out_count_ = active_count - keep_count;
-        }
-    }
+    set_filtered_count(info);
     return info;
 }
 

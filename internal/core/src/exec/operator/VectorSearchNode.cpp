@@ -51,6 +51,8 @@ struct CardinalExprDownpushSearchContext {
     std::vector<PinWrapper<Span<int64_t>>> pins_;
     std::vector<const int64_t*> chunk_data_;
     std::vector<int64_t> chunk_offsets_;
+    CardinalExprDownpushPredicate predicate_{
+        CardinalExprDownpushPredicate::ModLessThan};
     int64_t modulus_{0};
     int64_t threshold_{0};
 
@@ -62,18 +64,23 @@ struct CardinalExprDownpushSearchContext {
         }
         auto it = std::upper_bound(
             chunk_offsets_.begin(), chunk_offsets_.end(), seg_offset);
-        auto chunk_idx = static_cast<size_t>(
-            std::distance(chunk_offsets_.begin(), it) - 1);
+        auto chunk_idx =
+            static_cast<size_t>(std::distance(chunk_offsets_.begin(), it) - 1);
         auto inner_offset = seg_offset - chunk_offsets_[chunk_idx];
-        auto pk = chunk_data_[chunk_idx][inner_offset];
-        return pk % modulus_ >= threshold_;
+        auto value = chunk_data_[chunk_idx][inner_offset];
+        switch (predicate_) {
+            case CardinalExprDownpushPredicate::ModLessThan:
+                return value % modulus_ >= threshold_;
+            case CardinalExprDownpushPredicate::Int64GreaterEqual:
+                return value < threshold_;
+        }
+        return true;
     }
 };
 
 bool
 CardinalExprDownpushFilteredOut(void* ctx, int64_t seg_offset) {
-    auto* downpush_ctx =
-        static_cast<CardinalExprDownpushSearchContext*>(ctx);
+    auto* downpush_ctx = static_cast<CardinalExprDownpushSearchContext*>(ctx);
     return downpush_ctx->FilteredOut(seg_offset);
 }
 
@@ -98,6 +105,7 @@ BuildCardinalExprDownpushSearchContext(
     }
 
     auto ctx = std::make_shared<CardinalExprDownpushSearchContext>();
+    ctx->predicate_ = info.predicate_;
     ctx->modulus_ = info.modulus_;
     ctx->threshold_ = info.threshold_;
     ctx->pins_.reserve(num_chunks);
@@ -243,14 +251,21 @@ PhyVectorSearchNode::GetOutput() {
     std::shared_ptr<CardinalExprDownpushSearchContext> downpush_ctx;
     const auto& downpush_info =
         query_context_->get_cardinal_expr_downpush_info();
-    if (downpush_info.has_value() && !ph.element_level_) {
+    if (downpush_info.has_value() && ph.element_level_) {
+        ThrowInfo(UnexpectedError,
+                  "cardinal expr downpush does not support element-level "
+                  "vector search");
+    }
+    if (downpush_info.has_value()) {
         downpush_ctx = BuildCardinalExprDownpushSearchContext(
             segment_, op_context, downpush_info.value());
-        if (downpush_ctx != nullptr) {
-            search_view.set_extra_filter(downpush_ctx.get(),
-                                         CardinalExprDownpushFilteredOut,
-                                         downpush_info->filtered_out_count_);
+        if (downpush_ctx == nullptr) {
+            ThrowInfo(UnexpectedError,
+                      "failed to build cardinal expr downpush search context");
         }
+        search_view.set_extra_filter(downpush_ctx.get(),
+                                     CardinalExprDownpushFilteredOut,
+                                     downpush_info->filtered_out_count_);
     }
 
     // Single search + metrics path
