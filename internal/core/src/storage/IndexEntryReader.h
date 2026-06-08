@@ -139,6 +139,7 @@ class IndexEntryReader {
     struct EntryDownloadAsyncTask {
         EntryDownloadState* state;
         std::future<RemoteAsyncReadResult> future;
+        std::vector<uint8_t> data;
         size_t expected_size;
         size_t file_offset;
         size_t range_idx;

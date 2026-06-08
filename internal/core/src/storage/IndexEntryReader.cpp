@@ -376,12 +376,11 @@ IndexEntryReader::ReadPlainEntry(const EntryMeta& meta) {
     if (auto remote_input = GetAsyncRemoteInputStream(input_)) {
         ConfigureAsyncReadAtConcurrency(remote_input, priority_);
         if (pm.size <= kRangeSize) {
-            auto future = remote_input->ReadAtAsync(
-                MILVUS_V3_MAGIC_SIZE + pm.offset, pm.size);
+            auto future = remote_input->ReadAtAsyncInto(
+                MILVUS_V3_MAGIC_SIZE + pm.offset, pm.size, result.data.data());
             auto read_result = future.get();
             AssertInfo(read_result.bytes_read == pm.size,
                        "Failed to read entry data");
-            std::memcpy(result.data.data(), AsBytes(read_result.data), pm.size);
             VerifyCrc32c(pm.crc32, result.data.data(), pm.size, "");
             return result;
         }
@@ -398,8 +397,10 @@ IndexEntryReader::ReadPlainEntry(const EntryMeta& meta) {
             tasks.push_back(
                 {offset,
                  len,
-                 remote_input->ReadAtAsync(
-                     MILVUS_V3_MAGIC_SIZE + pm.offset + offset, len)});
+                 remote_input->ReadAtAsyncInto(
+                     MILVUS_V3_MAGIC_SIZE + pm.offset + offset,
+                     len,
+                     dest + offset)});
             remaining -= len;
             offset += len;
         }
@@ -408,8 +409,6 @@ IndexEntryReader::ReadPlainEntry(const EntryMeta& meta) {
             auto read_result = task.future.get();
             AssertInfo(read_result.bytes_read == task.len,
                        "Failed to read entry data range");
-            std::memcpy(
-                dest + task.offset, AsBytes(read_result.data), task.len);
         }
 
         VerifyCrc32c(pm.crc32, result.data.data(), pm.size, "");
@@ -695,6 +694,7 @@ IndexEntryReader::SubmitEntryDownloadAsyncTasks(
                 {&state,
                  remote_input->ReadAtAsync(MILVUS_V3_MAGIC_SIZE + slice.offset,
                                            slice.size),
+                 {},
                  static_cast<size_t>(slice.size),
                  this_output_offset,
                  i,
@@ -711,15 +711,17 @@ IndexEntryReader::SubmitEntryDownloadAsyncTasks(
         while (remaining > 0) {
             size_t len = std::min(remaining, kRangeSize);
 
-            tasks.push_back(
-                {&state,
-                 remote_input->ReadAtAsync(MILVUS_V3_MAGIC_SIZE + src_offset,
-                                           len),
-                 len,
-                 file_offset,
-                 range_idx,
-                 false,
-                 0});
+            EntryDownloadAsyncTask task;
+            task.state = &state;
+            task.data.resize(len);
+            task.future = remote_input->ReadAtAsyncInto(
+                MILVUS_V3_MAGIC_SIZE + src_offset, len, task.data.data());
+            task.expected_size = len;
+            task.file_offset = file_offset;
+            task.range_idx = range_idx;
+            task.encrypted = false;
+            task.plain_len = 0;
+            tasks.push_back(std::move(task));
 
             remaining -= len;
             file_offset += len;
@@ -760,13 +762,13 @@ IndexEntryReader::FinishEntryDownloadAsyncTasks(
                 plain.size()};
         } else {
             auto written = ::pwrite(task.state->fd,
-                                    AsBytes(read_result.data),
+                                    task.data.data(),
                                     read_result.bytes_read,
                                     task.file_offset);
             AssertInfo(written == static_cast<ssize_t>(read_result.bytes_read),
                        "Failed to pwrite");
             task.state->range_crcs[task.range_idx] = {
-                Crc32cValue(AsBytes(read_result.data), read_result.bytes_read),
+                Crc32cValue(task.data.data(), read_result.bytes_read),
                 read_result.bytes_read};
         }
     }

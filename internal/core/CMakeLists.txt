@@ -297,6 +297,11 @@ ADD_DEFINITIONS(-DBOOST_GEOMETRY_INDEX_DETAIL_EXPERIMENTAL)
 add_subdirectory( thirdparty )
 add_subdirectory( src )
 
+option(BUILD_S3_READ_MICROBENCH "Build S3 read path microbench tool" OFF)
+if ( BUILD_S3_READ_MICROBENCH )
+    add_subdirectory( tools/s3_read_microbench )
+endif()
+
 # Unittest lib
 if ( BUILD_UNIT_TEST STREQUAL "ON" )
     append_flags( CMAKE_CXX_FLAGS FLAGS "-DELPP_DISABLE_LOGS")

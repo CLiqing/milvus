@@ -10,8 +10,10 @@
 #include <cstring>
 #include <future>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -33,6 +35,18 @@ milvus_storage_set_s3_read_path_context_for_file(void* file,
                                                  double crt_throughput_gbps,
                                                  bool has_crt_throughput_gbps)
     __attribute__((weak));
+
+using MilvusStorageReadAsyncIntoCallback = void (*)(
+    void* callback_ctx, int64_t bytes_read, const char* error_message);
+
+extern "C" bool
+milvus_storage_read_async_into_file(
+    void* file,
+    int64_t position,
+    int64_t nbytes,
+    void* output,
+    MilvusStorageReadAsyncIntoCallback callback,
+    void* callback_ctx) __attribute__((weak));
 
 namespace milvus::storage {
 namespace {
@@ -117,6 +131,63 @@ PrintS3ReadPathProbe(const char* operation,
               << " size=" << size
               << std::endl;
 }
+
+bool
+ShouldPrintS3ReadWorkloadTrace(uint64_t& seq) {
+    static const bool enabled = IsEnvEnabled("MILVUS_S3_READ_WORKLOAD_TRACE");
+    if (!enabled) {
+        return false;
+    }
+    static const uint64_t limit =
+        GetUnsignedEnv("MILVUS_S3_READ_WORKLOAD_TRACE_LIMIT", 100000);
+    static std::atomic<uint64_t> counter{0};
+    seq = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    return limit == 0 || seq <= limit;
+}
+
+uint64_t
+UnixMicros() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
+void
+PrintS3ReadWorkloadTrace(const char* operation,
+                         const milvus::S3ReadPathConfig& config,
+                         size_t offset,
+                         size_t size,
+                         size_t limiter_id,
+                         size_t limiter_max_inflight,
+                         size_t limiter_current_inflight) {
+    uint64_t seq = 0;
+    if (!ShouldPrintS3ReadWorkloadTrace(seq)) {
+        return;
+    }
+    std::ostringstream out;
+    out << "[MILVUS_S3_READ_WORKLOAD]"
+        << " seq=" << seq
+        << " ts_us=" << UnixMicros()
+        << " layer=remote_input_stream"
+        << " operation=" << operation
+        << " override_enabled=" << config.override_enabled
+        << " mode=" << config.mode
+        << " offset=" << offset
+        << " size=" << size
+        << " limiter_id=" << limiter_id
+        << " limiter_max_inflight=" << limiter_max_inflight
+        << " limiter_current_inflight=" << limiter_current_inflight
+        << " thread_id=" << std::this_thread::get_id()
+        << "\n";
+    const auto line = out.str();
+    (void)::write(STDERR_FILENO, line.data(), line.size());
+}
+
+struct DirectAsyncReadCallbackState {
+    std::shared_ptr<std::promise<RemoteAsyncReadResult>> promise;
+    size_t limiter_id;
+};
 
 void
 ApplyS3ReadPathConfigForFile(arrow::io::RandomAccessFile* file,
@@ -323,6 +394,36 @@ MaybeReportAsyncReadStats() {
 
 }  // namespace
 
+void
+RemoteInputStream::CompleteDirectAsyncRead(void* callback_ctx,
+                                           int64_t bytes_read,
+                                           const char* error_message) {
+    std::unique_ptr<DirectAsyncReadCallbackState> state(
+        static_cast<DirectAsyncReadCallbackState*>(callback_ctx));
+    try {
+        if (error_message != nullptr && *error_message != '\0') {
+            throw std::runtime_error(error_message);
+        }
+        if (bytes_read < 0) {
+            throw std::runtime_error("direct async read returned negative byte count");
+        }
+
+        RemoteAsyncReadResult async_result;
+        async_result.bytes_read = static_cast<size_t>(bytes_read);
+        GetAsyncReadStats().completed.fetch_add(1, std::memory_order_relaxed);
+        GetAsyncReadStats().completed_bytes.fetch_add(
+            async_result.bytes_read, std::memory_order_relaxed);
+        GetAsyncReadStats().MaybePrintWindow("complete_direct_into");
+        state->promise->set_value(std::move(async_result));
+    } catch (...) {
+        GetAsyncReadStats().failed.fetch_add(1, std::memory_order_relaxed);
+        GetAsyncReadStats().MaybePrintWindow("fail_direct_into");
+        state->promise->set_exception(std::current_exception());
+    }
+    FinishAsyncReadAndStartNext(state->limiter_id);
+    MaybeReportAsyncReadStats();
+}
+
 RemoteInputStream::RemoteInputStream(
     std::shared_ptr<arrow::io::RandomAccessFile>&& remote_file,
     milvus::S3ReadPathConfig s3_read_path_config)
@@ -348,6 +449,13 @@ size_t
 RemoteInputStream::ReadAt(void* data, size_t offset, size_t size) {
     PrintS3ReadPathProbe(
         "ReadAt", s3_read_path_config_, offset, size);
+    PrintS3ReadWorkloadTrace("ReadAt",
+                             s3_read_path_config_,
+                             offset,
+                             size,
+                             async_read_at_limiter_id_,
+                             0,
+                             0);
     auto status = remote_file_->ReadAt(offset, size, data);
     AssertInfo(status.ok(), "Failed to read from input stream");
     return static_cast<size_t>(status.ValueOrDie());
@@ -378,8 +486,17 @@ std::future<RemoteAsyncReadResult>
 RemoteInputStream::ReadAtAsync(size_t offset,
                                size_t size,
                                const milvus::S3ReadPathConfig& config) {
+    const auto effective_config =
+        config.override_enabled ? config : s3_read_path_config_;
     PrintS3ReadPathProbe(
-        "ReadAtAsync", config, offset, size);
+        "ReadAtAsync", effective_config, offset, size);
+    PrintS3ReadWorkloadTrace("ReadAtAsync",
+                             effective_config,
+                             offset,
+                             size,
+                             async_read_at_limiter_id_,
+                             GetAsyncReadAtMaxInflight(),
+                             GetAsyncReadAtCurrentInflight());
     auto& stats = GetAsyncReadStats();
     stats.submitted.fetch_add(1, std::memory_order_relaxed);
     stats.requested_bytes.fetch_add(size, std::memory_order_relaxed);
@@ -391,9 +508,67 @@ RemoteInputStream::ReadAtAsync(size_t offset,
         remote_file_,
         offset,
         size,
+        nullptr,
         promise,
         async_read_at_limiter_id_,
-        config,
+        effective_config,
+        s3_read_path_context_mutex_};
+    bool start_now = false;
+    auto& limiter = GetAsyncReadLimiter(request.limiter_id);
+    {
+        std::lock_guard<std::mutex> lock(limiter.mutex);
+        if (limiter.inflight < limiter.max_inflight) {
+            limiter.inflight++;
+            UpdateMax(stats.max_inflight_observed, limiter.inflight);
+            start_now = true;
+        } else {
+            limiter.pending.push_back(std::move(request));
+            stats.queued.fetch_add(1, std::memory_order_relaxed);
+            UpdateMax(stats.max_pending, limiter.pending.size());
+        }
+    }
+
+    if (start_now) {
+        StartAsyncRead(std::move(request));
+    }
+    return future;
+}
+
+std::future<RemoteAsyncReadResult>
+RemoteInputStream::ReadAtAsyncInto(size_t offset, size_t size, void* data) {
+    return ReadAtAsyncInto(offset, size, data, s3_read_path_config_);
+}
+
+std::future<RemoteAsyncReadResult>
+RemoteInputStream::ReadAtAsyncInto(size_t offset,
+                                   size_t size,
+                                   void* data,
+                                   const milvus::S3ReadPathConfig& config) {
+    const auto effective_config =
+        config.override_enabled ? config : s3_read_path_config_;
+    PrintS3ReadPathProbe("ReadAtAsyncInto", effective_config, offset, size);
+    PrintS3ReadWorkloadTrace("ReadAtAsyncInto",
+                             effective_config,
+                             offset,
+                             size,
+                             async_read_at_limiter_id_,
+                             GetAsyncReadAtMaxInflight(),
+                             GetAsyncReadAtCurrentInflight());
+    auto& stats = GetAsyncReadStats();
+    stats.submitted.fetch_add(1, std::memory_order_relaxed);
+    stats.requested_bytes.fetch_add(size, std::memory_order_relaxed);
+    stats.MaybePrintWindow("submit_direct_into");
+
+    auto promise = std::make_shared<std::promise<RemoteAsyncReadResult>>();
+    auto future = promise->get_future();
+    PendingAsyncRead request{
+        remote_file_,
+        offset,
+        size,
+        data,
+        promise,
+        async_read_at_limiter_id_,
+        effective_config,
         s3_read_path_context_mutex_};
     bool start_now = false;
     auto& limiter = GetAsyncReadLimiter(request.limiter_id);
@@ -474,6 +649,31 @@ RemoteInputStream::StartAsyncRead(PendingAsyncRead request) {
     GetAsyncReadStats().started.fetch_add(1, std::memory_order_relaxed);
     GetAsyncReadStats().MaybePrintWindow("start");
     try {
+        if (request.output != nullptr &&
+            milvus_storage_read_async_into_file != nullptr) {
+            auto* callback_state = new DirectAsyncReadCallbackState{
+                request.promise,
+                request.limiter_id};
+            bool accepted = false;
+            {
+                std::lock_guard<std::mutex> lock(
+                    *request.s3_read_path_context_mutex);
+                ApplyS3ReadPathConfigForFile(request.remote_file.get(),
+                                             request.s3_read_path_config);
+                accepted = milvus_storage_read_async_into_file(
+                    request.remote_file.get(),
+                    static_cast<int64_t>(request.offset),
+                    static_cast<int64_t>(request.size),
+                    request.output,
+                    &RemoteInputStream::CompleteDirectAsyncRead,
+                    callback_state);
+            }
+            if (accepted) {
+                return;
+            }
+            delete callback_state;
+        }
+
         arrow::Future<std::shared_ptr<arrow::Buffer>> arrow_future;
         {
             std::lock_guard<std::mutex> lock(
@@ -485,7 +685,9 @@ RemoteInputStream::StartAsyncRead(PendingAsyncRead request) {
                 static_cast<int64_t>(request.size));
         }
         arrow_future.AddCallback(
-            [promise = request.promise, limiter_id = request.limiter_id](
+            [promise = request.promise,
+             limiter_id = request.limiter_id,
+             output = request.output](
                 const arrow::Result<std::shared_ptr<arrow::Buffer>>& result) {
                 try {
                     if (!result.ok()) {
@@ -500,11 +702,19 @@ RemoteInputStream::StartAsyncRead(PendingAsyncRead request) {
                     GetAsyncReadStats().completed_bytes.fetch_add(
                         async_result.bytes_read, std::memory_order_relaxed);
                     GetAsyncReadStats().MaybePrintWindow("complete");
-                    async_result.data.resize(async_result.bytes_read);
-                    if (async_result.bytes_read > 0) {
-                        std::memcpy(async_result.data.data(),
-                                    buffer->data(),
-                                    async_result.bytes_read);
+                    if (output != nullptr) {
+                        if (async_result.bytes_read > 0) {
+                            std::memcpy(output,
+                                        buffer->data(),
+                                        async_result.bytes_read);
+                        }
+                    } else {
+                        async_result.data.resize(async_result.bytes_read);
+                        if (async_result.bytes_read > 0) {
+                            std::memcpy(async_result.data.data(),
+                                        buffer->data(),
+                                        async_result.bytes_read);
+                        }
                     }
                     promise->set_value(std::move(async_result));
                 } catch (...) {

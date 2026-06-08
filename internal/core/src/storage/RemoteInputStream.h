@@ -60,6 +60,15 @@ class RemoteInputStream : public milvus::InputStream,
                 size_t size,
                 const milvus::S3ReadPathConfig& config) override;
 
+    std::future<RemoteAsyncReadResult>
+    ReadAtAsyncInto(size_t offset, size_t size, void* data) override;
+
+    std::future<RemoteAsyncReadResult>
+    ReadAtAsyncInto(size_t offset,
+                    size_t size,
+                    void* data,
+                    const milvus::S3ReadPathConfig& config) override;
+
     void
     ConfigureAsyncReadAtLimiter(size_t limiter_id, size_t max_inflight) override;
 
@@ -86,6 +95,7 @@ class RemoteInputStream : public milvus::InputStream,
         std::shared_ptr<arrow::io::RandomAccessFile> remote_file;
         size_t offset;
         size_t size;
+        void* output;
         std::shared_ptr<std::promise<RemoteAsyncReadResult>> promise;
         size_t limiter_id;
         milvus::S3ReadPathConfig s3_read_path_config;
@@ -104,6 +114,11 @@ class RemoteInputStream : public milvus::InputStream,
 
     static void
     StartAsyncRead(PendingAsyncRead request);
+
+    static void
+    CompleteDirectAsyncRead(void* callback_ctx,
+                            int64_t bytes_read,
+                            const char* error_message);
 
     static void
     FinishAsyncReadAndStartNext(size_t limiter_id);

@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstddef>
+#include <cstring>
 #include <future>
 #include <string>
+#include <utility>
 #include <vector>
 #include <optional>
 
@@ -47,6 +49,41 @@ class AsyncInputStream {
                 const S3ReadPathConfig& config) {
         (void)config;
         return ReadAtAsync(offset, size);
+    }
+
+    virtual std::future<AsyncReadResult>
+    ReadAtAsyncInto(size_t offset, size_t size, void* data) {
+        auto source = ReadAtAsync(offset, size);
+        return std::async(
+            std::launch::async,
+            [source = std::move(source), data]() mutable {
+                auto result = source.get();
+                if (result.bytes_read > 0) {
+                    std::memcpy(data, result.data.data(), result.bytes_read);
+                }
+                result.data.clear();
+                result.data.shrink_to_fit();
+                return result;
+            });
+    }
+
+    virtual std::future<AsyncReadResult>
+    ReadAtAsyncInto(size_t offset,
+                    size_t size,
+                    void* data,
+                    const S3ReadPathConfig& config) {
+        auto source = ReadAtAsync(offset, size, config);
+        return std::async(
+            std::launch::async,
+            [source = std::move(source), data]() mutable {
+                auto result = source.get();
+                if (result.bytes_read > 0) {
+                    std::memcpy(data, result.data.data(), result.bytes_read);
+                }
+                result.data.clear();
+                result.data.shrink_to_fit();
+                return result;
+            });
     }
 
     virtual void
