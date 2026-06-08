@@ -80,6 +80,35 @@ struct EmptyEmbListState {
     std::vector<size_t> offsets;
 };
 
+bool
+IsCardinalDiskIndexType(const std::string& index_type) {
+    return index_type == "CARDINAL_TIERED" ||
+           index_type == knowhere::IndexEnum::INDEX_HNSW;
+}
+
+std::optional<std::string>
+TryGetCardinalIndexPrefix(const std::vector<std::string>& index_files) {
+    constexpr const char* kCardinalMemIndexSuffix = "_mem.index.bin";
+    const auto suffix_len = strlen(kCardinalMemIndexSuffix);
+
+    for (const auto& index_file : index_files) {
+        if (index_file.size() < suffix_len) {
+            continue;
+        }
+        if (index_file.compare(index_file.size() - suffix_len,
+                               suffix_len,
+                               kCardinalMemIndexSuffix) != 0) {
+            continue;
+        }
+
+        auto cardinal_index_prefix = index_file;
+        cardinal_index_prefix.resize(cardinal_index_prefix.size() - suffix_len);
+        return cardinal_index_prefix;
+    }
+
+    return std::nullopt;
+}
+
 class DiskEmptyVectorIterator : public knowhere::IndexNode::iterator {
  public:
     std::pair<int64_t, float>
@@ -899,8 +928,29 @@ VectorDiskAnnIndex<T>::update_load_json(const Config& config) {
     load_config.update(config);
 
     // set data path
-    auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
-    load_config[DISK_ANN_PREFIX_PATH] = local_index_path_prefix;
+    auto index_type = GetValueFromConfig<std::string>(config, INDEX_TYPE);
+    if (index_type.has_value() && IsCardinalDiskIndexType(index_type.value())) {
+        auto index_files =
+            GetValueFromConfig<std::vector<std::string>>(config, INDEX_FILES);
+        if (index_files.has_value()) {
+            auto cardinal_index_prefix =
+                TryGetCardinalIndexPrefix(index_files.value());
+            if (cardinal_index_prefix.has_value()) {
+                load_config[DISK_ANN_PREFIX_PATH] =
+                    cardinal_index_prefix.value();
+            } else {
+                load_config[DISK_ANN_PREFIX_PATH] =
+                    file_manager_->GetRemoteIndexObjectPrefix();
+            }
+        } else {
+            load_config[DISK_ANN_PREFIX_PATH] =
+                file_manager_->GetRemoteIndexObjectPrefix();
+        }
+    } else {
+        auto local_index_path_prefix =
+            file_manager_->GetLocalIndexObjectPrefix();
+        load_config[DISK_ANN_PREFIX_PATH] = local_index_path_prefix;
+    }
 
     if (GetIndexType() == knowhere::IndexEnum::INDEX_DISKANN) {
         // set base info
