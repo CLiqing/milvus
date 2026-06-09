@@ -121,6 +121,24 @@ class ScalarIndexSort : public ScalarIndex<T> {
     std::optional<T>
     Reverse_Lookup(size_t offset) const override;
 
+    size_t
+    GetFirstGreaterEqualOffsets(const T& value,
+                                size_t limit,
+                                int32_t* offsets) const {
+        AssertInfo(is_built_, "index has not been built");
+        if (limit == 0 || offsets == nullptr) {
+            return 0;
+        }
+        auto it = std::lower_bound(begin(), end(), IndexStructure<T>(value));
+        size_t count = 0;
+        for (; it != end() && count < limit; ++it) {
+            if (valid_bitset_[it->idx_]) {
+                offsets[count++] = it->idx_;
+            }
+        }
+        return count;
+    }
+
     int64_t
     Size() override {
         return (int64_t)size_;

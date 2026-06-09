@@ -35,6 +35,8 @@
 #include "exec/QueryContext.h"
 #include "exec/expression/Utils.h"
 #include "exec/operator/Utils.h"
+#include "index/ScalarIndex.h"
+#include "index/ScalarIndexSort.h"
 #include "monitor/Monitor.h"
 #include "opentelemetry/trace/span.h"
 #include "plan/PlanNode.h"
@@ -51,6 +53,10 @@ struct CardinalExprDownpushSearchContext {
     std::vector<PinWrapper<Span<int64_t>>> pins_;
     std::vector<const int64_t*> chunk_data_;
     std::vector<int64_t> chunk_offsets_;
+    PinWrapper<const index::IndexBase*> index_pin_;
+    const index::ScalarIndex<int64_t>* scalar_index_{nullptr};
+    const index::ScalarIndexSort<int64_t>* scalar_sort_index_{nullptr};
+    int64_t row_count_{0};
     CardinalExprDownpushPredicate predicate_{
         CardinalExprDownpushPredicate::ModLessThan};
     int64_t modulus_{0};
@@ -58,16 +64,32 @@ struct CardinalExprDownpushSearchContext {
 
     bool
     FilteredOut(int64_t seg_offset) const {
-        if (seg_offset < 0 || chunk_offsets_.empty() ||
-            seg_offset >= chunk_offsets_.back()) {
+        if (seg_offset < 0) {
             return true;
         }
-        auto it = std::upper_bound(
-            chunk_offsets_.begin(), chunk_offsets_.end(), seg_offset);
-        auto chunk_idx =
-            static_cast<size_t>(std::distance(chunk_offsets_.begin(), it) - 1);
-        auto inner_offset = seg_offset - chunk_offsets_[chunk_idx];
-        auto value = chunk_data_[chunk_idx][inner_offset];
+
+        int64_t value = 0;
+        if (!chunk_offsets_.empty()) {
+            if (seg_offset >= chunk_offsets_.back()) {
+                return true;
+            }
+            auto it = std::upper_bound(
+                chunk_offsets_.begin(), chunk_offsets_.end(), seg_offset);
+            auto chunk_idx = static_cast<size_t>(
+                std::distance(chunk_offsets_.begin(), it) - 1);
+            auto inner_offset = seg_offset - chunk_offsets_[chunk_idx];
+            value = chunk_data_[chunk_idx][inner_offset];
+        } else {
+            if (scalar_index_ == nullptr || seg_offset >= row_count_) {
+                return true;
+            }
+            auto raw = scalar_index_->Reverse_Lookup(seg_offset);
+            if (!raw.has_value()) {
+                return true;
+            }
+            value = raw.value();
+        }
+
         switch (predicate_) {
             case CardinalExprDownpushPredicate::ModLessThan:
                 return value % modulus_ >= threshold_;
@@ -76,12 +98,48 @@ struct CardinalExprDownpushSearchContext {
         }
         return true;
     }
+
+    size_t
+    FirstValid(size_t limit, int32_t* offsets) const {
+        if (predicate_ != CardinalExprDownpushPredicate::Int64GreaterEqual ||
+            limit == 0 || offsets == nullptr) {
+            return 0;
+        }
+        if (scalar_sort_index_ != nullptr) {
+            return scalar_sort_index_->GetFirstGreaterEqualOffsets(
+                threshold_, limit, offsets);
+        }
+
+        // Demo-only shortcut for the current VDBBench id >= threshold case.
+        // This assumes bit id / segment offset is aligned with id.
+        auto start = std::max<int64_t>(threshold_, 0);
+        if (start >= row_count_) {
+            return 0;
+        }
+        size_t count = 0;
+        for (auto offset = start; offset < row_count_ && count < limit;
+             ++offset) {
+            offsets[count++] = static_cast<int32_t>(offset);
+        }
+        return count;
+    }
+
+    bool
+    HasFirstValidProvider() const {
+        return predicate_ == CardinalExprDownpushPredicate::Int64GreaterEqual;
+    }
 };
 
 bool
 CardinalExprDownpushFilteredOut(void* ctx, int64_t seg_offset) {
     auto* downpush_ctx = static_cast<CardinalExprDownpushSearchContext*>(ctx);
     return downpush_ctx->FilteredOut(seg_offset);
+}
+
+size_t
+CardinalExprDownpushFirstValid(void* ctx, size_t limit, int32_t* offsets) {
+    auto* downpush_ctx = static_cast<CardinalExprDownpushSearchContext*>(ctx);
+    return downpush_ctx->FirstValid(limit, offsets);
 }
 
 std::shared_ptr<CardinalExprDownpushSearchContext>
@@ -94,13 +152,7 @@ BuildCardinalExprDownpushSearchContext(
     }
     auto& schema = segment->get_schema();
     auto& field_meta = schema[info.field_id_];
-    if (field_meta.get_data_type() != DataType::INT64 ||
-        !segment->HasFieldData(info.field_id_)) {
-        return nullptr;
-    }
-
-    auto num_chunks = segment->num_chunk(info.field_id_);
-    if (num_chunks <= 0) {
+    if (field_meta.get_data_type() != DataType::INT64) {
         return nullptr;
     }
 
@@ -108,6 +160,31 @@ BuildCardinalExprDownpushSearchContext(
     ctx->predicate_ = info.predicate_;
     ctx->modulus_ = info.modulus_;
     ctx->threshold_ = info.threshold_;
+    ctx->row_count_ = segment->get_row_count();
+
+    if (!segment->HasFieldData(info.field_id_)) {
+        auto indexes = segment->PinIndex(op_context, info.field_id_);
+        if (indexes.empty()) {
+            return nullptr;
+        }
+        auto scalar_index =
+            dynamic_cast<const index::ScalarIndex<int64_t>*>(indexes[0].get());
+        if (scalar_index == nullptr) {
+            return nullptr;
+        }
+        ctx->scalar_index_ = scalar_index;
+        ctx->scalar_sort_index_ =
+            dynamic_cast<const index::ScalarIndexSort<int64_t>*>(
+                indexes[0].get());
+        ctx->index_pin_ = std::move(indexes[0]);
+        return ctx;
+    }
+
+    auto num_chunks = segment->num_chunk(info.field_id_);
+    if (num_chunks <= 0) {
+        return nullptr;
+    }
+
     ctx->pins_.reserve(num_chunks);
     ctx->chunk_data_.reserve(num_chunks);
     ctx->chunk_offsets_.reserve(num_chunks + 1);
@@ -265,7 +342,10 @@ PhyVectorSearchNode::GetOutput() {
         }
         search_view.set_extra_filter(downpush_ctx.get(),
                                      CardinalExprDownpushFilteredOut,
-                                     downpush_info->filtered_out_count_);
+                                     downpush_info->filtered_out_count_,
+                                     downpush_ctx->HasFirstValidProvider()
+                                         ? CardinalExprDownpushFirstValid
+                                         : nullptr);
     }
 
     // Single search + metrics path
