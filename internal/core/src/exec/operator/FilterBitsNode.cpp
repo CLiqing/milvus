@@ -34,6 +34,8 @@
 #include "exec/expression/ExprCache.h"
 #include "expr/ITypeExpr.h"
 #include "fmt/core.h"
+#include "index/ScalarIndexSort.h"
+#include "log/Log.h"
 #include "monitor/Monitor.h"
 #include "plan/PlanNode.h"
 #include "prometheus/histogram.h"
@@ -140,12 +142,6 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
         search_params, kCardinalExprFilteredOutCountParam);
     auto filter_ratio =
         GetJsonNumber<double>(search_params, kCardinalExprFilterRatioParam);
-    if (!filtered_out_count.has_value() && !filter_ratio.has_value()) {
-        ThrowInfo(UnexpectedError,
-                  "cardinal expr downpush requires {} or {}",
-                  kCardinalExprFilteredOutCountParam,
-                  kCardinalExprFilterRatioParam);
-    }
 
     auto set_filtered_count = [&](CardinalExprDownpushInfo& info) {
         if (filtered_out_count.has_value()) {
@@ -156,6 +152,41 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
             info.filtered_out_count_ = std::clamp<int64_t>(
                 std::llround(active_count * ratio), 0, active_count);
         }
+    };
+
+    auto require_estimated_filtered_count = [&]() {
+        if (!filtered_out_count.has_value() && !filter_ratio.has_value()) {
+            ThrowInfo(UnexpectedError,
+                      "cardinal expr downpush requires {} or {}",
+                      kCardinalExprFilteredOutCountParam,
+                      kCardinalExprFilterRatioParam);
+        }
+    };
+
+    auto count_id_less_than = [&](FieldId field_id, int64_t threshold) {
+        auto indexes = segment->PinIndex(query_context->get_op_context(),
+                                         field_id);
+        for (auto& index_pin : indexes) {
+            auto scalar_sort_index =
+                dynamic_cast<const index::ScalarIndexSort<int64_t>*>(
+                    index_pin.get());
+            if (scalar_sort_index == nullptr) {
+                continue;
+            }
+            auto count = std::clamp<int64_t>(
+                scalar_sort_index->CountLessThan(threshold), 0, active_count);
+            LOG_INFO(
+                "CodexCardinalExprDownpushFilteredCount field_id={} "
+                "threshold={} active_count={} filtered_out_count={}",
+                field_id.get(),
+                threshold,
+                active_count,
+                count);
+            return count;
+        }
+        ThrowInfo(UnexpectedError,
+                  "cardinal expr downpush id >= threshold requires STL_SORT "
+                  "scalar index for exact per-segment filtered count");
     };
 
     auto unary_expr =
@@ -199,7 +230,8 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
         info.field_id_ = unary_expr->column_.field_id_;
         info.predicate_ = CardinalExprDownpushPredicate::Int64GreaterEqual;
         info.threshold_ = threshold;
-        set_filtered_count(info);
+        info.filtered_out_count_ =
+            count_id_less_than(info.field_id_, threshold);
         return info;
     }
 
@@ -260,6 +292,7 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
     info.predicate_ = CardinalExprDownpushPredicate::ModLessThan;
     info.modulus_ = modulus;
     info.threshold_ = threshold;
+    require_estimated_filtered_count();
     set_filtered_count(info);
     return info;
 }

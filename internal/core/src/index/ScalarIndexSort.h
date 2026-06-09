@@ -140,6 +140,13 @@ class ScalarIndexSort : public ScalarIndex<T> {
     }
 
     int64_t
+    CountLessThan(const T& value) const {
+        AssertInfo(is_built_, "index has not been built");
+        auto it = std::lower_bound(begin(), end(), IndexStructure<T>(value));
+        return std::distance(begin(), it);
+    }
+
+    int64_t
     Size() override {
         return (int64_t)size_;
     }
