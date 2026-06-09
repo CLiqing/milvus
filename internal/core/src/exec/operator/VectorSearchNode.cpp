@@ -63,6 +63,17 @@ struct CardinalExprDownpushSearchContext {
     int64_t threshold_{0};
 
     bool
+    ValueFilteredOut(int64_t value) const {
+        switch (predicate_) {
+            case CardinalExprDownpushPredicate::ModLessThan:
+                return value % modulus_ >= threshold_;
+            case CardinalExprDownpushPredicate::Int64GreaterEqual:
+                return value < threshold_;
+        }
+        return true;
+    }
+
+    bool
     FilteredOut(int64_t seg_offset) const {
         if (seg_offset < 0) {
             return true;
@@ -90,13 +101,7 @@ struct CardinalExprDownpushSearchContext {
             value = raw.value();
         }
 
-        switch (predicate_) {
-            case CardinalExprDownpushPredicate::ModLessThan:
-                return value % modulus_ >= threshold_;
-            case CardinalExprDownpushPredicate::Int64GreaterEqual:
-                return value < threshold_;
-        }
-        return true;
+        return ValueFilteredOut(value);
     }
 
     size_t
@@ -110,16 +115,33 @@ struct CardinalExprDownpushSearchContext {
                 threshold_, limit, offsets);
         }
 
-        // Demo-only shortcut for the current VDBBench id >= threshold case.
-        // This assumes bit id / segment offset is aligned with id.
-        auto start = std::max<int64_t>(threshold_, 0);
-        if (start >= row_count_) {
-            return 0;
-        }
         size_t count = 0;
-        for (auto offset = start; offset < row_count_ && count < limit;
+        if (!chunk_offsets_.empty()) {
+            for (size_t chunk_idx = 0;
+                 chunk_idx < chunk_data_.size() && count < limit;
+                 ++chunk_idx) {
+                auto begin = chunk_offsets_[chunk_idx];
+                auto end = chunk_offsets_[chunk_idx + 1];
+                for (auto offset = begin; offset < end && count < limit;
+                     ++offset) {
+                    auto inner_offset = offset - begin;
+                    if (!ValueFilteredOut(
+                            chunk_data_[chunk_idx][inner_offset])) {
+                        offsets[count++] = static_cast<int32_t>(offset);
+                    }
+                }
+            }
+            return count;
+        }
+
+        for (int64_t offset = 0; offset < row_count_ && count < limit;
              ++offset) {
-            offsets[count++] = static_cast<int32_t>(offset);
+            auto raw = scalar_index_ != nullptr
+                           ? scalar_index_->Reverse_Lookup(offset)
+                           : std::optional<int64_t>{};
+            if (raw.has_value() && !ValueFilteredOut(raw.value())) {
+                offsets[count++] = static_cast<int32_t>(offset);
+            }
         }
         return count;
     }
@@ -162,21 +184,23 @@ BuildCardinalExprDownpushSearchContext(
     ctx->threshold_ = info.threshold_;
     ctx->row_count_ = segment->get_row_count();
 
-    if (!segment->HasFieldData(info.field_id_)) {
-        auto indexes = segment->PinIndex(op_context, info.field_id_);
-        if (indexes.empty()) {
-            return nullptr;
-        }
+    auto indexes = segment->PinIndex(op_context, info.field_id_);
+    if (!indexes.empty()) {
         auto scalar_index =
             dynamic_cast<const index::ScalarIndex<int64_t>*>(indexes[0].get());
-        if (scalar_index == nullptr) {
+        if (scalar_index != nullptr) {
+            ctx->scalar_index_ = scalar_index;
+            ctx->scalar_sort_index_ =
+                dynamic_cast<const index::ScalarIndexSort<int64_t>*>(
+                    indexes[0].get());
+            ctx->index_pin_ = std::move(indexes[0]);
+        }
+    }
+
+    if (!segment->HasFieldData(info.field_id_)) {
+        if (ctx->scalar_index_ == nullptr) {
             return nullptr;
         }
-        ctx->scalar_index_ = scalar_index;
-        ctx->scalar_sort_index_ =
-            dynamic_cast<const index::ScalarIndexSort<int64_t>*>(
-                indexes[0].get());
-        ctx->index_pin_ = std::move(indexes[0]);
         return ctx;
     }
 
