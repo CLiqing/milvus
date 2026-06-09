@@ -367,9 +367,7 @@ PhyVectorSearchNode::GetOutput() {
         search_view.set_extra_filter(downpush_ctx.get(),
                                      CardinalExprDownpushFilteredOut,
                                      downpush_info->filtered_out_count_,
-                                     downpush_ctx->HasFirstValidProvider()
-                                         ? CardinalExprDownpushFirstValid
-                                         : nullptr);
+                                     nullptr);
     }
 
     // Single search + metrics path
