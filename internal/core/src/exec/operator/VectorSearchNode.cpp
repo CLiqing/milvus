@@ -352,12 +352,26 @@ PhyVectorSearchNode::GetOutput() {
     std::shared_ptr<CardinalExprDownpushSearchContext> downpush_ctx;
     const auto& downpush_info =
         query_context_->get_cardinal_expr_downpush_info();
+    bool install_downpush_extra_filter = downpush_info.has_value();
     if (downpush_info.has_value() && ph.element_level_) {
         ThrowInfo(UnexpectedError,
                   "cardinal expr downpush does not support element-level "
                   "vector search");
     }
-    if (downpush_info.has_value()) {
+    if (install_downpush_extra_filter) {
+        if (downpush_info->predicate_ ==
+            CardinalExprDownpushPredicate::Int64GreaterEqual) {
+            if (downpush_info->filtered_out_count_ >= active_count_) {
+                query_context_->set_search_result(
+                    empty_search_result(num_queries));
+                return input_;
+            }
+            if (downpush_info->filtered_out_count_ <= 0) {
+                install_downpush_extra_filter = false;
+            }
+        }
+    }
+    if (install_downpush_extra_filter) {
         downpush_ctx = BuildCardinalExprDownpushSearchContext(
             segment_, op_context, downpush_info.value());
         if (downpush_ctx == nullptr) {
