@@ -21,6 +21,7 @@
 #include <functional>
 #include <memory>
 #include <ratio>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -37,6 +38,7 @@
 #include "exec/operator/Utils.h"
 #include "index/ScalarIndex.h"
 #include "index/ScalarIndexSort.h"
+#include "log/Log.h"
 #include "monitor/Monitor.h"
 #include "opentelemetry/trace/span.h"
 #include "plan/PlanNode.h"
@@ -61,6 +63,7 @@ struct CardinalExprDownpushSearchContext {
         CardinalExprDownpushPredicate::ModLessThan};
     int64_t modulus_{0};
     int64_t threshold_{0};
+    std::string value_source_{"uninitialized"};
 
     bool
     ValueFilteredOut(int64_t value) const {
@@ -93,6 +96,11 @@ struct CardinalExprDownpushSearchContext {
         } else {
             if (scalar_index_ == nullptr || seg_offset >= row_count_) {
                 return true;
+            }
+            if (scalar_sort_index_ != nullptr &&
+                scalar_sort_index_->TryGetValueByRowOffsetFast(seg_offset,
+                                                               &value)) {
+                return ValueFilteredOut(value);
             }
             auto raw = scalar_index_->Reverse_Lookup(seg_offset);
             if (!raw.has_value()) {
@@ -201,6 +209,23 @@ BuildCardinalExprDownpushSearchContext(
         if (ctx->scalar_index_ == nullptr) {
             return nullptr;
         }
+        ctx->value_source_ = ctx->scalar_sort_index_ != nullptr
+                                 ? "scalar_sort_fast_accessor"
+                                 : "scalar_index_reverse_lookup";
+        LOG_INFO(
+            "CodexCardinalExprDownpushContext field_id={} row_count={} "
+            "predicate={} modulus={} threshold={} filtered_out_count={} "
+            "has_field_data=false scalar_index={} scalar_sort_index={} "
+            "value_source={}",
+            info.field_id_.get(),
+            ctx->row_count_,
+            static_cast<int>(ctx->predicate_),
+            ctx->modulus_,
+            ctx->threshold_,
+            info.filtered_out_count_,
+            ctx->scalar_index_ != nullptr,
+            ctx->scalar_sort_index_ != nullptr,
+            ctx->value_source_);
         return ctx;
     }
 
@@ -223,6 +248,23 @@ BuildCardinalExprDownpushSearchContext(
                                       span.row_count());
         ctx->pins_.push_back(std::move(pin));
     }
+    ctx->value_source_ = "raw_field_chunks";
+    LOG_INFO(
+        "CodexCardinalExprDownpushContext field_id={} row_count={} "
+        "predicate={} modulus={} threshold={} filtered_out_count={} "
+        "has_field_data=true scalar_index={} scalar_sort_index={} "
+        "num_chunks={} chunk_rows={} value_source={}",
+        info.field_id_.get(),
+        ctx->row_count_,
+        static_cast<int>(ctx->predicate_),
+        ctx->modulus_,
+        ctx->threshold_,
+        info.filtered_out_count_,
+        ctx->scalar_index_ != nullptr,
+        ctx->scalar_sort_index_ != nullptr,
+        num_chunks,
+        ctx->chunk_offsets_.empty() ? 0 : ctx->chunk_offsets_.back(),
+        ctx->value_source_);
     return ctx;
 }
 
@@ -378,6 +420,13 @@ PhyVectorSearchNode::GetOutput() {
             ThrowInfo(UnexpectedError,
                       "failed to build cardinal expr downpush search context");
         }
+        LOG_INFO(
+            "CodexCardinalExprDownpushInstall field_id={} row_count={} "
+            "filtered_out_count={} value_source={}",
+            downpush_info->field_id_.get(),
+            downpush_ctx->row_count_,
+            downpush_info->filtered_out_count_,
+            downpush_ctx->value_source_);
         search_view.set_extra_filter(downpush_ctx.get(),
                                      CardinalExprDownpushFilteredOut,
                                      downpush_info->filtered_out_count_,

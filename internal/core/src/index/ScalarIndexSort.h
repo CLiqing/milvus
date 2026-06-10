@@ -121,6 +121,19 @@ class ScalarIndexSort : public ScalarIndex<T> {
     std::optional<T>
     Reverse_Lookup(size_t offset) const override;
 
+    ALWAYS_INLINE bool
+    TryGetValueByRowOffsetFast(size_t offset, T* value) const {
+        if (value == nullptr || !is_built_ ||
+            offset >= idx_to_offsets_.size()) {
+            return false;
+        }
+        if (!valid_bitset_[offset]) {
+            return false;
+        }
+        *value = operator[](idx_to_offsets_[offset]).a_;
+        return true;
+    }
+
     size_t
     GetFirstGreaterEqualOffsets(const T& value,
                                 size_t limit,
