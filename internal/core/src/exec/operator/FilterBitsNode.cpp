@@ -243,14 +243,18 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
                   "cardinal expr downpush only supports id >= threshold or "
                   "pk % P < T demo expression");
     }
-    auto primary_field_id = segment->get_schema().get_primary_field_id();
-    if (!primary_field_id.has_value() ||
-        arith_expr->column_.field_id_ != primary_field_id.value() ||
-        arith_expr->column_.data_type_ != DataType::INT64 ||
+    if (arith_expr->column_.data_type_ != DataType::INT64 ||
         arith_expr->column_.element_level_) {
         ThrowInfo(UnexpectedError,
-                  "cardinal expr downpush mod demo requires INT64 primary "
+                  "cardinal expr downpush mod demo requires non-element INT64 "
                   "field");
+    }
+    auto& mod_field_meta = segment->get_schema()[arith_expr->column_.field_id_];
+    if (mod_field_meta.get_name().get() != "id") {
+        ThrowInfo(UnexpectedError,
+                  "cardinal expr downpush mod demo only supports id % P < T, "
+                  "got field {}",
+                  mod_field_meta.get_name().get());
     }
     if (arith_expr->arith_op_type_ != proto::plan::ArithOpType::Mod ||
         arith_expr->op_type_ != proto::plan::OpType::LessThan) {
@@ -288,7 +292,7 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
     }
 
     CardinalExprDownpushInfo info;
-    info.field_id_ = primary_field_id.value();
+    info.field_id_ = arith_expr->column_.field_id_;
     info.predicate_ = CardinalExprDownpushPredicate::ModLessThan;
     info.modulus_ = modulus;
     info.threshold_ = threshold;
