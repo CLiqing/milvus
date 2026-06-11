@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -418,6 +419,11 @@ func storeCipher(cipher hook.Cipher) {
 
 func initCipher() error {
 	storeCipher(nil)
+
+	if os.Getenv("CODEX_SKIP_CIPHER_PLUGIN") == "1" {
+		log.Warn("skip cipher plugin for codex downpush experiment")
+		return nil
+	}
 
 	pathGo := paramtable.GetCipherParams().SoPathGo.GetValue()
 	pathCpp := paramtable.GetCipherParams().SoPathCpp.GetValue()

@@ -134,6 +134,28 @@ class ScalarIndexSort : public ScalarIndex<T> {
         return true;
     }
 
+    struct FastRowValueAccessor {
+        const int32_t* row_to_sorted_offsets = nullptr;
+        const IndexStructure<T>* sorted_entries = nullptr;
+        size_t sorted_entry_stride = 0;
+        size_t sorted_value_offset = 0;
+        size_t row_count = 0;
+    };
+
+    std::optional<FastRowValueAccessor>
+    GetFastRowValueAccessor() const {
+        if (!is_built_ || data_ptr_ == nullptr || idx_to_offsets_.empty()) {
+            return std::nullopt;
+        }
+        FastRowValueAccessor accessor;
+        accessor.row_to_sorted_offsets = idx_to_offsets_.data();
+        accessor.sorted_entries = data_ptr_;
+        accessor.sorted_entry_stride = sizeof(IndexStructure<T>);
+        accessor.sorted_value_offset = offsetof(IndexStructure<T>, a_);
+        accessor.row_count = idx_to_offsets_.size();
+        return accessor;
+    }
+
     size_t
     GetFirstGreaterEqualOffsets(const T& value,
                                 size_t limit,

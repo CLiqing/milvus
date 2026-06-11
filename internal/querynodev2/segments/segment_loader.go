@@ -799,7 +799,19 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 	return bfSets, nil
 }
 
-func separateIndexAndBinlog(loadInfo *querypb.SegmentLoadInfo) (map[int64]*IndexedFieldInfo, []*datapb.FieldBinlog) {
+func shouldKeepCardinalDownpushRawField(schema *schemapb.CollectionSchema, fieldID int64) bool {
+	if schema == nil {
+		return false
+	}
+	for _, field := range schema.GetFields() {
+		if field.GetFieldID() == fieldID {
+			return field.GetName() == "id" && field.GetDataType() == schemapb.DataType_Int64
+		}
+	}
+	return false
+}
+
+func separateIndexAndBinlog(loadInfo *querypb.SegmentLoadInfo, schema *schemapb.CollectionSchema) (map[int64]*IndexedFieldInfo, []*datapb.FieldBinlog) {
 	fieldID2IndexInfo := make(map[int64][]*querypb.FieldIndexInfo)
 	for _, indexInfo := range loadInfo.IndexInfos {
 		if len(indexInfo.GetIndexFilePaths()) > 0 {
@@ -824,7 +836,7 @@ func separateIndexAndBinlog(loadInfo *querypb.SegmentLoadInfo) (map[int64]*Index
 				}
 				indexedFieldInfos[index.IndexID] = fieldInfo
 			}
-			if preferFieldData {
+			if preferFieldData || shouldKeepCardinalDownpushRawField(schema, fieldID) {
 				fieldBinlogs = append(fieldBinlogs, fieldBinlog)
 			}
 		} else {
@@ -924,7 +936,7 @@ func separateLoadInfoV2(loadInfo *querypb.SegmentLoadInfo, schema *schemapb.Coll
 						}
 						indexedFieldInfos[indexInfo.IndexID] = fieldInfo
 					}
-					if preferFieldData {
+					if preferFieldData || shouldKeepCardinalDownpushRawField(schema, fieldID) {
 						fieldBinlogs = append(fieldBinlogs, fieldBinlog)
 					}
 				} else {
@@ -949,7 +961,7 @@ func separateLoadInfoV2(loadInfo *querypb.SegmentLoadInfo, schema *schemapb.Coll
 					}
 					indexedFieldInfos[indexInfo.IndexID] = fieldInfo
 				}
-				if preferFieldData {
+				if preferFieldData || shouldKeepCardinalDownpushRawField(schema, fieldID) {
 					fieldBinlogs = append(fieldBinlogs, fieldBinlog)
 				}
 			} else {
@@ -1825,7 +1837,8 @@ func estimateLogicalResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			// could skip binlog or
 			// could be missing for new field or storage v2 group 0
 			if estimateResult.HasRawData &&
-				!paramtable.Get().QueryNodeCfg.PreferFieldDataWhenIndexHasRawData.GetAsBool() {
+				!paramtable.Get().QueryNodeCfg.PreferFieldDataWhenIndexHasRawData.GetAsBool() &&
+				!shouldKeepCardinalDownpushRawField(schema, fieldID) {
 				delete(id2Binlogs, fieldID)
 				continue
 			}
@@ -2031,7 +2044,8 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			// could skip binlog or
 			// could be missing for new field or storage v2 group 0
 			if estimateResult.HasRawData &&
-				!paramtable.Get().QueryNodeCfg.PreferFieldDataWhenIndexHasRawData.GetAsBool() {
+				!paramtable.Get().QueryNodeCfg.PreferFieldDataWhenIndexHasRawData.GetAsBool() &&
+				!shouldKeepCardinalDownpushRawField(schema, fieldID) {
 				delete(id2Binlogs, fieldID)
 				continue
 			}

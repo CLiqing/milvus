@@ -435,7 +435,7 @@ func NewSegment(ctx context.Context,
 
 func (s *LocalSegment) initializeSegment() error {
 	loadInfo := s.loadInfo.Load()
-	indexedFieldInfos, fieldBinlogs := separateIndexAndBinlog(loadInfo)
+	indexedFieldInfos, fieldBinlogs := separateIndexAndBinlog(loadInfo, s.collection.Schema())
 	schemaHelper, _ := typeutil.CreateSchemaHelper(s.collection.Schema())
 
 	for _, info := range indexedFieldInfos {
@@ -1523,7 +1523,7 @@ func (s *LocalSegment) RemoveFieldFile(fieldId int64) {
 
 func (s *LocalSegment) RemoveUnusedFieldFiles() error {
 	schema := s.collection.Schema()
-	indexInfos, _ := separateIndexAndBinlog(s.LoadInfo())
+	indexInfos, _ := separateIndexAndBinlog(s.LoadInfo(), schema)
 	for _, indexInfo := range indexInfos {
 		need, err := s.indexNeedLoadRawData(schema, indexInfo)
 		if err != nil {

@@ -5348,10 +5348,15 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
 
         bool has_warmup_setting = false;
         std::string aggregated_warmup_policy = "disable";
+        bool keep_cardinal_downpush_raw_field = false;
         for (const auto& child_field_id : fields_to_load) {
             auto& field_meta = schema_->operator[](child_field_id);
             if (IsVectorDataType(field_meta.get_data_type())) {
                 is_vector = true;
+            }
+            if (field_meta.get_name().get() == "id" &&
+                field_meta.get_data_type() == DataType::INT64) {
+                keep_cardinal_downpush_raw_field = true;
             }
 
             // if field has mmap setting, use it
@@ -5389,7 +5394,8 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
         // Normally we skip loading field data when the index already carries
         // raw data, but prefer_field_data_when_index_has_raw_data opts into
         // keeping both resident so retrieve can read the column directly.
-        if (index_has_raw_data && !prefer_field_data) {
+        if (index_has_raw_data && !prefer_field_data &&
+            !keep_cardinal_downpush_raw_field) {
             LOG_INFO(
                 "Skip loading fielddata for segment {} group {} because "
                 "index "

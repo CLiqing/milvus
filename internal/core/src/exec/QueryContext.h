@@ -50,6 +50,7 @@ struct CardinalExprDownpushInfo {
     int64_t modulus_{0};
     int64_t threshold_{0};
     int64_t filtered_out_count_{0};
+    bool diag_{false};
 };
 
 class BaseConfig {

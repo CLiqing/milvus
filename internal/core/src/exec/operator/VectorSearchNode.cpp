@@ -63,6 +63,7 @@ struct CardinalExprDownpushSearchContext {
         CardinalExprDownpushPredicate::ModLessThan};
     int64_t modulus_{0};
     int64_t threshold_{0};
+    bool diag_{false};
     std::string value_source_{"uninitialized"};
 
     bool
@@ -158,6 +159,48 @@ struct CardinalExprDownpushSearchContext {
     HasFirstValidProvider() const {
         return predicate_ == CardinalExprDownpushPredicate::Int64GreaterEqual;
     }
+
+    bool
+    TryBuildExtraScalarInt64PredicateFilter(
+        knowhere::BitsetView::ExtraScalarInt64PredicateFilter* filter) const {
+        if (filter == nullptr) {
+            return false;
+        }
+        switch (predicate_) {
+            case CardinalExprDownpushPredicate::ModLessThan:
+                filter->op = knowhere::BitsetView::
+                    ExtraScalarInt64PredicateOp::kModLessThan;
+                filter->arg0 = modulus_;
+                filter->arg1 = threshold_;
+                break;
+            case CardinalExprDownpushPredicate::Int64GreaterEqual:
+                filter->op = knowhere::BitsetView::
+                    ExtraScalarInt64PredicateOp::kGreaterEqual;
+                filter->arg0 = threshold_;
+                filter->arg1 = 0;
+                break;
+        }
+        if (!chunk_data_.empty() && !chunk_offsets_.empty()) {
+            filter->chunk_values = chunk_data_.data();
+            filter->chunk_offsets = chunk_offsets_.data();
+            filter->num_chunks = chunk_data_.size();
+            filter->row_count = static_cast<size_t>(chunk_offsets_.back());
+            return true;
+        }
+        if (scalar_sort_index_ == nullptr) {
+            return false;
+        }
+        auto accessor = scalar_sort_index_->GetFastRowValueAccessor();
+        if (!accessor.has_value()) {
+            return false;
+        }
+        filter->row_to_sorted_offsets = accessor->row_to_sorted_offsets;
+        filter->sorted_entries = accessor->sorted_entries;
+        filter->sorted_entry_stride = accessor->sorted_entry_stride;
+        filter->sorted_value_offset = accessor->sorted_value_offset;
+        filter->row_count = accessor->row_count;
+        return true;
+    }
 };
 
 bool
@@ -190,6 +233,7 @@ BuildCardinalExprDownpushSearchContext(
     ctx->predicate_ = info.predicate_;
     ctx->modulus_ = info.modulus_;
     ctx->threshold_ = info.threshold_;
+    ctx->diag_ = info.diag_;
     ctx->row_count_ = segment->get_row_count();
 
     auto indexes = segment->PinIndex(op_context, info.field_id_);
@@ -206,26 +250,36 @@ BuildCardinalExprDownpushSearchContext(
     }
 
     if (!segment->HasFieldData(info.field_id_)) {
+        if (info.predicate_ ==
+            CardinalExprDownpushPredicate::ModLessThan) {
+            ThrowInfo(
+                UnexpectedError,
+                "cardinal expr downpush mod filter requires raw field data "
+                "for field {}",
+                info.field_id_.get());
+        }
         if (ctx->scalar_index_ == nullptr) {
             return nullptr;
         }
         ctx->value_source_ = ctx->scalar_sort_index_ != nullptr
                                  ? "scalar_sort_fast_accessor"
                                  : "scalar_index_reverse_lookup";
-        LOG_INFO(
-            "CodexCardinalExprDownpushContext field_id={} row_count={} "
-            "predicate={} modulus={} threshold={} filtered_out_count={} "
-            "has_field_data=false scalar_index={} scalar_sort_index={} "
-            "value_source={}",
-            info.field_id_.get(),
-            ctx->row_count_,
-            static_cast<int>(ctx->predicate_),
-            ctx->modulus_,
-            ctx->threshold_,
-            info.filtered_out_count_,
-            ctx->scalar_index_ != nullptr,
-            ctx->scalar_sort_index_ != nullptr,
-            ctx->value_source_);
+        if (ctx->diag_) {
+            LOG_INFO(
+                "CodexCardinalExprDownpushContext field_id={} row_count={} "
+                "predicate={} modulus={} threshold={} filtered_out_count={} "
+                "has_field_data=false scalar_index={} scalar_sort_index={} "
+                "value_source={}",
+                info.field_id_.get(),
+                ctx->row_count_,
+                static_cast<int>(ctx->predicate_),
+                ctx->modulus_,
+                ctx->threshold_,
+                info.filtered_out_count_,
+                ctx->scalar_index_ != nullptr,
+                ctx->scalar_sort_index_ != nullptr,
+                ctx->value_source_);
+        }
         return ctx;
     }
 
@@ -249,22 +303,24 @@ BuildCardinalExprDownpushSearchContext(
         ctx->pins_.push_back(std::move(pin));
     }
     ctx->value_source_ = "raw_field_chunks";
-    LOG_INFO(
-        "CodexCardinalExprDownpushContext field_id={} row_count={} "
-        "predicate={} modulus={} threshold={} filtered_out_count={} "
-        "has_field_data=true scalar_index={} scalar_sort_index={} "
-        "num_chunks={} chunk_rows={} value_source={}",
-        info.field_id_.get(),
-        ctx->row_count_,
-        static_cast<int>(ctx->predicate_),
-        ctx->modulus_,
-        ctx->threshold_,
-        info.filtered_out_count_,
-        ctx->scalar_index_ != nullptr,
-        ctx->scalar_sort_index_ != nullptr,
-        num_chunks,
-        ctx->chunk_offsets_.empty() ? 0 : ctx->chunk_offsets_.back(),
-        ctx->value_source_);
+    if (ctx->diag_) {
+        LOG_INFO(
+            "CodexCardinalExprDownpushContext field_id={} row_count={} "
+            "predicate={} modulus={} threshold={} filtered_out_count={} "
+            "has_field_data=true scalar_index={} scalar_sort_index={} "
+            "num_chunks={} chunk_rows={} value_source={}",
+            info.field_id_.get(),
+            ctx->row_count_,
+            static_cast<int>(ctx->predicate_),
+            ctx->modulus_,
+            ctx->threshold_,
+            info.filtered_out_count_,
+            ctx->scalar_index_ != nullptr,
+            ctx->scalar_sort_index_ != nullptr,
+            num_chunks,
+            ctx->chunk_offsets_.empty() ? 0 : ctx->chunk_offsets_.back(),
+            ctx->value_source_);
+    }
     return ctx;
 }
 
@@ -420,17 +476,43 @@ PhyVectorSearchNode::GetOutput() {
             ThrowInfo(UnexpectedError,
                       "failed to build cardinal expr downpush search context");
         }
-        LOG_INFO(
-            "CodexCardinalExprDownpushInstall field_id={} row_count={} "
-            "filtered_out_count={} value_source={}",
-            downpush_info->field_id_.get(),
-            downpush_ctx->row_count_,
-            downpush_info->filtered_out_count_,
-            downpush_ctx->value_source_);
-        search_view.set_extra_filter(downpush_ctx.get(),
-                                     CardinalExprDownpushFilteredOut,
-                                     downpush_info->filtered_out_count_,
-                                     nullptr);
+        if (downpush_ctx->diag_) {
+            LOG_INFO(
+                "CodexCardinalExprDownpushInstall field_id={} row_count={} "
+                "filtered_out_count={} value_source={}",
+                downpush_info->field_id_.get(),
+                downpush_ctx->row_count_,
+                downpush_info->filtered_out_count_,
+                downpush_ctx->value_source_);
+        }
+        search_view.set_extra_filter_diag(downpush_ctx->diag_);
+        knowhere::BitsetView::ExtraScalarInt64PredicateFilter
+            scalar_predicate_filter;
+        if (downpush_ctx->TryBuildExtraScalarInt64PredicateFilter(
+                &scalar_predicate_filter)) {
+            search_view.set_extra_scalar_int64_predicate_filter(
+                scalar_predicate_filter, downpush_info->filtered_out_count_);
+            if (downpush_ctx->diag_) {
+                LOG_INFO(
+                    "CodexCardinalExprDownpushInstallScalarPredicate "
+                    "field_id={} row_count={} op={} arg0={} arg1={} "
+                    "filtered_out_count={}",
+                    downpush_info->field_id_.get(),
+                    scalar_predicate_filter.row_count,
+                    static_cast<int>(scalar_predicate_filter.op),
+                    scalar_predicate_filter.arg0,
+                    scalar_predicate_filter.arg1,
+                    downpush_info->filtered_out_count_);
+            }
+        } else {
+            search_view.set_extra_filter(
+                downpush_ctx.get(),
+                CardinalExprDownpushFilteredOut,
+                downpush_info->filtered_out_count_,
+                downpush_ctx->HasFirstValidProvider()
+                    ? CardinalExprDownpushFirstValid
+                    : nullptr);
+        }
     }
 
     // Single search + metrics path

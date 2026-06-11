@@ -54,6 +54,7 @@ constexpr const char* kCardinalExprFilteredOutCountParam =
     "cardinal_expr_filtered_out_count";
 constexpr const char* kCardinalExprFilterRatioParam =
     "cardinal_expr_filter_ratio";
+constexpr const char* kCardinalExprDiagParam = "cardinal_expr_diag";
 
 std::string
 BuildExprCacheKey(const plan::FilterBitsNode& filter,
@@ -142,8 +143,16 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
         search_params, kCardinalExprFilteredOutCountParam);
     auto filter_ratio =
         GetJsonNumber<double>(search_params, kCardinalExprFilterRatioParam);
+    auto diag_enabled = GetJsonBool(search_params, kCardinalExprDiagParam);
 
-    auto set_filtered_count = [&](CardinalExprDownpushInfo& info) {
+    auto set_filtered_count = [&](CardinalExprDownpushInfo& info,
+                                  bool prefer_ratio = false) {
+        if (prefer_ratio && filter_ratio.has_value()) {
+            auto ratio = std::clamp<double>(filter_ratio.value(), 0.0, 1.0);
+            info.filtered_out_count_ = std::clamp<int64_t>(
+                std::llround(active_count * ratio), 0, active_count);
+            return;
+        }
         if (filtered_out_count.has_value()) {
             info.filtered_out_count_ = std::clamp<int64_t>(
                 filtered_out_count.value(), 0, active_count);
@@ -175,13 +184,15 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
             }
             auto count = std::clamp<int64_t>(
                 scalar_sort_index->CountLessThan(threshold), 0, active_count);
-            LOG_INFO(
-                "CodexCardinalExprDownpushFilteredCount field_id={} "
-                "threshold={} active_count={} filtered_out_count={}",
-                field_id.get(),
-                threshold,
-                active_count,
-                count);
+            if (diag_enabled) {
+                LOG_INFO(
+                    "CodexCardinalExprDownpushFilteredCount field_id={} "
+                    "threshold={} active_count={} filtered_out_count={}",
+                    field_id.get(),
+                    threshold,
+                    active_count,
+                    count);
+            }
             return count;
         }
         ThrowInfo(UnexpectedError,
@@ -230,6 +241,7 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
         info.field_id_ = unary_expr->column_.field_id_;
         info.predicate_ = CardinalExprDownpushPredicate::Int64GreaterEqual;
         info.threshold_ = threshold;
+        info.diag_ = diag_enabled;
         info.filtered_out_count_ =
             count_id_less_than(info.field_id_, threshold);
         return info;
@@ -296,8 +308,9 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
     info.predicate_ = CardinalExprDownpushPredicate::ModLessThan;
     info.modulus_ = modulus;
     info.threshold_ = threshold;
+    info.diag_ = diag_enabled;
     require_estimated_filtered_count();
-    set_filtered_count(info);
+    set_filtered_count(info, true);
     return info;
 }
 
