@@ -36,8 +36,10 @@ class BitsetView : public knowhere::BitsetView {
         : knowhere::BitsetView(value) {     // NOLINT
     }
 
-    BitsetView(const uint8_t* data, size_t num_bits)
-        : knowhere::BitsetView(data, num_bits) {  // NOLINT
+    BitsetView(const uint8_t* data,
+               size_t num_bits,
+               size_t num_filtered_out_bits = 0)
+        : knowhere::BitsetView(data, num_bits, num_filtered_out_bits) {  // NOLINT
     }
 
     BitsetView(const BitsetType& bitset)  // NOLINT

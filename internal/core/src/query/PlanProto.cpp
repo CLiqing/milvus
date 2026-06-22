@@ -105,6 +105,8 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
                 search_info.iterative_filter_execution = false;
             } else if (query_info_proto.hints() == ITERATIVE_FILTER) {
                 search_info.iterative_filter_execution = true;
+            } else if (query_info_proto.hints() == FILTER_RATIO_ESTIMATOR) {
+                search_info.filter_ratio_estimator_execution = true;
             } else {
                 // check if hints is valid
                 ThrowInfo(ConfigInvalid,
@@ -114,12 +116,43 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
         } else if (search_info.search_params_.contains(HINTS)) {
             if (search_info.search_params_[HINTS] == ITERATIVE_FILTER) {
                 search_info.iterative_filter_execution = true;
+            } else if (search_info.search_params_[HINTS] ==
+                       FILTER_RATIO_ESTIMATOR) {
+                search_info.filter_ratio_estimator_execution = true;
             } else {
                 // check if hints is valid
                 ThrowInfo(ConfigInvalid,
                           "hints: {} not supported",
                           search_info.search_params_[HINTS].dump());
             }
+        }
+    }
+
+    if (search_info.search_params_.contains(FILTER_RATIO_ESTIMATOR_SAMPLE_SIZE)) {
+        auto sample_size =
+            search_info.search_params_[FILTER_RATIO_ESTIMATOR_SAMPLE_SIZE]
+                .get<int64_t>();
+        if (sample_size <= 0) {
+            ThrowInfo(ConfigInvalid,
+                      "{} must be positive, got {}",
+                      FILTER_RATIO_ESTIMATOR_SAMPLE_SIZE,
+                      sample_size);
+        }
+        search_info.filter_ratio_estimator_sample_size = sample_size;
+    }
+    if (search_info.search_params_.contains(FILTER_RATIO_ESTIMATOR_DEBUG)) {
+        const auto& value =
+            search_info.search_params_[FILTER_RATIO_ESTIMATOR_DEBUG];
+        if (value.is_boolean()) {
+            search_info.filter_ratio_estimator_debug = value.get<bool>();
+        } else if (value.is_string()) {
+            auto str = value.get<std::string>();
+            search_info.filter_ratio_estimator_debug =
+                str == "true" || str == "1";
+        } else {
+            ThrowInfo(ConfigInvalid,
+                      "{} must be boolean or string boolean",
+                      FILTER_RATIO_ESTIMATOR_DEBUG);
         }
     }
 

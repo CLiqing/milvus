@@ -440,9 +440,30 @@ PhyVectorSearchNode::GetOutput() {
             return input_;
         }
 
+        const auto& filter_ratio_estimate =
+            query_context_->get_filter_ratio_estimate();
+        auto estimated_filtered_out_count =
+            filter_ratio_estimate.available
+                ? static_cast<size_t>(
+                      filter_ratio_estimate.estimated_filtered_out_count)
+                : 0;
         // TODO: uniform knowhere BitsetView and milvus BitsetView
         search_view = milvus::BitsetView((uint8_t*)col_input->GetRawData(),
-                                         col_input->size());
+                                         col_input->size(),
+                                         estimated_filtered_out_count);
+        if (filter_ratio_estimate.available &&
+            query_context_->get_search_info().filter_ratio_estimator_debug) {
+            LOG_INFO(
+                "filter ratio estimator passed to vector search: "
+                "segment_id={}, sample_count={}, "
+                "estimated_filtered_out_count={}, "
+                "estimated_filter_out_ratio={:.6f}, cost_us={:.3f}",
+                segment_ != nullptr ? segment_->get_segment_id() : 0,
+                filter_ratio_estimate.sample_count,
+                filter_ratio_estimate.estimated_filtered_out_count,
+                filter_ratio_estimate.estimated_filter_out_ratio,
+                filter_ratio_estimate.cost_us);
+        }
         data_cnt = search_view.size();
     }
 

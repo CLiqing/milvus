@@ -70,6 +70,146 @@ BuildExprCacheKey(const plan::FilterBitsNode& filter,
     return key;
 }
 
+uint64_t
+SplitMix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+OffsetVector
+BuildSampleOffsets(int64_t active_count,
+                   int64_t sample_size,
+                   int64_t segment_id) {
+    auto real_sample_size = std::min(active_count, sample_size);
+    OffsetVector offsets;
+    offsets.reserve(real_sample_size);
+    auto seed = static_cast<uint64_t>(segment_id) ^
+                (static_cast<uint64_t>(active_count) << 1);
+    for (int64_t i = 0; i < real_sample_size; ++i) {
+        offsets.push_back(
+            static_cast<int32_t>(SplitMix64(seed + i) % active_count));
+    }
+    return offsets;
+}
+
+QueryContext::FilterRatioEstimate
+EstimateFilterRatioBySample(QueryContext* query_context,
+                            ExprSet* exprs,
+                            ExecContext* exec_context) {
+    QueryContext::FilterRatioEstimate estimate;
+    if (query_context == nullptr || exprs == nullptr || exec_context == nullptr) {
+        return estimate;
+    }
+
+    auto search_info = query_context->get_search_info();
+    if (!search_info.filter_ratio_estimator_execution) {
+        return estimate;
+    }
+
+    auto active_count = query_context->get_active_count();
+    if (active_count <= 0) {
+        estimate.available = true;
+        return estimate;
+    }
+
+    AssertInfo(exprs->size() == 1 && exprs->expr(0) != nullptr,
+               "filter ratio estimator expects exactly one root expression");
+    AssertInfo(exprs->expr(0)->SupportOffsetInput(),
+               "filter ratio estimator requires expression support offset "
+               "input: {}",
+               exprs->expr(0)->ToString());
+
+    auto segment = query_context->get_segment();
+    auto segment_id = segment != nullptr ? segment->get_segment_id() : 0;
+    auto offsets = BuildSampleOffsets(
+        active_count,
+        search_info.filter_ratio_estimator_sample_size,
+        segment_id);
+
+    std::vector<VectorPtr> sample_results;
+    EvalCtx sample_eval_ctx(exec_context, &offsets);
+    auto estimate_start = std::chrono::high_resolution_clock::now();
+    exprs->Eval(0, 1, true, sample_eval_ctx, sample_results);
+    auto estimate_end = std::chrono::high_resolution_clock::now();
+
+    AssertInfo(sample_results.size() == 1 && sample_results[0] != nullptr,
+               "filter ratio estimator result should be size one and not "
+               "be nullptr");
+    auto col_vec = std::dynamic_pointer_cast<ColumnVector>(sample_results[0]);
+    AssertInfo(col_vec && col_vec->IsBitmap(),
+               "filter ratio estimator result should be bitmap ColumnVector");
+    AssertInfo(col_vec->size() == offsets.size(),
+               "filter ratio estimator result size mismatch: result={}, "
+               "sample={}",
+               col_vec->size(),
+               offsets.size());
+
+    TargetBitmapView pass_view(col_vec->GetRawData(), col_vec->size());
+    auto pass_count = static_cast<int64_t>(pass_view.count());
+    auto sample_count = static_cast<int64_t>(offsets.size());
+    auto sample_filtered_count = sample_count - pass_count;
+    auto estimated_filtered_count =
+        sample_count > 0
+            ? static_cast<int64_t>(
+                  (static_cast<double>(sample_filtered_count) /
+                   static_cast<double>(sample_count)) *
+                      static_cast<double>(active_count) +
+                  0.5)
+            : 0;
+
+    estimate.available = true;
+    estimate.sample_count = sample_count;
+    estimate.estimated_filtered_out_count =
+        std::clamp<int64_t>(estimated_filtered_count, 0, active_count);
+    estimate.estimated_filter_out_ratio =
+        active_count > 0
+            ? static_cast<double>(estimate.estimated_filtered_out_count) /
+                  static_cast<double>(active_count)
+            : 0.0;
+    estimate.cost_us =
+        std::chrono::duration<double, std::micro>(estimate_end -
+                                                  estimate_start)
+            .count();
+    return estimate;
+}
+
+void
+LogFilterRatioEstimate(QueryContext* query_context,
+                       int64_t exact_filtered_out_count,
+                       int64_t total_count) {
+    if (query_context == nullptr) {
+        return;
+    }
+    if (!query_context->get_search_info().filter_ratio_estimator_debug) {
+        return;
+    }
+    const auto& estimate = query_context->get_filter_ratio_estimate();
+    if (!estimate.available) {
+        return;
+    }
+    auto exact_ratio = total_count > 0
+                           ? static_cast<double>(exact_filtered_out_count) /
+                                 static_cast<double>(total_count)
+                           : 0.0;
+    LOG_INFO(
+        "filter ratio estimator: segment_id={}, sample_count={}, "
+        "estimated_filtered_out_count={}, exact_filtered_out_count={}, "
+        "estimated_filter_out_ratio={:.6f}, exact_filter_out_ratio={:.6f}, "
+        "abs_error={:.6f}, cost_us={:.3f}",
+        query_context->get_segment() != nullptr
+            ? query_context->get_segment()->get_segment_id()
+            : 0,
+        estimate.sample_count,
+        estimate.estimated_filtered_out_count,
+        exact_filtered_out_count,
+        estimate.estimated_filter_out_ratio,
+        exact_ratio,
+        std::abs(estimate.estimated_filter_out_ratio - exact_ratio),
+        estimate.cost_us);
+}
+
 template <typename T>
 std::optional<T>
 GetJsonNumber(const knowhere::Json& params, const char* key) {
@@ -144,6 +284,12 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
     auto filter_ratio =
         GetJsonNumber<double>(search_params, kCardinalExprFilterRatioParam);
     auto diag_enabled = GetJsonBool(search_params, kCardinalExprDiagParam);
+    const auto& estimate = query_context->get_filter_ratio_estimate();
+    if (!filtered_out_count.has_value() && !filter_ratio.has_value() &&
+        estimate.available) {
+        filtered_out_count = estimate.estimated_filtered_out_count;
+        filter_ratio = estimate.estimated_filter_out_ratio;
+    }
 
     auto set_filtered_count = [&](CardinalExprDownpushInfo& info,
                                   bool prefer_ratio = false) {
@@ -242,8 +388,12 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
         info.predicate_ = CardinalExprDownpushPredicate::Int64GreaterEqual;
         info.threshold_ = threshold;
         info.diag_ = diag_enabled;
-        info.filtered_out_count_ =
-            count_id_less_than(info.field_id_, threshold);
+        if (filtered_out_count.has_value() || filter_ratio.has_value()) {
+            set_filtered_count(info, true);
+        } else {
+            info.filtered_out_count_ =
+                count_id_less_than(info.field_id_, threshold);
+        }
         return info;
     }
 
@@ -333,6 +483,10 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
 
+    auto filter_ratio_estimate =
+        EstimateFilterRatioBySample(query_context_, exprs_.get(), exec_context);
+    query_context_->set_filter_ratio_estimate(filter_ratio_estimate);
+
     auto downpush_info = TryBuildCardinalExprDownpushInfo(
         filter->filter(), query_context_, need_process_rows_);
     if (downpush_info.has_value()) {
@@ -401,6 +555,10 @@ PhyFilterBitsNode::GetOutput() {
             cached.result != nullptr &&
             cached.result->size() == need_process_rows_) {
             num_processed_rows_ = need_process_rows_;
+            TargetBitmapView cached_view(*cached.result);
+            LogFilterRatioEstimate(query_context_,
+                                   static_cast<int64_t>(cached_view.count()),
+                                   static_cast<int64_t>(need_process_rows_));
             std::vector<VectorPtr> col_res;
             col_res.push_back(std::make_shared<ColumnVector>(
                 cached.result->clone(),
@@ -458,6 +616,10 @@ PhyFilterBitsNode::GetOutput() {
             v.active_count = need_process_rows_;
             ExprResCacheManager::Instance().Put(key, v);
         }
+
+        LogFilterRatioEstimate(query_context_,
+                               static_cast<int64_t>(view.count()),
+                               static_cast<int64_t>(col_vec_size));
 
         std::vector<VectorPtr> col_res;
         col_res.push_back(std::move(results_[0]));
@@ -519,6 +681,10 @@ PhyFilterBitsNode::GetOutput() {
         v.active_count = need_process_rows_;
         ExprResCacheManager::Instance().Put(key, v);
     }
+
+    LogFilterRatioEstimate(query_context_,
+                           static_cast<int64_t>(bitset.count()),
+                           static_cast<int64_t>(need_process_rows_));
 
     // num_processed_rows_ = need_process_rows_;
     std::vector<VectorPtr> col_res;

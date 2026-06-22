@@ -434,6 +434,24 @@ class QueryContext : public Context {
         return cardinal_expr_downpush_info_;
     }
 
+    struct FilterRatioEstimate {
+        bool available{false};
+        int64_t sample_count{0};
+        int64_t estimated_filtered_out_count{0};
+        double estimated_filter_out_ratio{0.0};
+        double cost_us{0.0};
+    };
+
+    void
+    set_filter_ratio_estimate(FilterRatioEstimate estimate) {
+        filter_ratio_estimate_ = estimate;
+    }
+
+    const FilterRatioEstimate&
+    get_filter_ratio_estimate() const {
+        return filter_ratio_estimate_;
+    }
+
  private:
     folly::Executor* executor_;
     //folly::Executor::KeepAlive<> executor_keepalive_;
@@ -486,6 +504,7 @@ class QueryContext : public Context {
     bool enable_sub_expr_cache_write_ = true;
 
     std::optional<CardinalExprDownpushInfo> cardinal_expr_downpush_info_;
+    FilterRatioEstimate filter_ratio_estimate_;
 };
 
 // Represent the state of one thread of query execution.
