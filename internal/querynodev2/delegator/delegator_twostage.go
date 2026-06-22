@@ -136,7 +136,6 @@ func (sd *shardDelegator) twoStageSearch(
 	beforeReq := req.GetReq()
 	beforeTopK := beforeReq.GetTopk()
 	beforeNq := beforeReq.GetNq()
-	beforeSearchParams := beforeReq.GetSearchParams()
 	beforeIsTopkReduce := beforeReq.GetIsTopkReduce()
 	optimizedReq, err := optimizers.OptimizeSearchParams(ctx, req, sd.queryHook, effectiveSegmentNum, isSecondStageSearch, sd.getVectorFieldDim)
 	if err != nil {
@@ -146,7 +145,7 @@ func (sd *shardDelegator) twoStageSearch(
 	afterReq := optimizedReq.GetReq()
 	if beforeIsTopkReduce || afterReq.GetIsTopkReduce() {
 		if diagSeq, ok := codexQNOptimizeShouldLogDiag(); ok {
-			log.Ctx(ctx).Warn("CODEX retry diagnosis: querynode two-stage OptimizeSearchParams finished",
+			log.Warn("CODEX retry diagnosis: querynode two-stage OptimizeSearchParams finished",
 				zap.Uint64("diagSeq", diagSeq),
 				zap.Bool("isSecondStageSearch", isSecondStageSearch),
 				zap.Int("effectiveSegmentNum", effectiveSegmentNum),
@@ -155,9 +154,7 @@ func (sd *shardDelegator) twoStageSearch(
 				zap.Int64("beforeNq", beforeNq),
 				zap.Int64("afterNq", afterReq.GetNq()),
 				zap.Int64("beforeTopK", beforeTopK),
-				zap.Int64("afterTopK", afterReq.GetTopk()),
-				zap.String("beforeSearchParams", beforeSearchParams),
-				zap.String("afterSearchParams", afterReq.GetSearchParams()))
+				zap.Int64("afterTopK", afterReq.GetTopk()))
 		}
 	}
 
