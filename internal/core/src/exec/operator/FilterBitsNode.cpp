@@ -286,11 +286,26 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
     auto diag_enabled = GetJsonBool(search_params, kCardinalExprDiagParam);
     auto graph_walk_filter_ratio_estimator_enabled =
         GetJsonBool(search_params, GRAPH_WALK_FILTER_RATIO_ESTIMATOR);
+    auto graph_walk_diag_enabled =
+        GetJsonBool(search_params, GRAPH_WALK_FILTER_RATIO_ESTIMATOR_DEBUG);
     const auto& estimate = query_context->get_filter_ratio_estimate();
     if (!filtered_out_count.has_value() && !filter_ratio.has_value() &&
         estimate.available) {
         filtered_out_count = estimate.estimated_filtered_out_count;
         filter_ratio = estimate.estimated_filter_out_ratio;
+    }
+
+    if (diag_enabled || graph_walk_diag_enabled) {
+        LOG_INFO(
+            "CodexCardinalExprDownpushBuild begin enabled={} "
+            "graph_walk_estimator={} estimate_available={} "
+            "has_filtered_out_count={} has_filter_ratio={} active_count={}",
+            enabled,
+            graph_walk_filter_ratio_estimator_enabled,
+            estimate.available,
+            filtered_out_count.has_value(),
+            filter_ratio.has_value(),
+            active_count);
     }
 
     auto set_filtered_count = [&](CardinalExprDownpushInfo& info,
@@ -323,6 +338,13 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
 
     auto set_graph_walk_estimator_placeholder = [&](CardinalExprDownpushInfo& info) {
         info.filtered_out_count_ = active_count > 0 ? 1 : 0;
+        if (diag_enabled || graph_walk_diag_enabled) {
+            LOG_INFO(
+                "CodexCardinalExprDownpushBuild graph_walk_placeholder "
+                "active_count={} placeholder_filtered_out_count={}",
+                active_count,
+                info.filtered_out_count_);
+        }
     };
 
     auto count_id_less_than = [&](FieldId field_id, int64_t threshold) {
@@ -403,6 +425,14 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
             info.filtered_out_count_ =
                 count_id_less_than(info.field_id_, threshold);
         }
+        if (diag_enabled || graph_walk_diag_enabled) {
+            LOG_INFO(
+                "CodexCardinalExprDownpushBuild range field_id={} "
+                "threshold={} filtered_out_count={}",
+                info.field_id_.get(),
+                info.threshold_,
+                info.filtered_out_count_);
+        }
         return info;
     }
 
@@ -475,6 +505,15 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
     } else {
         require_estimated_filtered_count();
     }
+    if (diag_enabled || graph_walk_diag_enabled) {
+        LOG_INFO(
+            "CodexCardinalExprDownpushBuild mod field_id={} modulus={} "
+            "threshold={} filtered_out_count={}",
+            info.field_id_.get(),
+            info.modulus_,
+            info.threshold_,
+            info.filtered_out_count_);
+    }
     return info;
 }
 
@@ -506,6 +545,15 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     if (downpush_info.has_value()) {
         cardinal_expr_downpush_enabled_ = true;
         cardinal_expr_downpush_info_ = downpush_info.value();
+        if (GetJsonBool(query_context_->get_search_info().search_params_,
+                        GRAPH_WALK_FILTER_RATIO_ESTIMATOR_DEBUG) ||
+            cardinal_expr_downpush_info_.diag_) {
+            LOG_INFO(
+                "CodexCardinalExprDownpushBuild installed "
+                "filtered_out_count={} need_process_rows={}",
+                cardinal_expr_downpush_info_.filtered_out_count_,
+                need_process_rows_);
+        }
     }
 
     enable_expr_cache_ = query_context_->get_enable_expr_cache();
