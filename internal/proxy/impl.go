@@ -3497,7 +3497,6 @@ func (node *Proxy) HybridSearch(ctx context.Context, request *milvuspb.HybridSea
 					zap.Bool("resultSizeInsufficient", resultSizeInsufficient),
 					zap.Bool("isTopkReduce", isTopkReduce),
 					zap.Bool("enableResultLimitCheck", paramtable.Get().AutoIndexConfig.EnableResultLimitCheck.GetAsBool()),
-					zap.Int64("requestNq", request.GetNq()),
 					zap.Int64("resultTopKBeforeRetry", rsp.GetResults().GetTopK()),
 					zap.Int64s("resultTopksBeforeRetry", rsp.GetResults().GetTopks()),
 					zap.Int64("resultNumQueriesBeforeRetry", rsp.GetResults().GetNumQueries()))
