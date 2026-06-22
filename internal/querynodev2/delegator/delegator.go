@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	syncatomic "sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -69,6 +70,13 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
+
+var codexQNOptimizeDiagCounter uint64
+
+func codexQNOptimizeShouldLogDiag() (uint64, bool) {
+	n := syncatomic.AddUint64(&codexQNOptimizeDiagCounter, 1)
+	return n, n <= 10 || n%1000 == 0
+}
 
 // ShardDelegator is the interface definition.
 type ShardDelegator interface {
@@ -424,10 +432,34 @@ func (sd *shardDelegator) search(ctx context.Context, req *querypb.SearchRequest
 	}
 
 	const isSecondStageSearch = false
+	beforeReq := req.GetReq()
+	beforeTopK := beforeReq.GetTopk()
+	beforeNq := beforeReq.GetNq()
+	beforeSearchParams := beforeReq.GetSearchParams()
+	beforeIsTopkReduce := beforeReq.GetIsTopkReduce()
 	req, err = optimizers.OptimizeSearchParams(ctx, req, sd.queryHook, effectiveSegmentNum, isSecondStageSearch, sd.getVectorFieldDim)
 	if err != nil {
 		log.Warn("failed to optimize search params", zap.Error(err))
 		return nil, err
+	}
+	afterReq := req.GetReq()
+	if beforeIsTopkReduce || afterReq.GetIsTopkReduce() {
+		if diagSeq, ok := codexQNOptimizeShouldLogDiag(); ok {
+			log.Ctx(ctx).Warn("CODEX retry diagnosis: querynode OptimizeSearchParams finished",
+				zap.Uint64("diagSeq", diagSeq),
+				zap.Bool("isSecondStageSearch", isSecondStageSearch),
+				zap.Int("sealedNum", sealedNum),
+				zap.Int("growingNum", len(growing)),
+				zap.Int("effectiveSegmentNum", effectiveSegmentNum),
+				zap.Bool("beforeIsTopkReduce", beforeIsTopkReduce),
+				zap.Bool("afterIsTopkReduce", afterReq.GetIsTopkReduce()),
+				zap.Int64("beforeNq", beforeNq),
+				zap.Int64("afterNq", afterReq.GetNq()),
+				zap.Int64("beforeTopK", beforeTopK),
+				zap.Int64("afterTopK", afterReq.GetTopk()),
+				zap.String("beforeSearchParams", beforeSearchParams),
+				zap.String("afterSearchParams", afterReq.GetSearchParams()))
+		}
 	}
 	return sd.executeSearchSubTasks(ctx, req, sealed, growing, sealedRowCount)
 }

@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -81,6 +82,16 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
+
+var (
+	codexSearchRetryDiagCounter       atomic.Uint64
+	codexHybridSearchRetryDiagCounter atomic.Uint64
+	codexSearchFillDiagCounter        atomic.Uint64
+)
+
+func codexShouldLogDiag(n uint64) bool {
+	return n <= 10 || n%1000 == 0
+}
 
 const moduleName = "Proxy"
 
@@ -3166,9 +3177,39 @@ func (node *Proxy) Search(ctx context.Context, request *milvuspb.SearchRequest) 
 	err2 := retry.Handle(ctx, func() (bool, error) {
 		rsp, resultSizeInsufficient, isTopkReduce, isRecallEvaluation, err = node.search(ctx, request, optimizedSearch, false)
 		if merr.Ok(rsp.GetStatus()) && optimizedSearch && resultSizeInsufficient && isTopkReduce && paramtable.Get().AutoIndexConfig.EnableResultLimitCheck.GetAsBool() {
+			diagSeq := codexSearchRetryDiagCounter.Add(1)
+			if codexShouldLogDiag(diagSeq) {
+				log.Ctx(ctx).Warn("CODEX retry diagnosis: proxy search retry triggered",
+					zap.Uint64("diagSeq", diagSeq),
+					zap.String("dbName", request.GetDbName()),
+					zap.String("collectionName", request.GetCollectionName()),
+					zap.Bool("optimizedSearch", optimizedSearch),
+					zap.Bool("resultSizeInsufficient", resultSizeInsufficient),
+					zap.Bool("isTopkReduce", isTopkReduce),
+					zap.Bool("isRecallEvaluation", isRecallEvaluation),
+					zap.Bool("enableResultLimitCheck", paramtable.Get().AutoIndexConfig.EnableResultLimitCheck.GetAsBool()),
+					zap.Int64("requestNq", request.GetNq()),
+					zap.Int64("resultTopKBeforeRetry", rsp.GetResults().GetTopK()),
+					zap.Int64s("resultTopksBeforeRetry", rsp.GetResults().GetTopks()),
+					zap.Int64("resultNumQueriesBeforeRetry", rsp.GetResults().GetNumQueries()))
+			}
 			// without optimize search
 			optimizedSearch = false
 			rsp, resultSizeInsufficient, isTopkReduce, isRecallEvaluation, err = node.search(ctx, request, optimizedSearch, false)
+			if codexShouldLogDiag(diagSeq) {
+				log.Ctx(ctx).Warn("CODEX retry diagnosis: proxy search retry fallback finished",
+					zap.Uint64("diagSeq", diagSeq),
+					zap.String("dbName", request.GetDbName()),
+					zap.String("collectionName", request.GetCollectionName()),
+					zap.Bool("optimizedSearch", optimizedSearch),
+					zap.Bool("resultSizeInsufficientAfterRetry", resultSizeInsufficient),
+					zap.Bool("isTopkReduceAfterRetry", isTopkReduce),
+					zap.Bool("isRecallEvaluationAfterRetry", isRecallEvaluation),
+					zap.Int64("resultTopKAfterRetry", rsp.GetResults().GetTopK()),
+					zap.Int64s("resultTopksAfterRetry", rsp.GetResults().GetTopks()),
+					zap.Int64("resultNumQueriesAfterRetry", rsp.GetResults().GetNumQueries()),
+					zap.Error(err))
+			}
 			metrics.ProxyRetrySearchCount.WithLabelValues(
 				strconv.FormatInt(paramtable.GetNodeID(), 10),
 				metrics.SearchLabel,
@@ -3446,9 +3487,37 @@ func (node *Proxy) HybridSearch(ctx context.Context, request *milvuspb.HybridSea
 	err2 := retry.Handle(ctx, func() (bool, error) {
 		rsp, resultSizeInsufficient, isTopkReduce, err = node.hybridSearch(ctx, request, optimizedSearch)
 		if merr.Ok(rsp.GetStatus()) && optimizedSearch && resultSizeInsufficient && isTopkReduce && paramtable.Get().AutoIndexConfig.EnableResultLimitCheck.GetAsBool() {
+			diagSeq := codexHybridSearchRetryDiagCounter.Add(1)
+			if codexShouldLogDiag(diagSeq) {
+				log.Ctx(ctx).Warn("CODEX retry diagnosis: proxy hybrid search retry triggered",
+					zap.Uint64("diagSeq", diagSeq),
+					zap.String("dbName", request.GetDbName()),
+					zap.String("collectionName", request.GetCollectionName()),
+					zap.Bool("optimizedSearch", optimizedSearch),
+					zap.Bool("resultSizeInsufficient", resultSizeInsufficient),
+					zap.Bool("isTopkReduce", isTopkReduce),
+					zap.Bool("enableResultLimitCheck", paramtable.Get().AutoIndexConfig.EnableResultLimitCheck.GetAsBool()),
+					zap.Int64("requestNq", request.GetNq()),
+					zap.Int64("resultTopKBeforeRetry", rsp.GetResults().GetTopK()),
+					zap.Int64s("resultTopksBeforeRetry", rsp.GetResults().GetTopks()),
+					zap.Int64("resultNumQueriesBeforeRetry", rsp.GetResults().GetNumQueries()))
+			}
 			// without optimize search
 			optimizedSearch = false
 			rsp, resultSizeInsufficient, isTopkReduce, err = node.hybridSearch(ctx, request, optimizedSearch)
+			if codexShouldLogDiag(diagSeq) {
+				log.Ctx(ctx).Warn("CODEX retry diagnosis: proxy hybrid search retry fallback finished",
+					zap.Uint64("diagSeq", diagSeq),
+					zap.String("dbName", request.GetDbName()),
+					zap.String("collectionName", request.GetCollectionName()),
+					zap.Bool("optimizedSearch", optimizedSearch),
+					zap.Bool("resultSizeInsufficientAfterRetry", resultSizeInsufficient),
+					zap.Bool("isTopkReduceAfterRetry", isTopkReduce),
+					zap.Int64("resultTopKAfterRetry", rsp.GetResults().GetTopK()),
+					zap.Int64s("resultTopksAfterRetry", rsp.GetResults().GetTopks()),
+					zap.Int64("resultNumQueriesAfterRetry", rsp.GetResults().GetNumQueries()),
+					zap.Error(err))
+			}
 			metrics.ProxyRetrySearchCount.WithLabelValues(
 				strconv.FormatInt(paramtable.GetNodeID(), 10),
 				metrics.HybridSearchLabel,

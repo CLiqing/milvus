@@ -738,6 +738,25 @@ func (t *searchTask) fillResult() {
 		}
 	}
 	t.resultSizeInsufficient = resultSizeInsufficient
+	if resultSizeInsufficient {
+		diagSeq := codexSearchFillDiagCounter.Add(1)
+		if codexShouldLogDiag(diagSeq) {
+			log.Ctx(t.ctx).Warn("CODEX retry diagnosis: proxy fillResult marked insufficient",
+				zap.Uint64("diagSeq", diagSeq),
+				zap.String("dbName", t.request.GetDbName()),
+				zap.String("collectionName", t.collectionName),
+				zap.Int64("limit", limit),
+				zap.Int64("requestTopK", t.GetTopk()),
+				zap.Int64("requestOffset", t.GetOffset()),
+				zap.Int64("requestNq", t.GetNq()),
+				zap.Bool("isTopkReduce", t.isTopkReduce),
+				zap.Bool("isRecallEvaluation", t.isRecallEvaluation),
+				zap.Bool("isSearchAggregation", t.aggCtx != nil),
+				zap.Int64("resultTopK", t.result.GetResults().GetTopK()),
+				zap.Int64("resultNumQueries", t.result.GetResults().GetNumQueries()),
+				zap.Int64s("resultTopks", t.result.GetResults().GetTopks()))
+		}
+	}
 	t.result.CollectionName = t.collectionName
 }
 

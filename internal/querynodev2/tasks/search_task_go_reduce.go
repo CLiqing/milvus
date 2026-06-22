@@ -21,6 +21,7 @@ package tasks
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/apache/arrow/go/v17/arrow"
 	"github.com/apache/arrow/go/v17/arrow/array"
@@ -38,6 +39,21 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
 )
+
+var codexQNReduceDiagCounter atomic.Uint64
+
+func codexQNShouldLogDiag(n uint64) bool {
+	return n <= 10 || n%1000 == 0
+}
+
+func codexHasInsufficientTopks(topks []int64, limit int64) bool {
+	for _, topk := range topks {
+		if topk < limit {
+			return true
+		}
+	}
+	return false
+}
 
 // exportSearchResultsAsArrow exports per-segment SearchResults as Arrow DataFrames
 // via the Arrow C Stream Interface (one RecordBatch per NQ).
@@ -273,6 +289,21 @@ func (t *SearchTask) buildReducedResult(
 	// set_top_k(slice_topKs_[slice_index])).
 	searchResultData.TopK = t.originTopks[i]
 	searchResultData.AllSearchCount = allSearchCount
+	if codexHasInsufficientTopks(searchResultData.GetTopks(), t.originTopks[i]) {
+		diagSeq := codexQNReduceDiagCounter.Add(1)
+		if codexQNShouldLogDiag(diagSeq) {
+			log.Ctx(t.ctx).Warn("CODEX retry diagnosis: querynode reduce produced insufficient topks",
+				zap.Uint64("diagSeq", diagSeq),
+				zap.Int("sliceIndex", i),
+				zap.Int64("originNq", t.originNqs[i]),
+				zap.Int64("originTopK", t.originTopks[i]),
+				zap.Int64("resultTopK", searchResultData.GetTopK()),
+				zap.Int64("resultNumQueries", searchResultData.GetNumQueries()),
+				zap.Int64s("resultTopks", searchResultData.GetTopks()),
+				zap.Int64("allSearchCount", allSearchCount),
+				zap.Int("sourceChunks", len(reduceResult.Sources)))
+		}
+	}
 
 	if err := lateMaterializeOutputFields(t.ctx, results, plan, reduceResult.Sources, searchResultData); err != nil {
 		return err
