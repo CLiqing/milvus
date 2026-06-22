@@ -284,6 +284,8 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
     auto filter_ratio =
         GetJsonNumber<double>(search_params, kCardinalExprFilterRatioParam);
     auto diag_enabled = GetJsonBool(search_params, kCardinalExprDiagParam);
+    auto graph_walk_filter_ratio_estimator_enabled =
+        GetJsonBool(search_params, GRAPH_WALK_FILTER_RATIO_ESTIMATOR);
     const auto& estimate = query_context->get_filter_ratio_estimate();
     if (!filtered_out_count.has_value() && !filter_ratio.has_value() &&
         estimate.available) {
@@ -312,10 +314,15 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
     auto require_estimated_filtered_count = [&]() {
         if (!filtered_out_count.has_value() && !filter_ratio.has_value()) {
             ThrowInfo(UnexpectedError,
-                      "cardinal expr downpush requires {} or {}",
+                      "cardinal expr downpush requires {}, {}, or {}",
                       kCardinalExprFilteredOutCountParam,
-                      kCardinalExprFilterRatioParam);
+                      kCardinalExprFilterRatioParam,
+                      GRAPH_WALK_FILTER_RATIO_ESTIMATOR);
         }
+    };
+
+    auto set_graph_walk_estimator_placeholder = [&](CardinalExprDownpushInfo& info) {
+        info.filtered_out_count_ = active_count > 0 ? 1 : 0;
     };
 
     auto count_id_less_than = [&](FieldId field_id, int64_t threshold) {
@@ -390,6 +397,8 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
         info.diag_ = diag_enabled;
         if (filtered_out_count.has_value() || filter_ratio.has_value()) {
             set_filtered_count(info, true);
+        } else if (graph_walk_filter_ratio_estimator_enabled) {
+            set_graph_walk_estimator_placeholder(info);
         } else {
             info.filtered_out_count_ =
                 count_id_less_than(info.field_id_, threshold);
@@ -459,8 +468,13 @@ TryBuildCardinalExprDownpushInfo(const expr::TypedExprPtr& filter,
     info.modulus_ = modulus;
     info.threshold_ = threshold;
     info.diag_ = diag_enabled;
-    require_estimated_filtered_count();
-    set_filtered_count(info, true);
+    if (filtered_out_count.has_value() || filter_ratio.has_value()) {
+        set_filtered_count(info, true);
+    } else if (graph_walk_filter_ratio_estimator_enabled) {
+        set_graph_walk_estimator_placeholder(info);
+    } else {
+        require_estimated_filtered_count();
+    }
     return info;
 }
 
