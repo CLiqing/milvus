@@ -70,7 +70,7 @@ SegmentInternalInterface::FillPrimaryKeys(const query::Plan* plan,
     segcore::CheckCancellation(op_ctx, get_segment_id(), "FillPrimaryKeys");
     // Use a per-call OpContext for storage_usage; sharing op_ctx across
     // segments would make each segment's search_storage_cost_ accumulate
-    // every prior segment's bytes.
+    // every prior segment's bytes, inflating GetTotalStorageCost().
     milvus::OpContext local_ctx;
     if (op_ctx != nullptr) {
         local_ctx.cancellation_token = op_ctx->cancellation_token;
@@ -730,9 +730,9 @@ SegmentInternalInterface::GetTextIndex(milvus::OpContext* op_ctx,
     std::shared_lock lock(mutex_);
     auto iter = text_indexes_.find(field_id);
     if (iter == text_indexes_.end()) {
-        ThrowInfo(milvus::ErrorCode::TextIndexNotFound,
-                  "text index not found for field {}",
-                  field_id.get());
+        throw SegcoreError(
+            milvus::ErrorCode::TextIndexNotFound,
+            fmt::format("text index not found for field {}", field_id.get()));
     }
 
     auto make_pin = [&](auto&& alt) -> PinWrapper<index::TextMatchIndex*> {
@@ -756,9 +756,11 @@ SegmentInternalInterface::GetTextIndex(milvus::OpContext* op_ctx,
             auto index = ca->get_cell_of(0);
             return PinWrapper<index::TextMatchIndex*>(std::move(ca), index);
         } else {
-            ThrowInfo(milvus::ErrorCode::UnexpectedError,
-                      "text index of segment is not supported for field {}",
-                      field_id.get());
+            throw SegcoreError(
+                milvus::ErrorCode::UnexpectedError,
+                fmt::format(
+                    "text index of segment is not supported for field {}",
+                    field_id.get()));
         }
     };
 

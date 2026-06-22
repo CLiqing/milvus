@@ -72,10 +72,8 @@ const (
 // =============================================================================
 
 const (
-	IDFieldName        = "$id"
-	ScoreFieldName     = "$score"
-	SegOffsetFieldName = "$seg_offset"
-	GroupByFieldName   = "$group_by"
+	IDFieldName    = "$id"
+	ScoreFieldName = "$score"
 )
 
 // =============================================================================

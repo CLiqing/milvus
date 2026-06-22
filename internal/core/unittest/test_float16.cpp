@@ -52,6 +52,7 @@
 #include "segcore/SegmentGrowingImpl.h"
 #include "segcore/SegmentSealed.h"
 #include "segcore/Types.h"
+#include "segcore/reduce/Reduce.h"
 #include "test_utils/DataGen.h"
 #include "test_utils/GenExprProto.h"
 

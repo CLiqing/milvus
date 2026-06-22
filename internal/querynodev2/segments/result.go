@@ -258,10 +258,11 @@ func EncodeSearchResultData(ctx context.Context, searchResultData *schemapb.Sear
 		MetricType: metricType,
 	}
 
-	if searchResultData != nil && paramtable.Get().QueryNodeCfg.EnableResultZeroCopy.GetAsBool() {
+	hasData := searchResultData != nil && searchResultData.Ids != nil && typeutil.GetSizeOfIDs(searchResultData.Ids) != 0
+	if hasData && paramtable.Get().QueryNodeCfg.EnableResultZeroCopy.GetAsBool() {
 		// New path: embed struct directly, skip marshal
 		searchResults.ResultData = searchResultData
-	} else if searchResultData != nil {
+	} else if hasData {
 		// Legacy path: marshal to SlicedBlob
 		slicedBlob, err := proto.Marshal(searchResultData)
 		if err != nil {
