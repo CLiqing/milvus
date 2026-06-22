@@ -60,6 +60,14 @@ const char FILTER_RATIO_ESTIMATOR[] = "filter_ratio_estimator";
 const char FILTER_RATIO_ESTIMATOR_SAMPLE_SIZE[] =
     "filter_ratio_estimator_sample_size";
 const char FILTER_RATIO_ESTIMATOR_DEBUG[] = "filter_ratio_estimator_debug";
+const char GRAPH_WALK_FILTER_RATIO_ESTIMATOR[] =
+    "graph_walk_filter_ratio_estimator";
+const char GRAPH_WALK_FILTER_RATIO_ESTIMATOR_STEPS[] =
+    "graph_walk_filter_ratio_estimator_steps";
+const char GRAPH_WALK_FILTER_RATIO_ESTIMATOR_SAMPLE_SIZE[] =
+    "graph_walk_filter_ratio_estimator_sample_size";
+const char GRAPH_WALK_FILTER_RATIO_ESTIMATOR_DEBUG[] =
+    "graph_walk_filter_ratio_estimator_debug";
 const char HINTS[] = "hints";
 // json stats related
 const char JSON_KEY_INDEX_LOG_ROOT_PATH[] = "json_key_index_log";
