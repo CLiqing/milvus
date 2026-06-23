@@ -3,6 +3,7 @@ package optimizers
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
@@ -16,6 +17,59 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
+
+var codexQueryHookDiagCounter atomic.Uint64
+
+func codexQueryHookShouldLogDiag(n uint64) bool {
+	return n <= 20 || n%1000 == 0
+}
+
+func codexDiagInt64Param(params map[string]any, key string) (int64, bool) {
+	v, ok := params[key]
+	if !ok {
+		return 0, false
+	}
+	switch value := v.(type) {
+	case int64:
+		return value, true
+	case int:
+		return int64(value), true
+	case int32:
+		return int64(value), true
+	case float64:
+		return int64(value), true
+	case float32:
+		return int64(value), true
+	default:
+		return 0, false
+	}
+}
+
+func codexDiagBoolParam(params map[string]any, key string) (bool, bool) {
+	v, ok := params[key]
+	if !ok {
+		return false, false
+	}
+	value, ok := v.(bool)
+	return value, ok
+}
+
+func codexDiagStringParam(params map[string]any, key string) (string, bool) {
+	v, ok := params[key]
+	if !ok {
+		return "", false
+	}
+	value, ok := v.(string)
+	return codexDiagTruncate(value), ok
+}
+
+func codexDiagTruncate(value string) string {
+	const maxLen = 512
+	if len(value) <= maxLen {
+		return value
+	}
+	return value[:maxLen] + "...<truncated>"
+}
 
 // QueryHook is the interface for search/query parameter optimizer.
 type QueryHook interface {
@@ -69,6 +123,11 @@ func OptimizeSearchParams(ctx context.Context, req *querypb.SearchRequest, query
 
 		withFilter := (plan.GetVectorAnns().GetPredicates() != nil)
 		queryInfo := plan.GetVectorAnns().GetQueryInfo()
+		planTopKBeforeHook := queryInfo.GetTopk()
+		searchParamsBeforeHook := queryInfo.GetSearchParams()
+		reqTopKBeforeHook := req.GetReq().GetTopk()
+		reqIsTopkReduceBeforeHook := req.GetReq().GetIsTopkReduce()
+		reqIsRecallEvaluationBeforeHook := req.GetReq().GetIsRecallEvaluation()
 		params := map[string]any{
 			common.TopKKey:         queryInfo.GetTopk(),
 			common.SearchParamKey:  queryInfo.GetSearchParams(),
@@ -93,6 +152,11 @@ func OptimizeSearchParams(ctx context.Context, req *querypb.SearchRequest, query
 				params[common.RefineTopkRatioKey] = float32(paramtable.Get().AutoIndexConfig.GlobalRefineRefineTopkRatio.GetAsFloat())
 			}
 		}
+		paramsTopKBeforeHook, paramsTopKBeforeHookOK := codexDiagInt64Param(params, common.TopKKey)
+		paramsSearchBeforeHook, paramsSearchBeforeHookOK := codexDiagStringParam(params, common.SearchParamKey)
+		paramsSegmentNumBeforeHook, paramsSegmentNumBeforeHookOK := codexDiagInt64Param(params, common.SegmentNumKey)
+		paramsWithOptimizeBeforeHook, paramsWithOptimizeBeforeHookOK := codexDiagBoolParam(params, common.WithOptimizeKey)
+		paramsWithFilterBeforeHook, paramsWithFilterBeforeHookOK := codexDiagBoolParam(params, common.WithFilterKey)
 		err := queryHook.Run(params)
 		if err != nil {
 			log.Warn("failed to execute queryHook", zap.Error(err))
@@ -100,8 +164,58 @@ func OptimizeSearchParams(ctx context.Context, req *querypb.SearchRequest, query
 		}
 		finalTopk := params[common.TopKKey].(int64)
 		isTopkReduce := req.GetReq().GetIsTopkReduce() && (finalTopk < queryInfo.GetTopk()) && !isSecondStageSearch
+		paramsSearchAfterHook := params[common.SearchParamKey].(string)
+		paramsWithOptimizeAfterHook, paramsWithOptimizeAfterHookOK := codexDiagBoolParam(params, common.WithOptimizeKey)
+		paramsWithFilterAfterHook, paramsWithFilterAfterHookOK := codexDiagBoolParam(params, common.WithFilterKey)
+		paramsSegmentNumAfterHook, paramsSegmentNumAfterHookOK := codexDiagInt64Param(params, common.SegmentNumKey)
+		paramsRecallEvalAfterHook, paramsRecallEvalAfterHookOK := codexDiagBoolParam(params, common.RecallEvalKey)
+		if reqIsTopkReduceBeforeHook || isTopkReduce || finalTopk < planTopKBeforeHook {
+			diagSeq := codexQueryHookDiagCounter.Add(1)
+			if codexQueryHookShouldLogDiag(diagSeq) {
+				log.Warn("CODEX retry diagnosis: queryHook optimized search params",
+					zap.Uint64("diagSeq", diagSeq),
+					zap.Int64("collectionID", collectionId),
+					zap.Int64("reqNq", req.GetReq().GetNq()),
+					zap.Int64("reqTopKBeforeHook", reqTopKBeforeHook),
+					zap.Int64("planTopKBeforeHook", planTopKBeforeHook),
+					zap.Int64("paramsTopKBeforeHook", paramsTopKBeforeHook),
+					zap.Bool("paramsTopKBeforeHookOK", paramsTopKBeforeHookOK),
+					zap.Int64("paramsTopKAfterHook", finalTopk),
+					zap.String("planSearchParamsBeforeHook", codexDiagTruncate(searchParamsBeforeHook)),
+					zap.String("paramsSearchBeforeHook", paramsSearchBeforeHook),
+					zap.Bool("paramsSearchBeforeHookOK", paramsSearchBeforeHookOK),
+					zap.String("paramsSearchAfterHook", codexDiagTruncate(paramsSearchAfterHook)),
+					zap.Int("numSegmentsInput", numSegments),
+					zap.Int("estSegmentNum", estSegmentNum),
+					zap.Int("channelNum", int(channelNum)),
+					zap.Int64("paramsSegmentNumBeforeHook", paramsSegmentNumBeforeHook),
+					zap.Bool("paramsSegmentNumBeforeHookOK", paramsSegmentNumBeforeHookOK),
+					zap.Int64("paramsSegmentNumAfterHook", paramsSegmentNumAfterHook),
+					zap.Bool("paramsSegmentNumAfterHookOK", paramsSegmentNumAfterHookOK),
+					zap.Bool("withFilter", withFilter),
+					zap.Bool("isSecondStageSearch", isSecondStageSearch),
+					zap.Bool("reqIsTopkReduceBeforeHook", reqIsTopkReduceBeforeHook),
+					zap.Bool("reqIsTopkReduceAfterHook", isTopkReduce),
+					zap.Bool("reqIsRecallEvaluationBeforeHook", reqIsRecallEvaluationBeforeHook),
+					zap.Bool("paramsRecallEvalAfterHook", paramsRecallEvalAfterHook),
+					zap.Bool("paramsRecallEvalAfterHookOK", paramsRecallEvalAfterHookOK),
+					zap.Bool("paramsWithOptimizeBeforeHook", paramsWithOptimizeBeforeHook),
+					zap.Bool("paramsWithOptimizeBeforeHookOK", paramsWithOptimizeBeforeHookOK),
+					zap.Bool("paramsWithOptimizeAfterHook", paramsWithOptimizeAfterHook),
+					zap.Bool("paramsWithOptimizeAfterHookOK", paramsWithOptimizeAfterHookOK),
+					zap.Bool("paramsWithFilterBeforeHook", paramsWithFilterBeforeHook),
+					zap.Bool("paramsWithFilterBeforeHookOK", paramsWithFilterBeforeHookOK),
+					zap.Bool("paramsWithFilterAfterHook", paramsWithFilterAfterHook),
+					zap.Bool("paramsWithFilterAfterHookOK", paramsWithFilterAfterHookOK),
+					zap.Int64("groupByFieldID", queryInfo.GetGroupByFieldId()),
+					zap.Int64("fieldID", plan.GetVectorAnns().GetFieldId()),
+					zap.Int32("vectorType", int32(plan.GetVectorAnns().GetVectorType())),
+					zap.String("searchType", req.GetReq().GetSearchType().String()),
+					zap.Bool("globalRefineEnabledConfig", globalRefineEnable))
+			}
+		}
 		queryInfo.Topk = finalTopk
-		queryInfo.SearchParams = params[common.SearchParamKey].(string)
+		queryInfo.SearchParams = paramsSearchAfterHook
 		// Pass global refine decision to C++ via proto after hook validation
 		if globalRefineVal, ok := params[common.GlobalRefineKey]; ok && globalRefineVal.(bool) {
 			queryInfo.SearchTopkRatio = params[common.SearchTopkRatioKey].(float32)
