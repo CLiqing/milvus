@@ -49,6 +49,19 @@
 
 namespace milvus::query {
 
+namespace {
+
+bool
+IsGraphIndexSupportedForCardinalDownpush(const std::string& index_type) {
+    return index_type == knowhere::IndexEnum::INDEX_CARDINAL_TIERED ||
+           index_type == knowhere::IndexEnum::INDEX_HNSW ||
+           index_type == knowhere::IndexEnum::INDEX_HNSW_SQ ||
+           index_type == knowhere::IndexEnum::INDEX_HNSW_PQ ||
+           index_type == knowhere::IndexEnum::INDEX_HNSW_PRQ;
+}
+
+}  // namespace
+
 void
 SearchOnSealedIndex(const Schema& schema,
                     const segcore::SealedIndexingRecord& record,
@@ -97,9 +110,11 @@ SearchOnSealedIndex(const Schema& schema,
         dynamic_cast<index::VectorIndex*>(accessor->get_cell_of(0));
     AssertInfo(vec_index != nullptr, "invalid vector index");
     if (bitset.has_extra_scalar_int64_predicate_filter()) {
-        AssertInfo(vec_index->GetIndexType() ==
-                       knowhere::IndexEnum::INDEX_CARDINAL_TIERED,
-                   "downpush hint is only supported by Cardinal index/backend");
+        auto index_type = vec_index->GetIndexType();
+        AssertInfo(IsGraphIndexSupportedForCardinalDownpush(index_type),
+                   "downpush hint is only supported by Cardinal graph "
+                   "index/backend, actual index type: {}",
+                   index_type);
     }
 
     const auto& offset_mapping = vec_index->GetOffsetMapping();
