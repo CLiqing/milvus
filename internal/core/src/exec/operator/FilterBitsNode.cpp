@@ -127,7 +127,7 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
             return std::nullopt;
         }
         auto field_id = column.field_id_;
-        if (!segment->HasFieldData(field_id)) {
+        if (!segment->HasFieldData(field_id) && !segment->HasIndex(field_id)) {
             return std::nullopt;
         }
         return field_id;
