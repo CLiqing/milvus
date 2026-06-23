@@ -17,6 +17,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,25 @@
 namespace milvus::exec {
 
 enum class ContextScope { GLOBAL = 0, SESSION = 1, QUERY = 2, Executor = 3 };
+
+enum class CardinalDownpushPredicateOp {
+    Int64GreaterEqual = 0,
+    Int64ModLessThan = 1,
+    Int64GreaterThan = 2,
+    Int64LessEqual = 3,
+    Int64LessThan = 4,
+    Int64Equal = 5,
+    Int64NotEqual = 6,
+};
+
+struct CardinalDownpushPredicate {
+    FieldId field_id_;
+    CardinalDownpushPredicateOp op_{
+        CardinalDownpushPredicateOp::Int64GreaterEqual};
+    int64_t arg0_{0};
+    int64_t arg1_{0};
+    int64_t estimated_filtered_out_count_{0};
+};
 
 class BaseConfig {
  public:
@@ -408,6 +428,21 @@ class QueryContext : public Context {
         return enable_sub_expr_cache_write_;
     }
 
+    void
+    set_cardinal_downpush_predicate(CardinalDownpushPredicate predicate) {
+        cardinal_downpush_predicate_ = predicate;
+    }
+
+    const std::optional<CardinalDownpushPredicate>&
+    get_cardinal_downpush_predicate() const {
+        return cardinal_downpush_predicate_;
+    }
+
+    void
+    clear_cardinal_downpush_predicate() {
+        cardinal_downpush_predicate_.reset();
+    }
+
  private:
     folly::Executor* executor_;
     //folly::Executor::KeepAlive<> executor_keepalive_;
@@ -459,6 +494,8 @@ class QueryContext : public Context {
     // avoid duplicating the cached full-filter bitmap with cached child
     // bitmaps in the same request path.
     bool enable_sub_expr_cache_write_ = true;
+
+    std::optional<CardinalDownpushPredicate> cardinal_downpush_predicate_;
 };
 
 // Represent the state of one thread of query execution.

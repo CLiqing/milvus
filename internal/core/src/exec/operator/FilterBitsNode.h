@@ -17,6 +17,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "exec/Driver.h"
@@ -80,6 +81,8 @@ class PhyFilterBitsNode : public Operator {
     // Cache backend is the process-level ExprResCacheManager.
     bool enable_expr_cache_ = false;
     std::string expr_cache_key_;
+    bool cardinal_downpush_enabled_ = false;
+    std::optional<CardinalDownpushPredicate> cardinal_downpush_predicate_;
 };
 }  // namespace exec
 }  // namespace milvus

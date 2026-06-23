@@ -95,6 +95,12 @@ SearchOnSealedIndex(const Schema& schema,
         SemiInlineGet(field_indexing->indexing_->PinCells(op_context, {0}));
     auto vec_index =
         dynamic_cast<index::VectorIndex*>(accessor->get_cell_of(0));
+    AssertInfo(vec_index != nullptr, "invalid vector index");
+    if (bitset.has_extra_scalar_int64_predicate_filter()) {
+        AssertInfo(vec_index->GetIndexType() ==
+                       knowhere::IndexEnum::INDEX_CARDINAL_TIERED,
+                   "downpush hint is only supported by Cardinal index/backend");
+    }
 
     const auto& offset_mapping = vec_index->GetOffsetMapping();
     const bool is_element_level_search = search_info.array_offsets_ != nullptr;
@@ -103,6 +109,11 @@ SearchOnSealedIndex(const Schema& schema,
     BitsetView search_bitset = bitset;
     const auto has_offset_mapping =
         offset_mapping.IsEnabled() && !is_element_level_search;
+    if (bitset.has_extra_scalar_int64_predicate_filter() &&
+        has_offset_mapping) {
+        ThrowInfo(Unsupported,
+                  "downpush hint does not support vector offset mapping");
+    }
     if (has_offset_mapping) {
         if (offset_mapping.GetValidCount() == 0) {
             FillEmptySearchResult(search_result, num_queries, topK);
@@ -171,6 +182,9 @@ SearchOnSealedColumn(const Schema& schema,
                      const BitsetView& bitview,
                      milvus::OpContext* op_context,
                      SearchResult& result) {
+    AssertInfo(!bitview.has_extra_scalar_int64_predicate_filter(),
+               "downpush hint is only supported by Cardinal index/backend");
+
     auto field_id = search_info.field_id_;
     auto& field = schema[field_id];
 

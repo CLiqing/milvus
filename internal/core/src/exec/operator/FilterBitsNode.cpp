@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <ratio>
 #include <utility>
 #include <vector>
@@ -39,6 +40,9 @@ namespace exec {
 
 namespace {
 
+constexpr int64_t kDownpushEstimatorSampleSize = 256;
+constexpr double kDownpushFallbackFilterOutRatio = 0.90;
+
 std::string
 BuildExprCacheKey(const plan::FilterBitsNode& filter,
                   QueryContext* query_context) {
@@ -51,6 +55,163 @@ BuildExprCacheKey(const plan::FilterBitsNode& filter,
                            query_context->get_entity_ttl_physical_time_us());
     }
     return key;
+}
+
+uint64_t
+SplitMix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+OffsetVector
+BuildSampleOffsets(int64_t active_count,
+                   int64_t sample_size,
+                   int64_t segment_id) {
+    auto real_sample_size = std::min(active_count, sample_size);
+    OffsetVector offsets;
+    offsets.reserve(real_sample_size);
+    for (int64_t i = 0; i < real_sample_size; ++i) {
+        auto hash =
+            SplitMix64(static_cast<uint64_t>(segment_id) ^
+                       (static_cast<uint64_t>(i) * 0x9e3779b97f4a7c15ULL));
+        offsets.push_back(static_cast<int32_t>(hash % active_count));
+    }
+    return offsets;
+}
+
+std::optional<int64_t>
+GetInt64Value(const proto::plan::GenericValue& value) {
+    if (value.val_case() != proto::plan::GenericValue::kInt64Val) {
+        return std::nullopt;
+    }
+    return value.int64_val();
+}
+
+std::optional<CardinalDownpushPredicateOp>
+ToDownpushRangeOp(proto::plan::OpType op_type) {
+    switch (op_type) {
+        case proto::plan::OpType::GreaterEqual:
+            return CardinalDownpushPredicateOp::Int64GreaterEqual;
+        case proto::plan::OpType::GreaterThan:
+            return CardinalDownpushPredicateOp::Int64GreaterThan;
+        case proto::plan::OpType::LessEqual:
+            return CardinalDownpushPredicateOp::Int64LessEqual;
+        case proto::plan::OpType::LessThan:
+            return CardinalDownpushPredicateOp::Int64LessThan;
+        case proto::plan::OpType::Equal:
+            return CardinalDownpushPredicateOp::Int64Equal;
+        case proto::plan::OpType::NotEqual:
+            return CardinalDownpushPredicateOp::Int64NotEqual;
+        default:
+            return std::nullopt;
+    }
+}
+
+std::optional<CardinalDownpushPredicate>
+TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
+                                    QueryContext* query_context) {
+    if (query_context == nullptr || filter == nullptr) {
+        return std::nullopt;
+    }
+    auto* segment = query_context->get_segment();
+    if (segment == nullptr || segment->type() != SegmentType::Sealed) {
+        return std::nullopt;
+    }
+
+    auto try_field =
+        [&](const expr::ColumnInfo& column) -> std::optional<FieldId> {
+        if (column.data_type_ != DataType::INT64 || column.element_level_ ||
+            column.nullable_) {
+            return std::nullopt;
+        }
+        auto field_id = column.field_id_;
+        if (!segment->HasFieldData(field_id)) {
+            return std::nullopt;
+        }
+        return field_id;
+    };
+
+    if (auto unary =
+            std::dynamic_pointer_cast<const expr::UnaryRangeFilterExpr>(
+                filter)) {
+        auto field_id = try_field(unary->column_);
+        auto value = GetInt64Value(unary->val_);
+        auto op = ToDownpushRangeOp(unary->op_type_);
+        if (!field_id.has_value() || !value.has_value() || !op.has_value()) {
+            return std::nullopt;
+        }
+        CardinalDownpushPredicate predicate;
+        predicate.field_id_ = field_id.value();
+        predicate.op_ = op.value();
+        predicate.arg0_ = value.value();
+        return predicate;
+    }
+
+    if (auto arith =
+            std::dynamic_pointer_cast<const expr::BinaryArithOpEvalRangeExpr>(
+                filter)) {
+        auto field_id = try_field(arith->column_);
+        auto modulus = GetInt64Value(arith->right_operand_);
+        auto threshold = GetInt64Value(arith->value_);
+        if (!field_id.has_value() || !modulus.has_value() ||
+            !threshold.has_value() || modulus.value() <= 0 ||
+            threshold.value() < 0 || threshold.value() > modulus.value() ||
+            arith->arith_op_type_ != proto::plan::ArithOpType::Mod ||
+            arith->op_type_ != proto::plan::OpType::LessThan) {
+            return std::nullopt;
+        }
+        CardinalDownpushPredicate predicate;
+        predicate.field_id_ = field_id.value();
+        predicate.op_ = CardinalDownpushPredicateOp::Int64ModLessThan;
+        predicate.arg0_ = modulus.value();
+        predicate.arg1_ = threshold.value();
+        return predicate;
+    }
+
+    return std::nullopt;
+}
+
+std::optional<int64_t>
+EstimateFilteredOutCountBySample(QueryContext* query_context,
+                                 ExprSet* exprs,
+                                 ExecContext* exec_context) {
+    if (query_context == nullptr || exprs == nullptr ||
+        exec_context == nullptr) {
+        return std::nullopt;
+    }
+    auto active_count = query_context->get_active_count();
+    if (active_count <= 0) {
+        return 0;
+    }
+    auto* segment = query_context->get_segment();
+    auto segment_id = segment != nullptr ? segment->get_segment_id() : 0;
+    auto offsets = BuildSampleOffsets(
+        active_count, kDownpushEstimatorSampleSize, segment_id);
+    if (offsets.empty()) {
+        return 0;
+    }
+
+    EvalCtx eval_ctx(exec_context, &offsets);
+    std::vector<VectorPtr> results;
+    exprs->Eval(0, 1, true, eval_ctx, results);
+    if (results.size() != 1 || results[0] == nullptr) {
+        return std::nullopt;
+    }
+    auto col_vec = std::dynamic_pointer_cast<ColumnVector>(results[0]);
+    if (!col_vec || !col_vec->IsBitmap()) {
+        return std::nullopt;
+    }
+    TargetBitmapView passed(col_vec->GetRawData(), col_vec->size());
+    auto passed_count = static_cast<int64_t>(passed.count());
+    auto filtered_sample_count =
+        static_cast<int64_t>(offsets.size()) - passed_count;
+    auto estimate =
+        static_cast<int64_t>((static_cast<double>(filtered_sample_count) /
+                              static_cast<double>(offsets.size())) *
+                             static_cast<double>(active_count));
+    return std::clamp<int64_t>(estimate, 0, active_count);
 }
 
 }  // namespace
@@ -72,8 +233,35 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
 
+    if (query_context_->get_search_info().cardinal_downpush_execution) {
+        auto predicate = TryCompileCardinalDownpushPredicate(filter->filter(),
+                                                             query_context_);
+        std::optional<int64_t> estimated_filtered_out_count;
+        if (predicate.has_value()) {
+            ExprSet sample_exprs(filters, exec_context);
+            estimated_filtered_out_count = EstimateFilteredOutCountBySample(
+                query_context_, &sample_exprs, exec_context);
+        }
+        if (estimated_filtered_out_count.has_value()) {
+            auto ratio = need_process_rows_ > 0
+                             ? static_cast<double>(
+                                   estimated_filtered_out_count.value()) /
+                                   static_cast<double>(need_process_rows_)
+                             : 0.0;
+            if (ratio < kDownpushFallbackFilterOutRatio) {
+                predicate->estimated_filtered_out_count_ =
+                    need_process_rows_ > 0
+                        ? std::max<int64_t>(
+                              1, estimated_filtered_out_count.value())
+                        : 0;
+                cardinal_downpush_predicate_ = predicate;
+                cardinal_downpush_enabled_ = true;
+            }
+        }
+    }
+
     enable_expr_cache_ = query_context_->get_enable_expr_cache();
-    if (enable_expr_cache_) {
+    if (enable_expr_cache_ && !cardinal_downpush_enabled_) {
         expr_cache_key_ = BuildExprCacheKey(*filter, query_context_);
     }
 }
@@ -135,6 +323,17 @@ PhyFilterBitsNode::GetOutput() {
     tracer::AutoSpan span(
         "PhyFilterBitsNode::Execute", tracer::GetRootSpan(), true);
     tracer::AddEvent(fmt::format("input_rows: {}", need_process_rows_));
+
+    if (cardinal_downpush_enabled_) {
+        query_context_->set_cardinal_downpush_predicate(
+            cardinal_downpush_predicate_.value());
+        num_processed_rows_ = need_process_rows_;
+        std::vector<VectorPtr> col_res;
+        col_res.push_back(std::make_shared<ColumnVector>(
+            TargetBitmap(need_process_rows_, false),
+            TargetBitmap(need_process_rows_, true)));
+        return std::make_shared<RowVector>(col_res);
+    }
 
     std::chrono::high_resolution_clock::time_point scalar_start =
         std::chrono::high_resolution_clock::now();

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <optional>
 #include <ratio>
 #include <utility>
 #include <vector>
@@ -42,6 +43,69 @@
 
 namespace milvus {
 namespace exec {
+
+namespace {
+
+struct CardinalDownpushSearchContext {
+    std::vector<milvus::cachinglayer::PinWrapper<Span<int64_t>>> pins_;
+    std::vector<const int64_t*> chunk_values_;
+    std::vector<int64_t> chunk_offsets_;
+};
+
+std::optional<knowhere::BitsetView::ExtraScalarInt64PredicateOp>
+ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
+    using KnowhereOp = knowhere::BitsetView::ExtraScalarInt64PredicateOp;
+    switch (op) {
+        case CardinalDownpushPredicateOp::Int64GreaterEqual:
+            return KnowhereOp::kGreaterEqual;
+        case CardinalDownpushPredicateOp::Int64ModLessThan:
+            return KnowhereOp::kModLessThan;
+        case CardinalDownpushPredicateOp::Int64GreaterThan:
+            return KnowhereOp::kGreaterThan;
+        case CardinalDownpushPredicateOp::Int64LessEqual:
+            return KnowhereOp::kLessEqual;
+        case CardinalDownpushPredicateOp::Int64LessThan:
+            return KnowhereOp::kLessThan;
+        case CardinalDownpushPredicateOp::Int64Equal:
+            return KnowhereOp::kEqual;
+        case CardinalDownpushPredicateOp::Int64NotEqual:
+            return KnowhereOp::kNotEqual;
+    }
+    return std::nullopt;
+}
+
+std::shared_ptr<CardinalDownpushSearchContext>
+BuildCardinalDownpushSearchContext(
+    const segcore::SegmentInternalInterface* segment,
+    milvus::OpContext* op_context,
+    const CardinalDownpushPredicate& predicate) {
+    if (segment == nullptr || segment->type() != SegmentType::Sealed ||
+        !segment->HasFieldData(predicate.field_id_)) {
+        return nullptr;
+    }
+
+    auto ctx = std::make_shared<CardinalDownpushSearchContext>();
+    auto num_chunks = segment->num_chunk_data(predicate.field_id_);
+    if (num_chunks <= 0) {
+        return nullptr;
+    }
+    ctx->pins_.reserve(num_chunks);
+    ctx->chunk_values_.reserve(num_chunks);
+    ctx->chunk_offsets_.reserve(num_chunks + 1);
+    for (int64_t chunk_id = 0; chunk_id < num_chunks; ++chunk_id) {
+        ctx->chunk_offsets_.push_back(
+            segment->num_rows_until_chunk(predicate.field_id_, chunk_id));
+        auto pin = segment->chunk_data<int64_t>(
+            op_context, predicate.field_id_, chunk_id);
+        auto chunk = pin.get();
+        ctx->chunk_values_.push_back(chunk.data());
+        ctx->pins_.push_back(std::move(pin));
+    }
+    ctx->chunk_offsets_.push_back(segment->get_row_count());
+    return ctx;
+}
+
+}  // namespace
 
 static milvus::SearchResult
 empty_search_result(int64_t num_queries, bool element_level = false) {
@@ -175,9 +239,37 @@ PhyVectorSearchNode::GetOutput() {
         data_cnt = search_view.size();
     }
 
+    auto op_context = query_context_->get_op_context();
+    std::shared_ptr<CardinalDownpushSearchContext> downpush_ctx;
+    if (auto predicate = query_context_->get_cardinal_downpush_predicate();
+        predicate.has_value()) {
+        if (ph.element_level_) {
+            ThrowInfo(
+                UnexpectedError,
+                "downpush hint does not support element-level vector search");
+        }
+        auto op = ToKnowherePredicateOp(predicate->op_);
+        downpush_ctx = BuildCardinalDownpushSearchContext(
+            segment_, op_context, predicate.value());
+        if (!op.has_value() || downpush_ctx == nullptr) {
+            ThrowInfo(UnexpectedError,
+                      "failed to build Cardinal downpush search context");
+        }
+        knowhere::BitsetView::ExtraScalarInt64PredicateFilter filter;
+        filter.chunk_values = downpush_ctx->chunk_values_.data();
+        filter.chunk_offsets = downpush_ctx->chunk_offsets_.data();
+        filter.num_chunks = downpush_ctx->chunk_values_.size();
+        filter.row_count = static_cast<size_t>(segment_->get_row_count());
+        filter.op = op.value();
+        filter.arg0 = predicate->arg0_;
+        filter.arg1 = predicate->arg1_;
+        search_view.set_extra_scalar_int64_predicate_filter(
+            filter,
+            static_cast<size_t>(predicate->estimated_filtered_out_count_));
+    }
+
     // Single search + metrics path
     milvus::SearchResult search_result;
-    auto op_context = query_context_->get_op_context();
     segment_->vector_search(search_info_,
                             src_data,
                             src_offsets,
