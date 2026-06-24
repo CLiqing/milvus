@@ -20,10 +20,8 @@
 #include <chrono>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <ratio>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -58,36 +56,6 @@ struct CardinalDownpushSearchContext {
     std::vector<const int64_t*> chunk_values_;
     std::vector<int64_t> chunk_offsets_;
 };
-
-struct ScalarRowValuesCacheKey {
-    int64_t segment_id;
-    int64_t field_id;
-    int64_t row_count;
-
-    bool
-    operator==(const ScalarRowValuesCacheKey& other) const {
-        return segment_id == other.segment_id && field_id == other.field_id &&
-               row_count == other.row_count;
-    }
-};
-
-struct ScalarRowValuesCacheKeyHash {
-    size_t
-    operator()(const ScalarRowValuesCacheKey& key) const {
-        size_t h = std::hash<int64_t>{}(key.segment_id);
-        h ^= std::hash<int64_t>{}(key.field_id) + 0x9e3779b97f4a7c15ULL +
-             (h << 6) + (h >> 2);
-        h ^= std::hash<int64_t>{}(key.row_count) + 0x9e3779b97f4a7c15ULL +
-             (h << 6) + (h >> 2);
-        return h;
-    }
-};
-
-std::mutex g_scalar_row_values_cache_mutex;
-std::unordered_map<ScalarRowValuesCacheKey,
-                   std::shared_ptr<std::vector<int64_t>>,
-                   ScalarRowValuesCacheKeyHash>
-    g_scalar_row_values_cache;
 
 std::optional<knowhere::BitsetView::ExtraScalarInt64PredicateOp>
 ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
@@ -156,17 +124,6 @@ BuildCardinalDownpushSearchContext(
     }
 
     auto row_count = segment->get_row_count();
-    ScalarRowValuesCacheKey cache_key{
-        segment->get_segment_id(), predicate.field_id_.get(), row_count};
-    {
-        std::lock_guard<std::mutex> lock(g_scalar_row_values_cache_mutex);
-        if (auto iter = g_scalar_row_values_cache.find(cache_key);
-            iter != g_scalar_row_values_cache.end()) {
-            ctx->row_values_ = iter->second;
-            return ctx;
-        }
-    }
-
     auto row_values = std::make_shared<std::vector<int64_t>>();
     row_values->resize(row_count);
     for (int64_t row = 0; row < row_count; ++row) {
@@ -176,16 +133,7 @@ BuildCardinalDownpushSearchContext(
         }
         (*row_values)[row] = value.value();
     }
-    {
-        std::lock_guard<std::mutex> lock(g_scalar_row_values_cache_mutex);
-        if (auto iter = g_scalar_row_values_cache.find(cache_key);
-            iter != g_scalar_row_values_cache.end()) {
-            ctx->row_values_ = iter->second;
-        } else {
-            ctx->row_values_ = row_values;
-            g_scalar_row_values_cache.emplace(cache_key, std::move(row_values));
-        }
-    }
+    ctx->row_values_ = std::move(row_values);
     return ctx;
 }
 

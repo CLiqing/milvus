@@ -14,7 +14,7 @@
 # Update KNOWHERE_VERSION for the first occurrence
 milvus_add_pkg_config("knowhere")
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES "")
-set( KNOWHERE_VERSION 1879db25af7b7307f900dccdd8254ca80339135c )
+set( KNOWHERE_VERSION 8f18c0baa3bb97a32a971fac1a0356ea8ddfeea3 )
 set( GIT_REPOSITORY  "https://github.com/CLiqing/knowhere.git")
 
 message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")
@@ -31,6 +31,7 @@ endif ()
 
 if ( INDEX_ENGINE STREQUAL "cardinal" )
     set(WITH_CARDINAL ON CACHE BOOL "" FORCE )
+    set(CARDINAL_VERSION_FORCE_CHECKOUT ON CACHE BOOL "" FORCE )
 else ()
     set(WITH_CARDINAL OFF CACHE BOOL "" FORCE )
 endif()

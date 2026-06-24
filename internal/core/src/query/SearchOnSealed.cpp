@@ -52,12 +52,12 @@ namespace milvus::query {
 namespace {
 
 bool
-IsGraphIndexSupportedForCardinalDownpush(const std::string& index_type) {
-    return index_type == knowhere::IndexEnum::INDEX_CARDINAL_TIERED ||
-           index_type == knowhere::IndexEnum::INDEX_HNSW ||
-           index_type == knowhere::IndexEnum::INDEX_HNSW_SQ ||
-           index_type == knowhere::IndexEnum::INDEX_HNSW_PQ ||
-           index_type == knowhere::IndexEnum::INDEX_HNSW_PRQ;
+IsIndexSupportedForCardinalDownpushV1(const std::string& index_type) {
+    // Downpush v1 is a Cardinal-only opt-in path. Ordinary Knowhere HNSW
+    // indexes and Cardinal DISKANN are intentionally unsupported in v1 so
+    // unsupported benchmark shapes fail explicitly instead of silently taking
+    // a different filtering path.
+    return index_type == knowhere::IndexEnum::INDEX_CARDINAL_TIERED;
 }
 
 }  // namespace
@@ -111,9 +111,9 @@ SearchOnSealedIndex(const Schema& schema,
     AssertInfo(vec_index != nullptr, "invalid vector index");
     if (bitset.has_extra_scalar_int64_predicate_filter()) {
         auto index_type = vec_index->GetIndexType();
-        AssertInfo(IsGraphIndexSupportedForCardinalDownpush(index_type),
-                   "downpush hint is only supported by Cardinal graph "
-                   "index/backend, actual index type: {}",
+        AssertInfo(IsIndexSupportedForCardinalDownpushV1(index_type),
+                   "downpush hint is only supported by Cardinal index/backend "
+                   "in v1, actual index type: {}",
                    index_type);
     }
 

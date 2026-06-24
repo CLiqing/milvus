@@ -173,6 +173,17 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
     return std::nullopt;
 }
 
+bool
+HasEntityTTL(QueryContext* query_context) {
+    if (query_context == nullptr || query_context->get_segment() == nullptr) {
+        return false;
+    }
+    return query_context->get_segment()
+        ->get_schema()
+        .get_ttl_field_id()
+        .has_value();
+}
+
 std::optional<int64_t>
 EstimateFilteredOutCountBySample(QueryContext* query_context,
                                  ExprSet* exprs,
@@ -234,14 +245,32 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     num_processed_rows_ = 0;
 
     if (query_context_->get_search_info().cardinal_downpush_execution) {
+        // Downpush v1 intentionally moves only the user scalar predicate into
+        // Cardinal. Entity TTL is injected by ExprSet compilation, so skipping
+        // normal ExprSet materialization would bypass TTL. Treat it as an
+        // unsupported v1 shape instead of silently returning wrong results.
+        if (HasEntityTTL(query_context_)) {
+            ThrowInfo(Unsupported,
+                      "downpush hint does not support entity TTL");
+        }
+
         auto predicate = TryCompileCardinalDownpushPredicate(filter->filter(),
                                                              query_context_);
-        std::optional<int64_t> estimated_filtered_out_count;
-        if (predicate.has_value()) {
-            ExprSet sample_exprs(filters, exec_context);
-            estimated_filtered_out_count = EstimateFilteredOutCountBySample(
-                query_context_, &sample_exprs, exec_context);
+        if (!predicate.has_value()) {
+            ThrowInfo(Unsupported,
+                      "downpush hint only supports sealed non-nullable INT64 "
+                      "range/mod predicates in v1");
         }
+
+        std::optional<int64_t> estimated_filtered_out_count;
+        ExprSet sample_exprs(filters, exec_context);
+        estimated_filtered_out_count = EstimateFilteredOutCountBySample(
+            query_context_, &sample_exprs, exec_context);
+        if (!estimated_filtered_out_count.has_value()) {
+            ThrowInfo(Unsupported,
+                      "downpush hint failed to estimate filter ratio");
+        }
+
         if (estimated_filtered_out_count.has_value()) {
             auto ratio = need_process_rows_ > 0
                              ? static_cast<double>(
