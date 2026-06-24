@@ -116,24 +116,20 @@ ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
 }
 
 bool
-IsInt64PrimaryKeyField(const segcore::SegmentInternalInterface* segment,
-                       FieldId field_id) {
+IsInt64Field(const segcore::SegmentInternalInterface* segment,
+             FieldId field_id) {
     if (segment == nullptr) {
-        return false;
-    }
-    auto primary_field_id = segment->get_schema().get_primary_field_id();
-    if (!primary_field_id.has_value() ||
-        primary_field_id.value().get() != field_id.get()) {
         return false;
     }
     return segment->get_schema()[field_id].get_data_type() == DataType::INT64;
 }
 
 std::shared_ptr<std::vector<int64_t>>
-BuildInt64PrimaryKeyRowValues(const segcore::SegmentInternalInterface* segment,
-                              milvus::OpContext* op_context,
-                              FieldId field_id,
-                              int64_t row_count) {
+BuildInt64RowValuesFromBulkSubscript(
+    const segcore::SegmentInternalInterface* segment,
+    milvus::OpContext* op_context,
+    FieldId field_id,
+    int64_t row_count) {
     std::vector<int64_t> offsets(row_count);
     std::iota(offsets.begin(), offsets.end(), 0);
 
@@ -150,7 +146,7 @@ BuildInt64PrimaryKeyRowValues(const segcore::SegmentInternalInterface* segment,
 }
 
 std::shared_ptr<std::vector<int64_t>>
-GetCachedInt64PrimaryKeyRowValues(
+GetCachedInt64RowValuesFromBulkSubscript(
     const segcore::SegmentInternalInterface* segment,
     milvus::OpContext* op_context,
     FieldId field_id) {
@@ -166,8 +162,8 @@ GetCachedInt64PrimaryKeyRowValues(
         }
     }
 
-    auto row_values =
-        BuildInt64PrimaryKeyRowValues(segment, op_context, field_id, row_count);
+    auto row_values = BuildInt64RowValuesFromBulkSubscript(
+        segment, op_context, field_id, row_count);
     if (row_values == nullptr) {
         return nullptr;
     }
@@ -219,11 +215,11 @@ BuildCardinalDownpushSearchContext(
         return ctx;
     }
 
-    if (!IsInt64PrimaryKeyField(segment, predicate.field_id_)) {
+    if (!IsInt64Field(segment, predicate.field_id_)) {
         return nullptr;
     }
 
-    ctx->row_values_ = GetCachedInt64PrimaryKeyRowValues(
+    ctx->row_values_ = GetCachedInt64RowValuesFromBulkSubscript(
         segment, op_context, predicate.field_id_);
     if (ctx->row_values_ == nullptr) {
         return nullptr;
