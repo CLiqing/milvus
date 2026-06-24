@@ -18,10 +18,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <numeric>
 #include <optional>
 #include <ratio>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -48,14 +53,45 @@ namespace exec {
 
 namespace {
 
+constexpr size_t kDownpushRowValuesCacheMaxEntries = 16;
+
 struct CardinalDownpushSearchContext {
     std::vector<milvus::cachinglayer::PinWrapper<Span<int64_t>>> pins_;
-    std::vector<milvus::cachinglayer::PinWrapper<const index::IndexBase*>>
-        index_pins_;
     std::shared_ptr<std::vector<int64_t>> row_values_;
     std::vector<const int64_t*> chunk_values_;
     std::vector<int64_t> chunk_offsets_;
 };
+
+struct DownpushRowValuesCacheKey {
+    int64_t segment_id;
+    int64_t field_id;
+    int64_t row_count;
+
+    bool
+    operator==(const DownpushRowValuesCacheKey& other) const {
+        return segment_id == other.segment_id && field_id == other.field_id &&
+               row_count == other.row_count;
+    }
+};
+
+struct DownpushRowValuesCacheKeyHash {
+    size_t
+    operator()(const DownpushRowValuesCacheKey& key) const {
+        size_t seed = std::hash<int64_t>{}(key.segment_id);
+        seed ^= std::hash<int64_t>{}(key.field_id) + 0x9e3779b97f4a7c15ULL +
+                (seed << 6) + (seed >> 2);
+        seed ^= std::hash<int64_t>{}(key.row_count) + 0x9e3779b97f4a7c15ULL +
+                (seed << 6) + (seed >> 2);
+        return seed;
+    }
+};
+
+std::mutex g_downpush_row_values_cache_mutex;
+std::deque<DownpushRowValuesCacheKey> g_downpush_row_values_cache_order;
+std::unordered_map<DownpushRowValuesCacheKey,
+                   std::shared_ptr<std::vector<int64_t>>,
+                   DownpushRowValuesCacheKeyHash>
+    g_downpush_row_values_cache;
 
 std::optional<knowhere::BitsetView::ExtraScalarInt64PredicateOp>
 ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
@@ -77,6 +113,79 @@ ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
             return KnowhereOp::kNotEqual;
     }
     return std::nullopt;
+}
+
+bool
+IsInt64PrimaryKeyField(const segcore::SegmentInternalInterface* segment,
+                       FieldId field_id) {
+    if (segment == nullptr) {
+        return false;
+    }
+    auto primary_field_id = segment->get_schema().get_primary_field_id();
+    if (!primary_field_id.has_value() ||
+        primary_field_id.value().get() != field_id.get()) {
+        return false;
+    }
+    return segment->get_schema()[field_id].get_data_type() == DataType::INT64;
+}
+
+std::shared_ptr<std::vector<int64_t>>
+BuildInt64PrimaryKeyRowValues(const segcore::SegmentInternalInterface* segment,
+                              milvus::OpContext* op_context,
+                              FieldId field_id,
+                              int64_t row_count) {
+    std::vector<int64_t> offsets(row_count);
+    std::iota(offsets.begin(), offsets.end(), 0);
+
+    auto field_data = segment->bulk_subscript(
+        op_context, field_id, offsets.data(), row_count);
+    if (field_data == nullptr || !field_data->has_scalars() ||
+        !field_data->scalars().has_long_data() ||
+        field_data->scalars().long_data().data_size() != row_count) {
+        return nullptr;
+    }
+
+    const auto& data = field_data->scalars().long_data().data();
+    return std::make_shared<std::vector<int64_t>>(data.begin(), data.end());
+}
+
+std::shared_ptr<std::vector<int64_t>>
+GetCachedInt64PrimaryKeyRowValues(
+    const segcore::SegmentInternalInterface* segment,
+    milvus::OpContext* op_context,
+    FieldId field_id) {
+    auto row_count = segment->get_row_count();
+    DownpushRowValuesCacheKey key{
+        segment->get_segment_id(), field_id.get(), row_count};
+
+    {
+        std::lock_guard<std::mutex> lock(g_downpush_row_values_cache_mutex);
+        auto it = g_downpush_row_values_cache.find(key);
+        if (it != g_downpush_row_values_cache.end()) {
+            return it->second;
+        }
+    }
+
+    auto row_values =
+        BuildInt64PrimaryKeyRowValues(segment, op_context, field_id, row_count);
+    if (row_values == nullptr) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(g_downpush_row_values_cache_mutex);
+    auto it = g_downpush_row_values_cache.find(key);
+    if (it != g_downpush_row_values_cache.end()) {
+        return it->second;
+    }
+    g_downpush_row_values_cache.emplace(key, row_values);
+    g_downpush_row_values_cache_order.push_back(key);
+    while (g_downpush_row_values_cache_order.size() >
+           kDownpushRowValuesCacheMaxEntries) {
+        g_downpush_row_values_cache.erase(
+            g_downpush_row_values_cache_order.front());
+        g_downpush_row_values_cache_order.pop_front();
+    }
+    return row_values;
 }
 
 std::shared_ptr<CardinalDownpushSearchContext>
@@ -110,30 +219,15 @@ BuildCardinalDownpushSearchContext(
         return ctx;
     }
 
-    auto scalar_indexes = segment->PinIndex(op_context, predicate.field_id_);
-    if (scalar_indexes.empty()) {
-        return nullptr;
-    }
-    ctx->index_pins_.push_back(std::move(scalar_indexes[0]));
-
-    auto scalar_index =
-        dynamic_cast<const index::ScalarIndex<int64_t>*>(
-            ctx->index_pins_[0].get());
-    if (scalar_index == nullptr || !scalar_index->HasRawData()) {
+    if (!IsInt64PrimaryKeyField(segment, predicate.field_id_)) {
         return nullptr;
     }
 
-    auto row_count = segment->get_row_count();
-    auto row_values = std::make_shared<std::vector<int64_t>>();
-    row_values->resize(row_count);
-    for (int64_t row = 0; row < row_count; ++row) {
-        auto value = scalar_index->Reverse_Lookup(row);
-        if (!value.has_value()) {
-            return nullptr;
-        }
-        (*row_values)[row] = value.value();
+    ctx->row_values_ = GetCachedInt64PrimaryKeyRowValues(
+        segment, op_context, predicate.field_id_);
+    if (ctx->row_values_ == nullptr) {
+        return nullptr;
     }
-    ctx->row_values_ = std::move(row_values);
     return ctx;
 }
 
@@ -291,10 +385,9 @@ PhyVectorSearchNode::GetOutput() {
         filter.chunk_values = downpush_ctx->chunk_values_.data();
         filter.chunk_offsets = downpush_ctx->chunk_offsets_.data();
         filter.num_chunks = downpush_ctx->chunk_values_.size();
-        filter.row_values =
-            downpush_ctx->row_values_ == nullptr
-                ? nullptr
-                : downpush_ctx->row_values_->data();
+        filter.row_values = downpush_ctx->row_values_ == nullptr
+                                ? nullptr
+                                : downpush_ctx->row_values_->data();
         filter.row_count = static_cast<size_t>(segment_->get_row_count());
         filter.op = op.value();
         filter.arg0 = predicate->arg0_;
