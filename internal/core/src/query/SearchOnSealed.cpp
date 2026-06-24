@@ -53,11 +53,15 @@ namespace {
 
 bool
 IsIndexSupportedForCardinalDownpushV1(const std::string& index_type) {
-    // Downpush v1 is a Cardinal-only opt-in path. Ordinary Knowhere HNSW
-    // indexes and Cardinal DISKANN are intentionally unsupported in v1 so
-    // unsupported benchmark shapes fail explicitly instead of silently taking
-    // a different filtering path.
-    return index_type == knowhere::IndexEnum::INDEX_CARDINAL_TIERED;
+    // Downpush v1 is a Cardinal-only opt-in path. In cloud Cardinal builds,
+    // autoindex-backed Cardinal graph indexes are still exposed to Milvus as
+    // HNSW-family index types, so allow those graph types here. Cardinal
+    // DISKANN remains intentionally unsupported in v1.
+    return index_type == knowhere::IndexEnum::INDEX_CARDINAL_TIERED ||
+           index_type == knowhere::IndexEnum::INDEX_HNSW ||
+           index_type == knowhere::IndexEnum::INDEX_HNSW_SQ ||
+           index_type == knowhere::IndexEnum::INDEX_HNSW_PQ ||
+           index_type == knowhere::IndexEnum::INDEX_HNSW_PRQ;
 }
 
 }  // namespace
