@@ -89,6 +89,26 @@ GetInt64Value(const proto::plan::GenericValue& value) {
     return value.int64_val();
 }
 
+std::optional<double>
+GetDoubleValue(const proto::plan::GenericValue& value) {
+    switch (value.val_case()) {
+        case proto::plan::GenericValue::kInt64Val:
+            return static_cast<double>(value.int64_val());
+        case proto::plan::GenericValue::kFloatVal:
+            return value.float_val();
+        default:
+            return std::nullopt;
+    }
+}
+
+std::optional<std::string>
+GetStringValue(const proto::plan::GenericValue& value) {
+    if (value.val_case() != proto::plan::GenericValue::kStringVal) {
+        return std::nullopt;
+    }
+    return value.string_val();
+}
+
 std::optional<CardinalDownpushPredicateOp>
 ToDownpushRangeOp(proto::plan::OpType op_type) {
     switch (op_type) {
@@ -109,6 +129,82 @@ ToDownpushRangeOp(proto::plan::OpType op_type) {
     }
 }
 
+bool
+IsDownpushIntField(DataType data_type) {
+    return data_type == DataType::INT8 || data_type == DataType::INT16 ||
+           data_type == DataType::INT32 || data_type == DataType::INT64 ||
+           data_type == DataType::TIMESTAMPTZ;
+}
+
+bool
+IsDownpushFloatField(DataType data_type) {
+    return data_type == DataType::FLOAT;
+}
+
+bool
+IsDownpushStringField(DataType data_type) {
+    return data_type == DataType::VARCHAR || data_type == DataType::STRING;
+}
+
+std::optional<CardinalDownpushPredicateValueType>
+GetDownpushValueType(DataType data_type) {
+    if (IsDownpushIntField(data_type)) {
+        return CardinalDownpushPredicateValueType::Int64;
+    }
+    if (IsDownpushFloatField(data_type)) {
+        return CardinalDownpushPredicateValueType::Float;
+    }
+    if (IsDownpushStringField(data_type)) {
+        return CardinalDownpushPredicateValueType::String;
+    }
+    return std::nullopt;
+}
+
+bool
+FillPredicateArg(CardinalDownpushPredicate& predicate,
+                 const proto::plan::GenericValue& value,
+                 bool second_arg = false) {
+    switch (predicate.value_type_) {
+        case CardinalDownpushPredicateValueType::Int64: {
+            auto arg = GetInt64Value(value);
+            if (!arg.has_value()) {
+                return false;
+            }
+            if (second_arg) {
+                predicate.arg1_ = arg.value();
+            } else {
+                predicate.arg0_ = arg.value();
+            }
+            return true;
+        }
+        case CardinalDownpushPredicateValueType::Float: {
+            auto arg = GetDoubleValue(value);
+            if (!arg.has_value()) {
+                return false;
+            }
+            if (second_arg) {
+                predicate.double_arg1_ = arg.value();
+            } else {
+                predicate.double_arg0_ = arg.value();
+            }
+            return true;
+        }
+        case CardinalDownpushPredicateValueType::String: {
+            auto arg = GetStringValue(value);
+            if (!arg.has_value()) {
+                return false;
+            }
+            if (second_arg) {
+                predicate.string_arg1_ = arg.value();
+            } else {
+                predicate.string_arg0_ = arg.value();
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 std::optional<CardinalDownpushPredicate>
 TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
                                     QueryContext* query_context) {
@@ -120,53 +216,74 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
         return std::nullopt;
     }
 
-    auto try_field =
-        [&](const expr::ColumnInfo& column) -> std::optional<FieldId> {
-        if (column.data_type_ != DataType::INT64 || column.element_level_ ||
-            column.nullable_) {
+    auto try_field = [&](const expr::ColumnInfo& column)
+        -> std::optional<CardinalDownpushPredicate> {
+        if (column.element_level_ || column.nullable_ ||
+            !column.nested_path_.empty()) {
             return std::nullopt;
         }
         auto field_id = column.field_id_;
+        auto value_type = GetDownpushValueType(column.data_type_);
+        if (!value_type.has_value()) {
+            return std::nullopt;
+        }
         if (!segment->HasFieldData(field_id) && !segment->HasIndex(field_id)) {
             return std::nullopt;
         }
-        return field_id;
+        CardinalDownpushPredicate predicate;
+        predicate.field_id_ = field_id;
+        predicate.field_data_type_ = column.data_type_;
+        predicate.value_type_ = value_type.value();
+        return predicate;
     };
 
     if (auto unary =
             std::dynamic_pointer_cast<const expr::UnaryRangeFilterExpr>(
                 filter)) {
-        auto field_id = try_field(unary->column_);
-        auto value = GetInt64Value(unary->val_);
+        auto predicate = try_field(unary->column_);
         auto op = ToDownpushRangeOp(unary->op_type_);
-        if (!field_id.has_value() || !value.has_value() || !op.has_value()) {
+        if (!predicate.has_value() || !op.has_value() ||
+            !FillPredicateArg(predicate.value(), unary->val_)) {
             return std::nullopt;
         }
-        CardinalDownpushPredicate predicate;
-        predicate.field_id_ = field_id.value();
-        predicate.op_ = op.value();
-        predicate.arg0_ = value.value();
+        predicate->op_ = op.value();
+        return predicate;
+    }
+
+    if (auto binary =
+            std::dynamic_pointer_cast<const expr::BinaryRangeFilterExpr>(
+                filter)) {
+        auto predicate = try_field(binary->column_);
+        if (!predicate.has_value() ||
+            !FillPredicateArg(predicate.value(), binary->lower_val_) ||
+            !FillPredicateArg(predicate.value(), binary->upper_val_, true)) {
+            return std::nullopt;
+        }
+        predicate->op_ = CardinalDownpushPredicateOp::ScalarRange;
+        predicate->lower_inclusive_ = binary->lower_inclusive_;
+        predicate->upper_inclusive_ = binary->upper_inclusive_;
         return predicate;
     }
 
     if (auto arith =
             std::dynamic_pointer_cast<const expr::BinaryArithOpEvalRangeExpr>(
                 filter)) {
-        auto field_id = try_field(arith->column_);
+        auto predicate = try_field(arith->column_);
         auto modulus = GetInt64Value(arith->right_operand_);
         auto threshold = GetInt64Value(arith->value_);
-        if (!field_id.has_value() || !modulus.has_value() ||
-            !threshold.has_value() || modulus.value() <= 0 ||
-            threshold.value() < 0 || threshold.value() > modulus.value() ||
+        if (!predicate.has_value() ||
+            predicate->value_type_ !=
+                CardinalDownpushPredicateValueType::Int64 ||
+            !modulus.has_value() || !threshold.has_value() ||
+            modulus.value() <= 0 || threshold.value() < 0 ||
+            threshold.value() > modulus.value() ||
             arith->arith_op_type_ != proto::plan::ArithOpType::Mod ||
             arith->op_type_ != proto::plan::OpType::LessThan) {
             return std::nullopt;
         }
-        CardinalDownpushPredicate predicate;
-        predicate.field_id_ = field_id.value();
-        predicate.op_ = CardinalDownpushPredicateOp::Int64ModLessThan;
-        predicate.arg0_ = modulus.value();
-        predicate.arg1_ = threshold.value();
+        predicate->op_ = CardinalDownpushPredicateOp::Int64ModLessThan;
+        predicate->arg0_ = modulus.value();
+        predicate->arg1_ = threshold.value();
         return predicate;
     }
 
@@ -250,16 +367,16 @@ PhyFilterBitsNode::PhyFilterBitsNode(
         // normal ExprSet materialization would bypass TTL. Treat it as an
         // unsupported v1 shape instead of silently returning wrong results.
         if (HasEntityTTL(query_context_)) {
-            ThrowInfo(Unsupported,
-                      "downpush hint does not support entity TTL");
+            ThrowInfo(Unsupported, "downpush hint does not support entity TTL");
         }
 
         auto predicate = TryCompileCardinalDownpushPredicate(filter->filter(),
                                                              query_context_);
         if (!predicate.has_value()) {
             ThrowInfo(Unsupported,
-                      "downpush hint only supports sealed non-nullable INT64 "
-                      "range/mod predicates in v1");
+                      "downpush hint only supports sealed non-nullable "
+                      "scalar int/float/varchar range predicates and int mod "
+                      "predicates in v1");
         }
 
         std::optional<int64_t> estimated_filtered_out_count;

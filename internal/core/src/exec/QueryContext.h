@@ -46,14 +46,30 @@ enum class CardinalDownpushPredicateOp {
     Int64LessThan = 4,
     Int64Equal = 5,
     Int64NotEqual = 6,
+    ScalarRange = 7,
+};
+
+enum class CardinalDownpushPredicateValueType {
+    Int64 = 0,
+    Float = 1,
+    String = 2,
 };
 
 struct CardinalDownpushPredicate {
     FieldId field_id_;
+    DataType field_data_type_{DataType::NONE};
+    CardinalDownpushPredicateValueType value_type_{
+        CardinalDownpushPredicateValueType::Int64};
     CardinalDownpushPredicateOp op_{
         CardinalDownpushPredicateOp::Int64GreaterEqual};
     int64_t arg0_{0};
     int64_t arg1_{0};
+    double double_arg0_{0.0};
+    double double_arg1_{0.0};
+    std::string string_arg0_;
+    std::string string_arg1_;
+    bool lower_inclusive_{true};
+    bool upper_inclusive_{true};
     int64_t estimated_filtered_out_count_{0};
 };
 

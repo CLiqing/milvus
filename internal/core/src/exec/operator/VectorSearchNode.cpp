@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -56,9 +57,15 @@ namespace {
 constexpr size_t kDownpushRowValuesCacheMaxEntries = 16;
 
 struct CardinalDownpushSearchContext {
-    std::vector<milvus::cachinglayer::PinWrapper<Span<int64_t>>> pins_;
-    std::shared_ptr<std::vector<int64_t>> row_values_;
-    std::vector<const int64_t*> chunk_values_;
+    std::vector<milvus::cachinglayer::PinWrapper<Span<int64_t>>> int64_pins_;
+    std::vector<milvus::cachinglayer::PinWrapper<Span<float>>> float_pins_;
+    std::shared_ptr<std::vector<int64_t>> int64_row_values_;
+    std::shared_ptr<std::vector<float>> float_row_values_;
+    std::shared_ptr<std::vector<std::string>> string_row_values_;
+    std::vector<const char*> string_row_value_ptrs_;
+    std::vector<uint32_t> string_row_value_sizes_;
+    std::vector<const int64_t*> int64_chunk_values_;
+    std::vector<const float*> float_chunk_values_;
     std::vector<int64_t> chunk_offsets_;
 };
 
@@ -111,17 +118,36 @@ ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
             return KnowhereOp::kEqual;
         case CardinalDownpushPredicateOp::Int64NotEqual:
             return KnowhereOp::kNotEqual;
+        case CardinalDownpushPredicateOp::ScalarRange:
+            return KnowhereOp::kRange;
     }
     return std::nullopt;
 }
 
 bool
-IsInt64Field(const segcore::SegmentInternalInterface* segment,
-             FieldId field_id) {
+IsDownpushIntField(DataType data_type) {
+    return data_type == DataType::INT8 || data_type == DataType::INT16 ||
+           data_type == DataType::INT32 || data_type == DataType::INT64 ||
+           data_type == DataType::TIMESTAMPTZ;
+}
+
+bool
+IsDownpushFloatField(DataType data_type) {
+    return data_type == DataType::FLOAT;
+}
+
+bool
+IsDownpushStringField(DataType data_type) {
+    return data_type == DataType::VARCHAR || data_type == DataType::STRING;
+}
+
+DataType
+GetFieldDataType(const segcore::SegmentInternalInterface* segment,
+                 FieldId field_id) {
     if (segment == nullptr) {
-        return false;
+        return DataType::NONE;
     }
-    return segment->get_schema()[field_id].get_data_type() == DataType::INT64;
+    return segment->get_schema()[field_id].get_data_type();
 }
 
 std::shared_ptr<std::vector<int64_t>>
@@ -135,14 +161,33 @@ BuildInt64RowValuesFromBulkSubscript(
 
     auto field_data = segment->bulk_subscript(
         op_context, field_id, offsets.data(), row_count);
-    if (field_data == nullptr || !field_data->has_scalars() ||
-        !field_data->scalars().has_long_data() ||
-        field_data->scalars().long_data().data_size() != row_count) {
+    if (field_data == nullptr || !field_data->has_scalars()) {
         return nullptr;
     }
 
-    const auto& data = field_data->scalars().long_data().data();
-    return std::make_shared<std::vector<int64_t>>(data.begin(), data.end());
+    auto row_values = std::make_shared<std::vector<int64_t>>();
+    row_values->reserve(row_count);
+    const auto& scalars = field_data->scalars();
+    if (scalars.has_long_data() &&
+        scalars.long_data().data_size() == row_count) {
+        const auto& data = scalars.long_data().data();
+        row_values->assign(data.begin(), data.end());
+        return row_values;
+    }
+    if (scalars.has_int_data() && scalars.int_data().data_size() == row_count) {
+        const auto& data = scalars.int_data().data();
+        for (const auto value : data) {
+            row_values->push_back(static_cast<int64_t>(value));
+        }
+        return row_values;
+    }
+    if (scalars.has_timestamptz_data() &&
+        scalars.timestamptz_data().data_size() == row_count) {
+        const auto& data = scalars.timestamptz_data().data();
+        row_values->assign(data.begin(), data.end());
+        return row_values;
+    }
+    return nullptr;
 }
 
 std::shared_ptr<std::vector<int64_t>>
@@ -184,6 +229,48 @@ GetCachedInt64RowValuesFromBulkSubscript(
     return row_values;
 }
 
+std::shared_ptr<std::vector<float>>
+BuildFloatRowValuesFromBulkSubscript(
+    const segcore::SegmentInternalInterface* segment,
+    milvus::OpContext* op_context,
+    FieldId field_id,
+    int64_t row_count) {
+    std::vector<int64_t> offsets(row_count);
+    std::iota(offsets.begin(), offsets.end(), 0);
+
+    auto field_data = segment->bulk_subscript(
+        op_context, field_id, offsets.data(), row_count);
+    if (field_data == nullptr || !field_data->has_scalars() ||
+        !field_data->scalars().has_float_data() ||
+        field_data->scalars().float_data().data_size() != row_count) {
+        return nullptr;
+    }
+
+    const auto& data = field_data->scalars().float_data().data();
+    return std::make_shared<std::vector<float>>(data.begin(), data.end());
+}
+
+std::shared_ptr<std::vector<std::string>>
+BuildStringRowValuesFromBulkSubscript(
+    const segcore::SegmentInternalInterface* segment,
+    milvus::OpContext* op_context,
+    FieldId field_id,
+    int64_t row_count) {
+    std::vector<int64_t> offsets(row_count);
+    std::iota(offsets.begin(), offsets.end(), 0);
+
+    auto field_data = segment->bulk_subscript(
+        op_context, field_id, offsets.data(), row_count);
+    if (field_data == nullptr || !field_data->has_scalars() ||
+        !field_data->scalars().has_string_data() ||
+        field_data->scalars().string_data().data_size() != row_count) {
+        return nullptr;
+    }
+
+    const auto& data = field_data->scalars().string_data().data();
+    return std::make_shared<std::vector<std::string>>(data.begin(), data.end());
+}
+
 std::shared_ptr<CardinalDownpushSearchContext>
 BuildCardinalDownpushSearchContext(
     const segcore::SegmentInternalInterface* segment,
@@ -192,15 +279,22 @@ BuildCardinalDownpushSearchContext(
     if (segment == nullptr || segment->type() != SegmentType::Sealed) {
         return nullptr;
     }
+    auto field_data_type = GetFieldDataType(segment, predicate.field_id_);
+    if (field_data_type != predicate.field_data_type_) {
+        return nullptr;
+    }
 
     auto ctx = std::make_shared<CardinalDownpushSearchContext>();
-    if (segment->HasFieldData(predicate.field_id_)) {
+    if (predicate.value_type_ == CardinalDownpushPredicateValueType::Int64 &&
+        segment->HasFieldData(predicate.field_id_) &&
+        (field_data_type == DataType::INT64 ||
+         field_data_type == DataType::TIMESTAMPTZ)) {
         auto num_chunks = segment->num_chunk_data(predicate.field_id_);
         if (num_chunks <= 0) {
             return nullptr;
         }
-        ctx->pins_.reserve(num_chunks);
-        ctx->chunk_values_.reserve(num_chunks);
+        ctx->int64_pins_.reserve(num_chunks);
+        ctx->int64_chunk_values_.reserve(num_chunks);
         ctx->chunk_offsets_.reserve(num_chunks + 1);
         for (int64_t chunk_id = 0; chunk_id < num_chunks; ++chunk_id) {
             ctx->chunk_offsets_.push_back(
@@ -208,23 +302,147 @@ BuildCardinalDownpushSearchContext(
             auto pin = segment->chunk_data<int64_t>(
                 op_context, predicate.field_id_, chunk_id);
             auto chunk = pin.get();
-            ctx->chunk_values_.push_back(chunk.data());
-            ctx->pins_.push_back(std::move(pin));
+            ctx->int64_chunk_values_.push_back(chunk.data());
+            ctx->int64_pins_.push_back(std::move(pin));
         }
         ctx->chunk_offsets_.push_back(segment->get_row_count());
         return ctx;
     }
 
-    if (!IsInt64Field(segment, predicate.field_id_)) {
-        return nullptr;
+    if (predicate.value_type_ == CardinalDownpushPredicateValueType::Float &&
+        segment->HasFieldData(predicate.field_id_) &&
+        field_data_type == DataType::FLOAT) {
+        auto num_chunks = segment->num_chunk_data(predicate.field_id_);
+        if (num_chunks <= 0) {
+            return nullptr;
+        }
+        ctx->float_pins_.reserve(num_chunks);
+        ctx->float_chunk_values_.reserve(num_chunks);
+        ctx->chunk_offsets_.reserve(num_chunks + 1);
+        for (int64_t chunk_id = 0; chunk_id < num_chunks; ++chunk_id) {
+            ctx->chunk_offsets_.push_back(
+                segment->num_rows_until_chunk(predicate.field_id_, chunk_id));
+            auto pin = segment->chunk_data<float>(
+                op_context, predicate.field_id_, chunk_id);
+            auto chunk = pin.get();
+            ctx->float_chunk_values_.push_back(chunk.data());
+            ctx->float_pins_.push_back(std::move(pin));
+        }
+        ctx->chunk_offsets_.push_back(segment->get_row_count());
+        return ctx;
     }
 
-    ctx->row_values_ = GetCachedInt64RowValuesFromBulkSubscript(
-        segment, op_context, predicate.field_id_);
-    if (ctx->row_values_ == nullptr) {
-        return nullptr;
+    auto row_count = segment->get_row_count();
+    if (predicate.value_type_ == CardinalDownpushPredicateValueType::Int64 &&
+        IsDownpushIntField(field_data_type)) {
+        ctx->int64_row_values_ = GetCachedInt64RowValuesFromBulkSubscript(
+            segment, op_context, predicate.field_id_);
+        if (ctx->int64_row_values_ == nullptr) {
+            return nullptr;
+        }
+        return ctx;
     }
-    return ctx;
+
+    if (predicate.value_type_ == CardinalDownpushPredicateValueType::Float &&
+        IsDownpushFloatField(field_data_type)) {
+        ctx->float_row_values_ = BuildFloatRowValuesFromBulkSubscript(
+            segment, op_context, predicate.field_id_, row_count);
+        if (ctx->float_row_values_ == nullptr) {
+            return nullptr;
+        }
+        return ctx;
+    }
+
+    if (predicate.value_type_ == CardinalDownpushPredicateValueType::String &&
+        IsDownpushStringField(field_data_type)) {
+        ctx->string_row_values_ = BuildStringRowValuesFromBulkSubscript(
+            segment, op_context, predicate.field_id_, row_count);
+        if (ctx->string_row_values_ == nullptr) {
+            return nullptr;
+        }
+        ctx->string_row_value_ptrs_.reserve(ctx->string_row_values_->size());
+        ctx->string_row_value_sizes_.reserve(ctx->string_row_values_->size());
+        for (const auto& value : *ctx->string_row_values_) {
+            ctx->string_row_value_ptrs_.push_back(value.data());
+            ctx->string_row_value_sizes_.push_back(
+                static_cast<uint32_t>(value.size()));
+        }
+        return ctx;
+    }
+
+    return nullptr;
+}
+
+std::optional<knowhere::BitsetView::ExtraScalarPredicateValueType>
+ToKnowherePredicateValueType(CardinalDownpushPredicateValueType value_type) {
+    using KnowhereValueType =
+        knowhere::BitsetView::ExtraScalarPredicateValueType;
+    switch (value_type) {
+        case CardinalDownpushPredicateValueType::Int64:
+            return KnowhereValueType::kInt64;
+        case CardinalDownpushPredicateValueType::Float:
+            return KnowhereValueType::kFloat;
+        case CardinalDownpushPredicateValueType::String:
+            return KnowhereValueType::kString;
+    }
+    return std::nullopt;
+}
+
+void
+FillKnowhereDownpushValueSource(
+    knowhere::BitsetView::ExtraScalarInt64PredicateFilter& filter,
+    const CardinalDownpushSearchContext& ctx) {
+    filter.row_values = ctx.int64_row_values_ == nullptr
+                            ? nullptr
+                            : ctx.int64_row_values_->data();
+    filter.chunk_values = ctx.int64_chunk_values_.data();
+    filter.row_float_values = ctx.float_row_values_ == nullptr
+                                  ? nullptr
+                                  : ctx.float_row_values_->data();
+    filter.chunk_float_values = ctx.float_chunk_values_.data();
+    filter.row_string_values = ctx.string_row_value_ptrs_.data();
+    filter.row_string_sizes = ctx.string_row_value_sizes_.data();
+    filter.chunk_offsets = ctx.chunk_offsets_.data();
+    if (!ctx.int64_chunk_values_.empty()) {
+        filter.num_chunks = ctx.int64_chunk_values_.size();
+    } else if (!ctx.float_chunk_values_.empty()) {
+        filter.num_chunks = ctx.float_chunk_values_.size();
+    }
+}
+
+void
+FillKnowhereDownpushArgs(
+    knowhere::BitsetView::ExtraScalarInt64PredicateFilter& filter,
+    const CardinalDownpushPredicate& predicate) {
+    filter.arg0 = predicate.arg0_;
+    filter.arg1 = predicate.arg1_;
+    filter.double_arg0 = predicate.double_arg0_;
+    filter.double_arg1 = predicate.double_arg1_;
+    filter.string_arg0_data = predicate.string_arg0_.data();
+    filter.string_arg0_size =
+        static_cast<uint32_t>(predicate.string_arg0_.size());
+    filter.string_arg1_data = predicate.string_arg1_.data();
+    filter.string_arg1_size =
+        static_cast<uint32_t>(predicate.string_arg1_.size());
+    filter.lower_inclusive = predicate.lower_inclusive_;
+    filter.upper_inclusive = predicate.upper_inclusive_;
+}
+
+bool
+IsDownpushPredicateSourceReady(const CardinalDownpushSearchContext& ctx,
+                               CardinalDownpushPredicateValueType value_type) {
+    switch (value_type) {
+        case CardinalDownpushPredicateValueType::Int64:
+            return ctx.int64_row_values_ != nullptr ||
+                   !ctx.int64_chunk_values_.empty();
+        case CardinalDownpushPredicateValueType::Float:
+            return ctx.float_row_values_ != nullptr ||
+                   !ctx.float_chunk_values_.empty();
+        case CardinalDownpushPredicateValueType::String:
+            return ctx.string_row_values_ != nullptr &&
+                   !ctx.string_row_value_ptrs_.empty();
+    }
+    return false;
 }
 
 }  // namespace
@@ -371,23 +589,22 @@ PhyVectorSearchNode::GetOutput() {
                 "downpush hint does not support element-level vector search");
         }
         auto op = ToKnowherePredicateOp(predicate->op_);
+        auto value_type = ToKnowherePredicateValueType(predicate->value_type_);
         downpush_ctx = BuildCardinalDownpushSearchContext(
             segment_, op_context, predicate.value());
-        if (!op.has_value() || downpush_ctx == nullptr) {
+        if (!op.has_value() || !value_type.has_value() ||
+            downpush_ctx == nullptr ||
+            !IsDownpushPredicateSourceReady(*downpush_ctx,
+                                            predicate->value_type_)) {
             ThrowInfo(UnexpectedError,
                       "failed to build Cardinal downpush search context");
         }
         knowhere::BitsetView::ExtraScalarInt64PredicateFilter filter;
-        filter.chunk_values = downpush_ctx->chunk_values_.data();
-        filter.chunk_offsets = downpush_ctx->chunk_offsets_.data();
-        filter.num_chunks = downpush_ctx->chunk_values_.size();
-        filter.row_values = downpush_ctx->row_values_ == nullptr
-                                ? nullptr
-                                : downpush_ctx->row_values_->data();
+        filter.value_type = value_type.value();
+        FillKnowhereDownpushValueSource(filter, *downpush_ctx);
         filter.row_count = static_cast<size_t>(segment_->get_row_count());
         filter.op = op.value();
-        filter.arg0 = predicate->arg0_;
-        filter.arg1 = predicate->arg1_;
+        FillKnowhereDownpushArgs(filter, predicate.value());
         search_view.set_extra_scalar_int64_predicate_filter(
             filter,
             static_cast<size_t>(predicate->estimated_filtered_out_count_));
