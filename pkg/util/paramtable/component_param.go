@@ -4510,7 +4510,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	p.MaxGroupNQ = ParamItem{
 		Key:          "queryNode.grouping.maxNQ",
 		Version:      "2.0.0",
-		DefaultValue: "16",
+		DefaultValue: "1000",
 		Export:       true,
 	}
 	p.MaxGroupNQ.Init(base.mgr)
@@ -4518,7 +4518,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	p.NQMergeRatio = ParamItem{
 		Key:          "queryNode.grouping.nqMergeRatio",
 		Version:      "2.6.17",
-		DefaultValue: "3.0",
+		DefaultValue: "0",
 		Doc:          "Maximum ratio between merged total NQ and the smaller task NQ when grouping query node read tasks.",
 		Export:       true,
 	}
@@ -4527,7 +4527,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	p.MaxDeadlineMergeGap = ParamItem{
 		Key:          "queryNode.grouping.maxDeadlineMergeGap",
 		Version:      "2.6.17",
-		DefaultValue: "50ms",
+		DefaultValue: "-1",
 		Doc:          "Maximum allowed gap between task context deadlines when grouping query node read tasks. Tasks with only one deadline cannot be grouped. Set a negative duration to disable this check.",
 		Formatter:    formatDurationWithMillisecondFallback,
 		Export:       true,
