@@ -15,7 +15,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 	"github.com/milvus-io/milvus/pkg/v3/util/lifetime"
-	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
@@ -31,10 +30,11 @@ const (
 // newScheduler create a scheduler with given schedule policy.
 func newScheduler(policy schedulePolicy) Scheduler {
 	maxReadConcurrency := paramtable.Get().QueryNodeCfg.MaxReadConcurrency.GetAsInt()
+	maxReceiveChanSize := paramtable.Get().QueryNodeCfg.MaxReceiveChanSize.GetAsInt()
 	log.Info("query node use concurrent safe scheduler", zap.Int("max_concurrency", maxReadConcurrency))
 	return &scheduler{
 		policy:           policy,
-		receiveChan:      make(chan addTaskReq),
+		receiveChan:      make(chan addTaskReq, maxReceiveChanSize),
 		clearChan:        make(chan clearQueuedReq),
 		execChan:         make(chan Task),
 		pool:             conc.NewPool[any](maxReadConcurrency, conc.WithPreAlloc(true)),
@@ -87,19 +87,13 @@ func (s *scheduler) Add(task Task) (err error) {
 
 	errCh := make(chan error, 1)
 
-	req := addTaskReq{
+	// Keep Add on the pre-9f hot path: enqueue into a buffered channel quickly
+	// and let the scheduler goroutine own cancellation/queue checks.
+	s.receiveChan <- addTaskReq{
 		task: task,
 		err:  errCh,
 	}
-
-	// start a new in queue span and send task to add chan
-	ctx := task.Context()
-	select {
-	case s.receiveChan <- req:
-		err = <-errCh
-	case <-ctx.Done():
-		err = ctx.Err()
-	}
+	err = <-errCh
 
 	return
 }
@@ -224,18 +218,8 @@ func (s *scheduler) consumeRecvChan(req addTaskReq, limit int, now time.Time) {
 // HandleAddTaskRequest handle a add task request.
 // Return true if the process can be continued.
 func (s *scheduler) handleAddTaskRequest(req addTaskReq, maxWaitTaskNum int64, now time.Time) bool {
-	if maxWaitTaskNum > 0 && s.GetWaitingTaskTotal() >= maxWaitTaskNum {
-		s.cleanupExpiredTasks(now)
-	}
-
 	if err := req.task.Context().Err(); err != nil {
 		log.Warn("task canceled before enqueue", zap.Error(err))
-		req.err <- err
-	} else if maxWaitTaskNum > 0 && s.GetWaitingTaskTotal() >= maxWaitTaskNum {
-		err := merr.WrapErrTooManyRequests(
-			int32(maxWaitTaskNum),
-			fmt.Sprintf("limit by %s", paramtable.Get().QueryNodeCfg.MaxUnsolvedQueueSize.Key),
-		)
 		req.err <- err
 	} else {
 		// Push the task into the policy to schedule and update the counter of the ready queue.
@@ -345,20 +329,9 @@ func (s *scheduler) setupExecListener(lastWaitingTask *queuedTask, now time.Time
 	nq := int64(0)
 	if !lastWaitingTask.valid() {
 		// No task is waiting to send to execChan, schedule a new one from queue.
-		for {
-			lastWaitingTask = s.policy.Pop(now)
-			if !lastWaitingTask.valid() {
-				break
-			}
-			if err := lastWaitingTask.Context().Err(); err != nil {
-				s.updateWaitingTaskCounter(-1, -lastWaitingTask.NQ())
-				s.recordReadTaskQueueDuration(lastWaitingTask, now, readTaskQueueOutcomeExpired)
-				lastWaitingTask.Done(err)
-				lastWaitingTask = nil
-				continue
-			}
+		lastWaitingTask = s.policy.Pop(now)
+		if lastWaitingTask.valid() {
 			s.recordReadTaskQueueDuration(lastWaitingTask, now, readTaskQueueOutcomeScheduled)
-			break
 		}
 	}
 	if lastWaitingTask.valid() {

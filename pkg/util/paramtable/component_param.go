@@ -3599,6 +3599,7 @@ type queryNodeConfig struct {
 	ReadAheadPolicy     ParamItem `refreshable:"false"`
 	ChunkCacheWarmingUp ParamItem `refreshable:"true"`
 
+	MaxReceiveChanSize    ParamItem `refreshable:"false"`
 	MaxUnsolvedQueueSize  ParamItem `refreshable:"true"`
 	MaxReadConcurrency    ParamItem `refreshable:"true"`
 	MaxGpuReadConcurrency ParamItem `refreshable:"false"`
@@ -4488,10 +4489,18 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	}
 	p.MaxGpuReadConcurrency.Init(base.mgr)
 
+	p.MaxReceiveChanSize = ParamItem{
+		Key:          "queryNode.scheduler.receiveChanSize",
+		Version:      "2.0.0",
+		DefaultValue: "10240",
+		Export:       true,
+	}
+	p.MaxReceiveChanSize.Init(base.mgr)
+
 	p.MaxUnsolvedQueueSize = ParamItem{
 		Key:          "queryNode.scheduler.unsolvedQueueSize",
 		Version:      "2.0.0",
-		DefaultValue: "1024",
+		DefaultValue: "10240",
 		Export:       true,
 	}
 	p.MaxUnsolvedQueueSize.Init(base.mgr)
@@ -4499,7 +4508,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	p.MaxGroupNQ = ParamItem{
 		Key:          "queryNode.grouping.maxNQ",
 		Version:      "2.0.0",
-		DefaultValue: "16",
+		DefaultValue: "1000",
 		Export:       true,
 	}
 	p.MaxGroupNQ.Init(base.mgr)
@@ -4507,7 +4516,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	p.NQMergeRatio = ParamItem{
 		Key:          "queryNode.grouping.nqMergeRatio",
 		Version:      "2.6.17",
-		DefaultValue: "3.0",
+		DefaultValue: "0",
 		Doc:          "Maximum ratio between merged total NQ and the smaller task NQ when grouping query node read tasks.",
 		Export:       true,
 	}
@@ -4516,7 +4525,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	p.MaxDeadlineMergeGap = ParamItem{
 		Key:          "queryNode.grouping.maxDeadlineMergeGap",
 		Version:      "2.6.17",
-		DefaultValue: "50ms",
+		DefaultValue: "-1ms",
 		Doc:          "Maximum allowed gap between task context deadlines when grouping query node read tasks. Tasks with only one deadline cannot be grouped. Set a negative duration to disable this check.",
 		Formatter:    formatDurationWithMillisecondFallback,
 		Export:       true,
@@ -4776,7 +4785,7 @@ user-task-polling:
 	p.SchedulePolicyTaskDeadlineAdvance = ParamItem{
 		Key:          "queryNode.scheduler.scheduleReadPolicy.taskDeadlineAdvance",
 		Version:      "2.6.17",
-		DefaultValue: "50ms",
+		DefaultValue: "-1ms",
 		Doc:          "Advance duration for cleaning queued query node read tasks before their context deadline. It supports duration strings such as 50ms and 1s. A bare number is interpreted as milliseconds for compatibility.",
 		Formatter:    formatDurationWithMillisecondFallback,
 		Export:       true,

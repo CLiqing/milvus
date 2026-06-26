@@ -138,47 +138,15 @@ func (q *mergeTaskQueue) expire(d time.Duration) bool {
 	return false
 }
 
-func canMergeNQ(task MergeTask, other MergeTask, maxNQ int64, nqMergeRatio float64) bool {
-	totalNQ := task.NQ() + other.NQ()
-	if totalNQ > maxNQ {
-		return false
-	}
-	if nqMergeRatio <= 0 {
-		return true
-	}
-	minNQ := task.MinNQ()
-	if otherMinNQ := other.MinNQ(); otherMinNQ < minNQ {
-		minNQ = otherMinNQ
-	}
-	return minNQ > 0 && float64(totalNQ)/float64(minNQ) <= nqMergeRatio
-}
-
-func canMergeDeadline(task *queuedTask, other *queuedTask, maxDeadlineMergeGap time.Duration) bool {
-	if maxDeadlineMergeGap < 0 {
-		return true
-	}
-	deadline, ok := task.Context().Deadline()
-	otherDeadline, otherOk := other.Context().Deadline()
-	if !ok && !otherOk {
-		return true
-	}
-	if ok != otherOk {
-		return false
-	}
-	if deadline.After(otherDeadline) {
-		deadline, otherDeadline = otherDeadline, deadline
-	}
-	return otherDeadline.Sub(deadline) <= maxDeadlineMergeGap
-}
-
 // tryMerge try to a new task to any task in queue.
-func (q *mergeTaskQueue) tryMerge(task *queuedTask, maxNQ int64, nqMergeRatio float64, maxDeadlineMergeGap time.Duration) bool {
+func (q *mergeTaskQueue) tryMerge(task *queuedTask, maxNQ int64, _ float64, _ time.Duration) bool {
 	mergeTask := tryIntoMergeTask(task.Task)
 	if mergeTask == nil {
 		return false
 	}
+	nqRest := maxNQ - mergeTask.NQ()
 	// No need to perform any merge if task.nq is greater than maxNQ.
-	if mergeTask.NQ() >= maxNQ {
+	if nqRest <= 0 {
 		return false
 	}
 	for i := len(q.tasks) - 1; i >= 0; i-- {
@@ -188,9 +156,7 @@ func (q *mergeTaskQueue) tryMerge(task *queuedTask, maxNQ int64, nqMergeRatio fl
 		}
 		if taskInQueue := tryIntoMergeTask(taskInQueue.Task); taskInQueue != nil {
 			// Try to merge it if limit of nq is enough.
-			if (canMergeNQ(taskInQueue, mergeTask, maxNQ, nqMergeRatio) &&
-				canMergeDeadline(q.tasks[i], task, maxDeadlineMergeGap)) &&
-				taskInQueue.MergeWith(mergeTask) {
+			if taskInQueue.NQ() <= nqRest && taskInQueue.MergeWith(mergeTask) {
 				return true
 			}
 		}

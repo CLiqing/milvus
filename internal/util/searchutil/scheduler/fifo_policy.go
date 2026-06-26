@@ -35,9 +35,7 @@ func (p *fifoPolicy) Push(task *queuedTask) (int, error) {
 	// Try to merge task if task can merge.
 	if t := tryIntoMergeTask(task.Task); t != nil {
 		maxNQ := pt.QueryNodeCfg.MaxGroupNQ.GetAsInt64()
-		nqMergeRatio := pt.QueryNodeCfg.NQMergeRatio.GetAsFloat()
-		maxDeadlineMergeGap := pt.QueryNodeCfg.MaxDeadlineMergeGap.GetAsDurationByParse()
-		if p.queue.tryMerge(task, maxNQ, nqMergeRatio, maxDeadlineMergeGap) {
+		if p.queue.tryMerge(task, maxNQ, 0, -1) {
 			return 0, nil
 		}
 	}
