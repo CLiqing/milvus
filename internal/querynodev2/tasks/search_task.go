@@ -25,6 +25,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/resource"
 	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
@@ -102,10 +103,6 @@ func (t *SearchTask) subTaskAt(i int) *SearchTask {
 
 func (t *SearchTask) IsGpuIndex() bool {
 	return t.collection.IsGpuIndex()
-}
-
-func (t *SearchTask) Context() context.Context {
-	return t.ctx
 }
 
 func (t *SearchTask) PreExecute() error {
@@ -254,59 +251,93 @@ func (t *SearchTask) Execute() error {
 		return acc + segments.GetSegmentRelatedDataSize(seg)
 	}, 0)
 
-	tr.RecordSpan() // consume search latency so reduce metric is pure reduce time
-
-	// Use a dedicated TimeRecorder for the reduce metric. The result-building
-	// path calls tr.ElapseSpan() for CostAggregation.ServiceTime — that has a
-	// side effect of resetting tr.last and would steal part of the span if we
-	// measured the reduce metric off tr.
-	reduceTR := timerecord.NewTimeRecorder("reduce")
-
-	// Mutates results in place; must run before Arrow export.
-	allSearchCount, err := segcore.PrepareSearchResultsForExport(
+	tr.RecordSpan()
+	blobs, err := segcore.ReduceSearchResultsAndFillData(
 		t.ctx,
 		searchReq.Plan(),
 		searchReq.PlaceholderGroup(),
 		results,
+		int64(len(results)),
 		t.originNqs,
 		t.originTopks,
 	)
 	if err != nil {
-		mlog.Warn(t.ctx, "failed to prepare search results for export", mlog.Err(err))
+		mlog.Warn(t.ctx, "failed to reduce search results", mlog.Err(err))
 		return err
 	}
-
-	// Export per-segment results as Arrow DataFrames
-	// TODO: extract extra field IDs from L0 rerank scorer filters when rerank is configured
-	segDFs, err := t.exportSearchResultsAsArrow(results, searchReq.Plan(), nil)
+	allTasks := append([]*SearchTask{t}, t.others...)
+	refs, err := resource.NewSharedPinnedRefs(
+		blobs,
+		len(allTasks),
+		segcore.DeleteSearchResultDataBlobs,
+		"SearchResultDataBlobs",
+	)
 	if err != nil {
-		return err
-	}
-	defer func() {
-		for _, df := range segDFs {
-			if df != nil {
-				df.Release()
-			}
-		}
-	}()
-
-	if err := t.applyBoostScores(segDFs, searchedSegments, searchReq); err != nil {
+		segcore.DeleteSearchResultDataBlobs(blobs)
 		return err
 	}
 
-	if err := t.executeGoReduce(segDFs, results, searchReq, metricType, tr, relatedDataSize, allSearchCount); err != nil {
-		return err
-	}
-
-	// Reduce metric covers the full Go-reduce pipeline (Arrow export +
-	// heap merge + Late Materialization + proto marshal), aligned with the
-	// legacy C++ reduce-and-fill boundary so A/B comparisons are meaningful.
 	metrics.QueryNodeReduceLatency.WithLabelValues(
 		fmt.Sprint(t.GetNodeID()),
 		metrics.SearchLabel,
 		metrics.ReduceSegments,
 		metrics.BatchReduce).
-		Observe(float64(reduceTR.RecordSpan().Microseconds()) / 1000.0)
+		Observe(float64(tr.RecordSpan().Microseconds()) / 1000.0)
+
+	zeroCopy := paramtable.Get().QueryNodeCfg.EnableResultZeroCopy.GetAsBool()
+
+	// Phase 1: build all results.
+	var phaseErr error
+
+	for i := range t.originNqs {
+		blob, cost, err := segcore.GetSearchResultDataBlob(t.ctx, blobs, i)
+		if err != nil {
+			phaseErr = err
+			break
+		}
+		slicedBlob := blob
+		if !zeroCopy && len(blob) > 0 {
+			slicedBlob = make([]byte, len(blob))
+			copy(slicedBlob, blob)
+		}
+		allTasks[i].result = &internalpb.SearchResults{
+			Base: &commonpb.MsgBase{
+				SourceID: t.GetNodeID(),
+			},
+			Status:         merr.Success(),
+			MetricType:     metricType,
+			NumQueries:     t.originNqs[i],
+			TopK:           t.originTopks[i],
+			SlicedBlob:     slicedBlob,
+			SlicedOffset:   1,
+			SlicedNumCount: 1,
+			CostAggregation: &internalpb.CostAggregation{
+				ServiceTime:          tr.ElapseSpan().Milliseconds(),
+				TotalRelatedDataSize: relatedDataSize,
+			},
+			ScannedRemoteBytes: cost.ScannedRemoteBytes,
+			ScannedTotalBytes:  cost.ScannedTotalBytes,
+		}
+	}
+
+	if phaseErr != nil {
+		for _, task := range allTasks {
+			task.result = nil
+		}
+		for _, ref := range refs {
+			ref.Release()
+		}
+		return phaseErr
+	}
+	if zeroCopy {
+		for i, task := range allTasks {
+			resource.MsgPins.Pin(task.result, refs[i].Release)
+		}
+	} else {
+		for _, ref := range refs {
+			ref.Release()
+		}
+	}
 	return nil
 }
 
@@ -343,7 +374,8 @@ func (t *SearchTask) Merge(other *SearchTask) bool {
 		t.req.GetReq().GetMvccTimestamp() != other.req.GetReq().GetMvccTimestamp() ||
 		t.req.GetReq().GetDslType() != other.req.GetReq().GetDslType() ||
 		t.req.GetDmlChannels()[0] != other.req.GetDmlChannels()[0] ||
-		(diffTopk && ratio > paramtable.Get().QueryNodeCfg.TopKMergeRatio.GetAsFloat()) ||
+		nq+otherNq > paramtable.Get().QueryNodeCfg.MaxGroupNQ.GetAsInt64() ||
+		diffTopk && ratio > paramtable.Get().QueryNodeCfg.TopKMergeRatio.GetAsFloat() ||
 		!funcutil.SliceSetEqual(t.req.GetReq().GetPartitionIDs(), other.req.GetReq().GetPartitionIDs()) ||
 		!funcutil.SliceSetEqual(t.req.GetSegmentIDs(), other.req.GetSegmentIDs()) ||
 		!bytes.Equal(t.req.GetReq().GetSerializedExprPlan(), other.req.GetReq().GetSerializedExprPlan()) {
@@ -374,6 +406,10 @@ func (t *SearchTask) Done(err error) {
 	}
 }
 
+func (t *SearchTask) Canceled() error {
+	return t.ctx.Err()
+}
+
 func (t *SearchTask) Wait() error {
 	return <-t.notifier
 }
@@ -391,19 +427,6 @@ func (t *SearchTask) SearchResult() *internalpb.SearchResults {
 
 func (t *SearchTask) NQ() int64 {
 	return t.nq
-}
-
-func (t *SearchTask) MinNQ() int64 {
-	if len(t.originNqs) == 0 {
-		return t.nq
-	}
-	minNQ := t.originNqs[0]
-	for _, nq := range t.originNqs[1:] {
-		if nq < minNQ {
-			minNQ = nq
-		}
-	}
-	return minNQ
 }
 
 func (t *SearchTask) MergeWith(other scheduler.Task) bool {

@@ -2,11 +2,8 @@ package scheduler
 
 import (
 	"context"
-	"fmt"
 	"sync"
-	"time"
 
-	"github.com/cockroachdb/errors"
 	"go.uber.org/atomic"
 
 	"github.com/milvus-io/milvus/internal/querynodev2/collector"
@@ -14,27 +11,22 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 	"github.com/milvus-io/milvus/pkg/v3/util/lifetime"
-	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
 const (
 	maxReceiveChanBatchConsumeNum = 100
-
-	readTaskQueueOutcomeScheduled = "scheduled"
-	readTaskQueueOutcomeExpired   = "expired"
-	readTaskQueueOutcomeCleared   = "cleared"
 )
 
 // newScheduler create a scheduler with given schedule policy.
 func newScheduler(policy schedulePolicy) Scheduler {
 	maxReadConcurrency := paramtable.Get().QueryNodeCfg.MaxReadConcurrency.GetAsInt()
+	maxReceiveChanSize := paramtable.Get().QueryNodeCfg.MaxReceiveChanSize.GetAsInt()
 	mlog.Info(context.TODO(), "query node use concurrent safe scheduler", mlog.Int("max_concurrency", maxReadConcurrency))
 	return &scheduler{
 		policy:           policy,
-		receiveChan:      make(chan addTaskReq),
-		clearChan:        make(chan clearQueuedReq),
+		receiveChan:      make(chan addTaskReq, maxReceiveChanSize),
 		execChan:         make(chan Task),
 		pool:             conc.NewPool[any](maxReadConcurrency, conc.WithPreAlloc(true)),
 		gpuPool:          conc.NewPool[any](paramtable.Get().QueryNodeCfg.MaxGpuReadConcurrency.GetAsInt(), conc.WithPreAlloc(true)),
@@ -48,22 +40,10 @@ type addTaskReq struct {
 	err  chan<- error
 }
 
-type clearQueuedReq struct {
-	filter TaskFilter
-	reason string
-	resp   chan<- clearQueuedResp
-}
-
-type clearQueuedResp struct {
-	result ClearResult
-	err    error
-}
-
 // scheduler is a general concurrent safe scheduler implementation by wrapping a schedule policy.
 type scheduler struct {
 	policy      schedulePolicy
 	receiveChan chan addTaskReq
-	clearChan   chan clearQueuedReq
 	execChan    chan Task
 	pool        *conc.Pool[any]
 	gpuPool     *conc.Pool[any]
@@ -86,36 +66,26 @@ func (s *scheduler) Add(task Task) (err error) {
 
 	errCh := make(chan error, 1)
 
-	req := addTaskReq{
+	// TODO: add operation should be fast, is UnsolveLen metric unnesscery?
+	metrics.QueryNodeReadTaskUnsolveLen.WithLabelValues(paramtable.GetStringNodeID()).Inc()
+
+	// start a new in queue span and send task to add chan
+	s.receiveChan <- addTaskReq{
 		task: task,
 		err:  errCh,
 	}
+	err = <-errCh
 
-	// start a new in queue span and send task to add chan
-	ctx := task.Context()
-	select {
-	case s.receiveChan <- req:
-		err = <-errCh
-	case <-ctx.Done():
-		err = ctx.Err()
-	}
-
-	return err
+	metrics.QueryNodeReadTaskUnsolveLen.WithLabelValues(paramtable.GetStringNodeID()).Dec()
+	return
 }
 
 func (s *scheduler) ClearQueued(ctx context.Context, filter TaskFilter, reason string) (ClearResult, error) {
-	if err := s.lifetime.Add(lifetime.IsWorking); err != nil {
-		return ClearResult{}, err
-	}
-	defer s.lifetime.Done()
-
-	respCh := make(chan clearQueuedResp, 1)
 	select {
-	case s.clearChan <- clearQueuedReq{filter: filter, reason: reason, resp: respCh}:
-		resp := <-respCh
-		return resp.result, resp.err
 	case <-ctx.Done():
 		return ClearResult{}, ctx.Err()
+	default:
+		return ClearResult{}, nil
 	}
 }
 
@@ -152,28 +122,23 @@ func (s *scheduler) Stop() {
 // schedule the owned task asynchronously and continuously.
 func (s *scheduler) schedule() {
 	defer s.wg.Done()
-	var task *queuedTask
+	var task Task
 	for {
 		s.setupReadyLenMetric()
 
 		var execChan chan Task
-		var execTask Task
 		nq := int64(0)
-		now := time.Now()
-		task, nq, execChan = s.setupExecListener(task, now)
-		if task.valid() {
-			execTask = task.Task
-		}
+		task, nq, execChan = s.setupExecListener(task)
 
 		select {
 		case req, ok := <-s.receiveChan:
 			if !ok {
 				mlog.Info(context.TODO(), "receiveChan closed, processing remaining request")
 				// drain policy maintained task
-				for task.valid() {
-					execChan <- task.Task
+				for task != nil {
+					execChan <- task
 					s.updateWaitingTaskCounter(-1, -nq)
-					task = s.produceExecChan(now)
+					task = s.produceExecChan()
 				}
 				mlog.Info(context.TODO(), "all task put into exeChan, schedule worker exit")
 				close(s.execChan)
@@ -181,26 +146,22 @@ func (s *scheduler) schedule() {
 			}
 			// Receive add operation request and return the process result.
 			// And consume recv chan as much as possible.
-			s.consumeRecvChan(req, maxReceiveChanBatchConsumeNum, now)
-		case req := <-s.clearChan:
-			var result ClearResult
-			result, task = s.clearQueuedTasks(req.filter, req.reason, task, now)
-			req.resp <- clearQueuedResp{result: result}
-		case execChan <- execTask:
+			s.consumeRecvChan(req, maxReceiveChanBatchConsumeNum)
+		case execChan <- task:
 			// Task sent, drop the ownership of sent task.
 			// Update waiting task counter.
 			s.updateWaitingTaskCounter(-1, -nq)
 			// And produce new task into execChan as much as possible.
-			task = s.produceExecChan(now)
+			task = s.produceExecChan()
 		}
 	}
 }
 
 // consumeRecvChan consume the recv chan as much as possible.
-func (s *scheduler) consumeRecvChan(req addTaskReq, limit int, now time.Time) {
+func (s *scheduler) consumeRecvChan(req addTaskReq, limit int) {
 	// Check the dynamic wait task limit.
 	maxWaitTaskNum := paramtable.Get().QueryNodeCfg.MaxUnsolvedQueueSize.GetAsInt64()
-	if !s.handleAddTaskRequest(req, maxWaitTaskNum, now) {
+	if !s.handleAddTaskRequest(req, maxWaitTaskNum) {
 		return
 	}
 
@@ -211,7 +172,7 @@ func (s *scheduler) consumeRecvChan(req addTaskReq, limit int, now time.Time) {
 			if !ok {
 				return
 			}
-			if !s.handleAddTaskRequest(req, maxWaitTaskNum, now) {
+			if !s.handleAddTaskRequest(req, maxWaitTaskNum) {
 				return
 			}
 		default:
@@ -222,25 +183,14 @@ func (s *scheduler) consumeRecvChan(req addTaskReq, limit int, now time.Time) {
 
 // HandleAddTaskRequest handle a add task request.
 // Return true if the process can be continued.
-func (s *scheduler) handleAddTaskRequest(req addTaskReq, maxWaitTaskNum int64, now time.Time) bool {
-	if maxWaitTaskNum > 0 && s.GetWaitingTaskTotal() >= maxWaitTaskNum {
-		s.cleanupExpiredTasks(now)
-	}
-
-	if err := req.task.Context().Err(); err != nil {
+func (s *scheduler) handleAddTaskRequest(req addTaskReq, maxWaitTaskNum int64) bool {
+	if err := req.task.Canceled(); err != nil {
 		mlog.Warn(context.TODO(), "task canceled before enqueue", mlog.Err(err))
-		req.err <- err
-	} else if maxWaitTaskNum > 0 && s.GetWaitingTaskTotal() >= maxWaitTaskNum {
-		err := merr.WrapErrTooManyRequests(
-			int32(maxWaitTaskNum),
-			fmt.Sprintf("limit by %s", paramtable.Get().QueryNodeCfg.MaxUnsolvedQueueSize.Key),
-		)
 		req.err <- err
 	} else {
 		// Push the task into the policy to schedule and update the counter of the ready queue.
-		queued := newQueuedTask(req.task, now)
-		nq := queued.NQ()
-		newTaskAdded, err := s.policy.Push(queued)
+		nq := req.task.NQ()
+		newTaskAdded, err := s.policy.Push(req.task)
 		if err == nil {
 			s.updateWaitingTaskCounter(int64(newTaskAdded), nq)
 		}
@@ -248,23 +198,19 @@ func (s *scheduler) handleAddTaskRequest(req addTaskReq, maxWaitTaskNum int64, n
 	}
 
 	// Continue processing if the queue isn't reach the max limit.
-	return maxWaitTaskNum <= 0 || s.GetWaitingTaskTotal() < maxWaitTaskNum
+	return s.GetWaitingTaskTotal() < maxWaitTaskNum
 }
 
 // produceExecChan produce task from scheduler into exec chan as much as possible
-func (s *scheduler) produceExecChan(now time.Time) *queuedTask {
-	var task *queuedTask
+func (s *scheduler) produceExecChan() Task {
+	var task Task
 	for {
 		var execChan chan Task
-		var execTask Task
 		nq := int64(0)
-		task, nq, execChan = s.setupExecListener(task, now)
-		if task.valid() {
-			execTask = task.Task
-		}
+		task, nq, execChan = s.setupExecListener(task)
 
 		select {
-		case execChan <- execTask:
+		case execChan <- task:
 			// Update waiting task counter.
 			s.updateWaitingTaskCounter(-1, -nq)
 			// Task sent, drop the ownership of sent task.
@@ -286,7 +232,7 @@ func (s *scheduler) exec() {
 			return
 		}
 		// Skip this task if task is canceled.
-		if err := t.Context().Err(); err != nil {
+		if err := t.Canceled(); err != nil {
 			mlog.Warn(context.TODO(), "task canceled before executing", mlog.Err(err))
 			t.Done(err)
 			continue
@@ -302,12 +248,7 @@ func (s *scheduler) exec() {
 			metrics.QueryNodeReadTaskConcurrency.WithLabelValues(paramtable.GetStringNodeID()).Inc()
 			collector.Counter.Inc(metricsinfo.ExecuteQueueType)
 
-			executeStart := time.Now()
 			err := t.Execute()
-			metrics.QueryNodeReadTaskExecuteDuration.WithLabelValues(
-				paramtable.GetStringNodeID(),
-				readTaskExecuteOutcome(err),
-			).Observe(float64(time.Since(executeStart).Microseconds()) / 1000.0)
 
 			// Update all metric after task finished.
 			metrics.QueryNodeReadTaskConcurrency.WithLabelValues(paramtable.GetStringNodeID()).Dec()
@@ -328,86 +269,21 @@ func (s *scheduler) getPool(t Task) *conc.Pool[any] {
 	return s.pool
 }
 
-func readTaskExecuteOutcome(err error) string {
-	if err == nil {
-		return metrics.SuccessLabel
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return metrics.CancelLabel
-	}
-	return metrics.FailLabel
-}
-
 // setupExecListener setup the execChan and next task to run.
-func (s *scheduler) setupExecListener(lastWaitingTask *queuedTask, now time.Time) (*queuedTask, int64, chan Task) {
+func (s *scheduler) setupExecListener(lastWaitingTask Task) (Task, int64, chan Task) {
 	var execChan chan Task
 	nq := int64(0)
-	if !lastWaitingTask.valid() {
+	if lastWaitingTask == nil {
 		// No task is waiting to send to execChan, schedule a new one from queue.
-		for {
-			lastWaitingTask = s.policy.Pop(now)
-			if !lastWaitingTask.valid() {
-				break
-			}
-			if err := lastWaitingTask.Context().Err(); err != nil {
-				s.updateWaitingTaskCounter(-1, -lastWaitingTask.NQ())
-				s.recordReadTaskQueueDuration(lastWaitingTask, now, readTaskQueueOutcomeExpired)
-				lastWaitingTask.Done(err)
-				lastWaitingTask = nil
-				continue
-			}
-			s.recordReadTaskQueueDuration(lastWaitingTask, now, readTaskQueueOutcomeScheduled)
-			break
-		}
+		lastWaitingTask = s.policy.Pop()
 	}
-	if lastWaitingTask.valid() {
+	if lastWaitingTask != nil {
 		// Try to sent task to execChan if there is a task ready to run.
 		execChan = s.execChan
 		nq = lastWaitingTask.NQ()
 	}
 
 	return lastWaitingTask, nq, execChan
-}
-
-func (s *scheduler) cleanupExpiredTasks(now time.Time) {
-	deadlineAdvance := paramtable.Get().QueryNodeCfg.SchedulePolicyTaskDeadlineAdvance.GetAsDurationByParse()
-	cleanupTime := now.Add(deadlineAdvance)
-	tasks := s.policy.Cleanup(cleanupTime)
-	for _, task := range tasks {
-		s.updateWaitingTaskCounter(-1, -task.NQ())
-		s.recordReadTaskQueueDuration(task, now, readTaskQueueOutcomeExpired)
-		task.Done(cleanupTaskError(task))
-	}
-}
-
-func (s *scheduler) clearQueuedTasks(filter TaskFilter, reason string, task *queuedTask, now time.Time) (ClearResult, *queuedTask) {
-	removed := s.policy.Remove(filter, now)
-	if task.valid() && (filter == nil || filter(task.Task)) {
-		removed = append(removed, task)
-		task = nil
-	}
-
-	clearErr := clearTaskQueueError(reason)
-	var result ClearResult
-	for _, removedTask := range removed {
-		if !removedTask.valid() {
-			continue
-		}
-		nq := removedTask.NQ()
-		result.QueuedCleared++
-		result.QueuedNQCleared += nq
-		s.updateWaitingTaskCounter(-1, -nq)
-		s.recordReadTaskQueueDuration(removedTask, now, readTaskQueueOutcomeCleared)
-		removedTask.Done(clearErr)
-	}
-	return result, task
-}
-
-func clearTaskQueueError(reason string) error {
-	if reason == "" {
-		return errors.Wrap(context.Canceled, "read task queue cleared by admin")
-	}
-	return errors.Wrap(context.Canceled, fmt.Sprintf("read task queue cleared by admin: %s", reason))
 }
 
 // setupReadyLenMetric update the read task ready len metric.
@@ -418,17 +294,6 @@ func (s *scheduler) setupReadyLenMetric() {
 	collector.Counter.Set(metricsinfo.ReadyQueueType, waitingTaskCount)
 	// Record the waiting task length of policy as ready task metric.
 	metrics.QueryNodeReadTaskReadyLen.WithLabelValues(paramtable.GetStringNodeID()).Set(float64(waitingTaskCount))
-	metrics.QueryNodeReadTaskReadyNQ.WithLabelValues(paramtable.GetStringNodeID()).Set(float64(s.GetWaitingTaskTotalNQ()))
-}
-
-func (s *scheduler) recordReadTaskQueueDuration(task *queuedTask, now time.Time, outcome string) {
-	if !task.valid() {
-		return
-	}
-	metrics.QueryNodeReadTaskQueueDuration.WithLabelValues(
-		paramtable.GetStringNodeID(),
-		outcome,
-	).Observe(float64(task.queueDuration(now).Microseconds()) / 1000.0)
 }
 
 // scheduler counter implement, concurrent safe.

@@ -38,15 +38,6 @@ func getSearchResultDedupKey(data *schemapb.SearchResultData, idx int64, pk inte
 
 type SearchCommonReduce struct{}
 
-func reduceFieldsDataLen(searchResultData []*schemapb.SearchResultData) int {
-	for _, data := range searchResultData {
-		if len(data.GetFieldsData()) > 0 {
-			return len(data.GetFieldsData())
-		}
-	}
-	return 0
-}
-
 func (scr *SearchCommonReduce) ReduceSearchResultData(ctx context.Context, searchResultData []*schemapb.SearchResultData, info *reduce.ResultInfo) (*schemapb.SearchResultData, error) {
 	ctx, sp := otel.Tracer(typeutil.QueryNodeRole).Start(ctx, "ReduceSearchResultData")
 	defer sp.End()
@@ -58,7 +49,7 @@ func (scr *SearchCommonReduce) ReduceSearchResultData(ctx context.Context, searc
 			FieldsData: make([]*schemapb.FieldData, 0),
 			Scores:     make([]float32, 0),
 			Ids:        &schemapb.IDs{},
-			Topks:      make([]int64, int(info.GetNq())),
+			Topks:      make([]int64, 0),
 		}, nil
 	}
 	nq := info.GetNq()
@@ -66,7 +57,7 @@ func (scr *SearchCommonReduce) ReduceSearchResultData(ctx context.Context, searc
 	ret := &schemapb.SearchResultData{
 		NumQueries: nq,
 		TopK:       topk,
-		FieldsData: make([]*schemapb.FieldData, reduceFieldsDataLen(searchResultData)),
+		FieldsData: make([]*schemapb.FieldData, len(searchResultData[0].FieldsData)),
 		Scores:     make([]float32, 0, nq*topk),
 		Ids:        &schemapb.IDs{},
 		Topks:      make([]int64, 0, nq),
@@ -203,7 +194,7 @@ func (sbr *SearchGroupByReduce) ReduceSearchResultData(ctx context.Context, sear
 	ret := &schemapb.SearchResultData{
 		NumQueries: nq,
 		TopK:       topk,
-		FieldsData: make([]*schemapb.FieldData, reduceFieldsDataLen(searchResultData)),
+		FieldsData: make([]*schemapb.FieldData, len(searchResultData[0].FieldsData)),
 		Scores:     make([]float32, 0, nq*topk),
 		Ids:        &schemapb.IDs{},
 		Topks:      make([]int64, 0, nq),

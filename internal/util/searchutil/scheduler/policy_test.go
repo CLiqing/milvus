@@ -1,10 +1,8 @@
 package scheduler
 
 import (
-	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -22,85 +20,6 @@ func TestFIFOPolicy(t *testing.T) {
 	testCommonPolicyOperation(t, newFIFOPolicy())
 }
 
-func TestPolicyCleanupExpiredTasks(t *testing.T) {
-	paramtable.Init()
-	for name, policy := range map[string]schedulePolicy{
-		"fifo":              newFIFOPolicy(),
-		"user-task-polling": newUserTaskPollingPolicy(),
-	} {
-		t.Run(name, func(t *testing.T) {
-			base := time.Now()
-			ctx, cancel := context.WithDeadline(context.Background(), base.Add(10*time.Millisecond))
-			defer cancel()
-
-			added, err := policy.Push(newQueuedTask(newMockTask(mockTaskConfig{ctx: ctx, nq: 1}), base))
-			assert.NoError(t, err)
-			assert.Equal(t, 1, added)
-			assert.Equal(t, 1, policy.Len())
-
-			expired := policy.Cleanup(base.Add(20 * time.Millisecond))
-			assert.Len(t, expired, 1)
-			assert.Equal(t, 0, policy.Len())
-			assert.False(t, policy.Pop(base.Add(20*time.Millisecond)).valid())
-		})
-	}
-}
-
-func TestPolicyCleanupCanceledTasks(t *testing.T) {
-	paramtable.Init()
-	for name, policy := range map[string]schedulePolicy{
-		"fifo":              newFIFOPolicy(),
-		"user-task-polling": newUserTaskPollingPolicy(),
-	} {
-		t.Run(name, func(t *testing.T) {
-			base := time.Now()
-			ctx, cancel := context.WithCancel(context.Background())
-
-			added, err := policy.Push(newQueuedTask(newMockTask(mockTaskConfig{ctx: ctx, nq: 1}), base))
-			assert.NoError(t, err)
-			assert.Equal(t, 1, added)
-
-			cancel()
-			removed := policy.Cleanup(base)
-
-			assert.Len(t, removed, 1)
-			assert.Equal(t, 0, policy.Len())
-			assert.False(t, policy.Pop(base).valid())
-		})
-	}
-}
-
-func TestPolicyRemove(t *testing.T) {
-	paramtable.Init()
-	for name, policy := range map[string]schedulePolicy{
-		"fifo":              newFIFOPolicy(),
-		"user-task-polling": newUserTaskPollingPolicy(),
-	} {
-		t.Run(name, func(t *testing.T) {
-			base := time.Now()
-			keep := newMockTask(mockTaskConfig{username: "keep", nq: 2})
-			remove := newMockTask(mockTaskConfig{username: "remove", nq: 3})
-
-			added, err := policy.Push(newQueuedTask(keep, base))
-			assert.NoError(t, err)
-			assert.Equal(t, 1, added)
-			added, err = policy.Push(newQueuedTask(remove, base))
-			assert.NoError(t, err)
-			assert.Equal(t, 1, added)
-
-			removed := policy.Remove(func(task Task) bool {
-				return task.Username() == "remove"
-			}, base.Add(time.Second))
-
-			assert.Len(t, removed, 1)
-			assert.Same(t, remove, removed[0].Task)
-			assert.Equal(t, 1, policy.Len())
-			assert.Same(t, keep, policy.Pop(base).Task)
-			assert.Equal(t, 0, policy.Len())
-		})
-	}
-}
-
 func testCrossUserMerge(t *testing.T, policy schedulePolicy) {
 	userN := 10
 	maxNQ := paramtable.Get().QueryNodeCfg.MaxGroupNQ.GetAsInt64()
@@ -113,20 +32,17 @@ func testCrossUserMerge(t *testing.T, policy schedulePolicy) {
 			nq:        maxNQ / 2,
 			mergeAble: true,
 		})
-		policy.Push(newQueuedTask(task, time.Now()))
+		policy.Push(task)
 	}
 	nAfterMerge := n / 2
 	assert.Equal(t, nAfterMerge, policy.Len())
 	for i := 1; i <= nAfterMerge; i++ {
-		assert.True(t, policy.Pop(time.Now()).valid())
+		assert.NotNil(t, policy.Pop())
 		assert.Equal(t, nAfterMerge-i, policy.Len())
 	}
 
 	// Open cross user grouping
-	oldGrouping := paramtable.Get().QueryNodeCfg.SchedulePolicyEnableCrossUserGrouping.SwapTempValue("true")
-	defer paramtable.Get().QueryNodeCfg.SchedulePolicyEnableCrossUserGrouping.SwapTempValue(oldGrouping)
-	oldNQMergeRatio := paramtable.Get().QueryNodeCfg.NQMergeRatio.SwapTempValue("0")
-	defer paramtable.Get().QueryNodeCfg.NQMergeRatio.SwapTempValue(oldNQMergeRatio)
+	paramtable.Get().QueryNodeCfg.SchedulePolicyEnableCrossUserGrouping.SwapTempValue("true")
 	for i := 1; i <= n; i++ {
 		username := fmt.Sprintf("user_%d", (i-1)%userN)
 		task := newMockTask(mockTaskConfig{
@@ -134,12 +50,12 @@ func testCrossUserMerge(t *testing.T, policy schedulePolicy) {
 			nq:        maxNQ / 4,
 			mergeAble: true,
 		})
-		policy.Push(newQueuedTask(task, time.Now()))
+		policy.Push(task)
 	}
 	nAfterMerge = n / 4
 	assert.Equal(t, nAfterMerge, policy.Len())
 	for i := 1; i <= nAfterMerge; i++ {
-		assert.True(t, policy.Pop(time.Now()).valid())
+		assert.NotNil(t, policy.Pop())
 		assert.Equal(t, nAfterMerge-i, policy.Len())
 	}
 }
@@ -148,7 +64,7 @@ func testCrossUserMerge(t *testing.T, policy schedulePolicy) {
 func testCommonPolicyOperation(t *testing.T, policy schedulePolicy) {
 	// Empty policy assertion.
 	assert.Equal(t, 0, policy.Len())
-	assert.False(t, policy.Pop(time.Now()).valid())
+	assert.Nil(t, policy.Pop())
 	assert.Equal(t, 0, policy.Len())
 
 	// Test no merge push pop.
@@ -160,12 +76,12 @@ func testCommonPolicyOperation(t *testing.T, policy schedulePolicy) {
 		task := newMockTask(mockTaskConfig{
 			username: username,
 		})
-		policy.Push(newQueuedTask(task, time.Now()))
+		policy.Push(task)
 		assert.Equal(t, i, policy.Len())
 	}
 	// Test Pop
 	for i := 1; i <= n; i++ {
-		assert.True(t, policy.Pop(time.Now()).valid())
+		assert.NotNil(t, policy.Pop())
 		assert.Equal(t, n-i, policy.Len())
 	}
 
@@ -179,11 +95,11 @@ func testCommonPolicyOperation(t *testing.T, policy schedulePolicy) {
 			nq:        maxNQ,
 			mergeAble: true,
 		})
-		policy.Push(newQueuedTask(task, time.Now()))
+		policy.Push(task)
 	}
 	assert.Equal(t, n, policy.Len())
 	for i := 1; i <= n; i++ {
-		assert.True(t, policy.Pop(time.Now()).valid())
+		assert.NotNil(t, policy.Pop())
 		assert.Equal(t, n-i, policy.Len())
 	}
 
@@ -196,12 +112,12 @@ func testCommonPolicyOperation(t *testing.T, policy schedulePolicy) {
 			nq:        maxNQ / 2,
 			mergeAble: true,
 		})
-		policy.Push(newQueuedTask(task, time.Now()))
+		policy.Push(task)
 	}
 	nAfterMerge := n / 2
 	assert.Equal(t, nAfterMerge, policy.Len())
 	for i := 1; i <= nAfterMerge; i++ {
-		assert.True(t, policy.Pop(time.Now()).valid())
+		assert.NotNil(t, policy.Pop())
 		assert.Equal(t, nAfterMerge-i, policy.Len())
 	}
 }
