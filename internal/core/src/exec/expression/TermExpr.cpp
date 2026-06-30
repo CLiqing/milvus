@@ -19,6 +19,7 @@
 #include <math.h>
 #include <simdjson.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -1120,6 +1121,7 @@ PhyTermFilterExpr::ExecVisitorImplForData(EvalCtx& context) {
 
         // ── Path 2: Per-row (string, bool, large numeric, random access) ──
         // Check validity and bitmap first, then direct lookup without variant.
+        uint64_t pr50438_assignment_count = 0;
         for (int i = 0; i < size; ++i) {
             auto offset = i;
             if constexpr (filter_type == FilterType::random) {
@@ -1147,6 +1149,19 @@ PhyTermFilterExpr::ExecVisitorImplForData(EvalCtx& context) {
             } else {
                 res[i] = vals->In(MultiElement::ValueType(std::in_place_type<T>,
                                                           data[offset]));
+                ++pr50438_assignment_count;
+            }
+        }
+        if (pr50438_assignment_count > 0) {
+            static std::atomic<uint64_t> pr50438_total_assignments{0};
+            constexpr uint64_t kLogInterval = uint64_t{1} << 34;
+            const auto previous = pr50438_total_assignments.fetch_add(
+                pr50438_assignment_count, std::memory_order_relaxed);
+            const auto current = previous + pr50438_assignment_count;
+            if ((previous / kLogInterval) != (current / kLogInterval)) {
+                LOG(INFO) << "[PR50438_COUNTER] term_expr_per_row_bitmap_assignments="
+                          << current
+                          << " batch_assignments=" << pr50438_assignment_count;
             }
         }
         processed_cursor += size;
