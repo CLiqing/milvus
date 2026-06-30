@@ -222,6 +222,12 @@ FillPredicateTermArgs(CardinalDownpushPredicate& predicate,
                 }
                 predicate.int64_terms_.push_back(arg.value());
             }
+            std::sort(predicate.int64_terms_.begin(),
+                      predicate.int64_terms_.end());
+            predicate.int64_terms_.erase(
+                std::unique(predicate.int64_terms_.begin(),
+                            predicate.int64_terms_.end()),
+                predicate.int64_terms_.end());
             return true;
         case CardinalDownpushPredicateValueType::Float:
             predicate.double_terms_.reserve(values.size());
@@ -232,6 +238,12 @@ FillPredicateTermArgs(CardinalDownpushPredicate& predicate,
                 }
                 predicate.double_terms_.push_back(arg.value());
             }
+            std::sort(predicate.double_terms_.begin(),
+                      predicate.double_terms_.end());
+            predicate.double_terms_.erase(
+                std::unique(predicate.double_terms_.begin(),
+                            predicate.double_terms_.end()),
+                predicate.double_terms_.end());
             return true;
         case CardinalDownpushPredicateValueType::String:
             predicate.string_terms_.reserve(values.size());
@@ -245,6 +257,36 @@ FillPredicateTermArgs(CardinalDownpushPredicate& predicate,
             return true;
     }
     return false;
+}
+
+bool
+TryFoldInt64TermsToRange(CardinalDownpushPredicate& predicate) {
+    if (predicate.value_type_ != CardinalDownpushPredicateValueType::Int64 ||
+        predicate.int64_terms_.empty()) {
+        return false;
+    }
+
+    const auto first = predicate.int64_terms_.front();
+    const auto last = predicate.int64_terms_.back();
+    if (last < first) {
+        return false;
+    }
+
+    const auto expected_size = static_cast<__int128>(last) -
+                               static_cast<__int128>(first) + 1;
+    if (expected_size <= 0 ||
+        expected_size !=
+            static_cast<__int128>(predicate.int64_terms_.size())) {
+        return false;
+    }
+
+    predicate.arg0_ = first;
+    predicate.arg1_ = last;
+    predicate.lower_inclusive_ = true;
+    predicate.upper_inclusive_ = true;
+    predicate.int64_terms_.clear();
+    predicate.op_ = CardinalDownpushPredicateOp::ScalarRange;
+    return true;
 }
 
 std::optional<CardinalDownpushPredicate>
@@ -313,6 +355,9 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
         if (!predicate.has_value() ||
             !FillPredicateTermArgs(predicate.value(), term->vals_)) {
             return std::nullopt;
+        }
+        if (TryFoldInt64TermsToRange(predicate.value())) {
+            return predicate;
         }
         predicate->op_ = CardinalDownpushPredicateOp::ScalarTerm;
         return predicate;
