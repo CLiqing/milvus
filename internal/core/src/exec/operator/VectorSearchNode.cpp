@@ -64,6 +64,8 @@ struct CardinalDownpushSearchContext {
     std::shared_ptr<std::vector<std::string>> string_row_values_;
     std::vector<const char*> string_row_value_ptrs_;
     std::vector<uint32_t> string_row_value_sizes_;
+    std::vector<const char*> string_term_value_ptrs_;
+    std::vector<uint32_t> string_term_value_sizes_;
     std::vector<const int64_t*> int64_chunk_values_;
     std::vector<const float*> float_chunk_values_;
     std::vector<int64_t> chunk_offsets_;
@@ -120,6 +122,10 @@ ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
             return KnowhereOp::kNotEqual;
         case CardinalDownpushPredicateOp::ScalarRange:
             return KnowhereOp::kRange;
+        case CardinalDownpushPredicateOp::ScalarAddLessThan:
+            return KnowhereOp::kAddLessThan;
+        case CardinalDownpushPredicateOp::ScalarTerm:
+            return KnowhereOp::kTerm;
     }
     return std::nullopt;
 }
@@ -413,7 +419,8 @@ FillKnowhereDownpushValueSource(
 void
 FillKnowhereDownpushArgs(
     knowhere::BitsetView::ExtraScalarInt64PredicateFilter& filter,
-    const CardinalDownpushPredicate& predicate) {
+    const CardinalDownpushPredicate& predicate,
+    CardinalDownpushSearchContext& ctx) {
     filter.arg0 = predicate.arg0_;
     filter.arg1 = predicate.arg1_;
     filter.double_arg0 = predicate.double_arg0_;
@@ -424,6 +431,22 @@ FillKnowhereDownpushArgs(
     filter.string_arg1_data = predicate.string_arg1_.data();
     filter.string_arg1_size =
         static_cast<uint32_t>(predicate.string_arg1_.size());
+    filter.int64_terms = predicate.int64_terms_.data();
+    filter.int64_term_count = predicate.int64_terms_.size();
+    filter.double_terms = predicate.double_terms_.data();
+    filter.double_term_count = predicate.double_terms_.size();
+    if (!predicate.string_terms_.empty()) {
+        ctx.string_term_value_ptrs_.reserve(predicate.string_terms_.size());
+        ctx.string_term_value_sizes_.reserve(predicate.string_terms_.size());
+        for (const auto& term : predicate.string_terms_) {
+            ctx.string_term_value_ptrs_.push_back(term.data());
+            ctx.string_term_value_sizes_.push_back(
+                static_cast<uint32_t>(term.size()));
+        }
+        filter.string_term_values = ctx.string_term_value_ptrs_.data();
+        filter.string_term_sizes = ctx.string_term_value_sizes_.data();
+        filter.string_term_count = ctx.string_term_value_ptrs_.size();
+    }
     filter.lower_inclusive = predicate.lower_inclusive_;
     filter.upper_inclusive = predicate.upper_inclusive_;
 }
@@ -604,7 +627,7 @@ PhyVectorSearchNode::GetOutput() {
         FillKnowhereDownpushValueSource(filter, *downpush_ctx);
         filter.row_count = static_cast<size_t>(segment_->get_row_count());
         filter.op = op.value();
-        FillKnowhereDownpushArgs(filter, predicate.value());
+        FillKnowhereDownpushArgs(filter, predicate.value(), *downpush_ctx);
         search_view.set_extra_scalar_int64_predicate_filter(
             filter,
             static_cast<size_t>(predicate->estimated_filtered_out_count_));

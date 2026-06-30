@@ -205,6 +205,48 @@ FillPredicateArg(CardinalDownpushPredicate& predicate,
     return false;
 }
 
+bool
+FillPredicateTermArgs(CardinalDownpushPredicate& predicate,
+                      const std::vector<proto::plan::GenericValue>& values) {
+    if (values.empty()) {
+        return false;
+    }
+
+    switch (predicate.value_type_) {
+        case CardinalDownpushPredicateValueType::Int64:
+            predicate.int64_terms_.reserve(values.size());
+            for (const auto& value : values) {
+                auto arg = GetInt64Value(value);
+                if (!arg.has_value()) {
+                    return false;
+                }
+                predicate.int64_terms_.push_back(arg.value());
+            }
+            return true;
+        case CardinalDownpushPredicateValueType::Float:
+            predicate.double_terms_.reserve(values.size());
+            for (const auto& value : values) {
+                auto arg = GetDoubleValue(value);
+                if (!arg.has_value()) {
+                    return false;
+                }
+                predicate.double_terms_.push_back(arg.value());
+            }
+            return true;
+        case CardinalDownpushPredicateValueType::String:
+            predicate.string_terms_.reserve(values.size());
+            for (const auto& value : values) {
+                auto arg = GetStringValue(value);
+                if (!arg.has_value()) {
+                    return false;
+                }
+                predicate.string_terms_.push_back(arg.value());
+            }
+            return true;
+    }
+    return false;
+}
+
 std::optional<CardinalDownpushPredicate>
 TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
                                     QueryContext* query_context) {
@@ -265,26 +307,68 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
         return predicate;
     }
 
+    if (auto term =
+            std::dynamic_pointer_cast<const expr::TermFilterExpr>(filter)) {
+        auto predicate = try_field(term->column_);
+        if (!predicate.has_value() ||
+            !FillPredicateTermArgs(predicate.value(), term->vals_)) {
+            return std::nullopt;
+        }
+        predicate->op_ = CardinalDownpushPredicateOp::ScalarTerm;
+        return predicate;
+    }
+
     if (auto arith =
             std::dynamic_pointer_cast<const expr::BinaryArithOpEvalRangeExpr>(
                 filter)) {
         auto predicate = try_field(arith->column_);
-        auto modulus = GetInt64Value(arith->right_operand_);
-        auto threshold = GetInt64Value(arith->value_);
         if (!predicate.has_value() ||
-            predicate->value_type_ !=
-                CardinalDownpushPredicateValueType::Int64 ||
-            !modulus.has_value() || !threshold.has_value() ||
-            modulus.value() <= 0 || threshold.value() < 0 ||
-            threshold.value() > modulus.value() ||
-            arith->arith_op_type_ != proto::plan::ArithOpType::Mod ||
             arith->op_type_ != proto::plan::OpType::LessThan) {
             return std::nullopt;
         }
-        predicate->op_ = CardinalDownpushPredicateOp::Int64ModLessThan;
-        predicate->arg0_ = modulus.value();
-        predicate->arg1_ = threshold.value();
-        return predicate;
+
+        if (arith->arith_op_type_ == proto::plan::ArithOpType::Mod) {
+            auto modulus = GetInt64Value(arith->right_operand_);
+            auto threshold = GetInt64Value(arith->value_);
+            if (predicate->value_type_ !=
+                    CardinalDownpushPredicateValueType::Int64 ||
+                !modulus.has_value() || !threshold.has_value() ||
+                modulus.value() <= 0 || threshold.value() < 0 ||
+                threshold.value() > modulus.value()) {
+                return std::nullopt;
+            }
+            predicate->op_ = CardinalDownpushPredicateOp::Int64ModLessThan;
+            predicate->arg0_ = modulus.value();
+            predicate->arg1_ = threshold.value();
+            return predicate;
+        }
+
+        if (arith->arith_op_type_ == proto::plan::ArithOpType::Add) {
+            if (predicate->value_type_ ==
+                CardinalDownpushPredicateValueType::Int64) {
+                auto addend = GetInt64Value(arith->right_operand_);
+                auto threshold = GetInt64Value(arith->value_);
+                if (!addend.has_value() || !threshold.has_value()) {
+                    return std::nullopt;
+                }
+                predicate->op_ = CardinalDownpushPredicateOp::ScalarAddLessThan;
+                predicate->arg0_ = addend.value();
+                predicate->arg1_ = threshold.value();
+                return predicate;
+            }
+            if (predicate->value_type_ ==
+                CardinalDownpushPredicateValueType::Float) {
+                auto addend = GetDoubleValue(arith->right_operand_);
+                auto threshold = GetDoubleValue(arith->value_);
+                if (!addend.has_value() || !threshold.has_value()) {
+                    return std::nullopt;
+                }
+                predicate->op_ = CardinalDownpushPredicateOp::ScalarAddLessThan;
+                predicate->double_arg0_ = addend.value();
+                predicate->double_arg1_ = threshold.value();
+                return predicate;
+            }
+        }
     }
 
     return std::nullopt;
@@ -375,8 +459,8 @@ PhyFilterBitsNode::PhyFilterBitsNode(
         if (!predicate.has_value()) {
             ThrowInfo(Unsupported,
                       "downpush hint only supports sealed non-nullable "
-                      "scalar int/float/varchar range predicates and int mod "
-                      "predicates in v1");
+                      "scalar int/float/varchar range, term, add-less-than, "
+                      "and int mod predicates in v1");
         }
 
         std::optional<int64_t> estimated_filtered_out_count;

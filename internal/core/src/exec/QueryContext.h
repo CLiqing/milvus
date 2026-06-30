@@ -47,6 +47,8 @@ enum class CardinalDownpushPredicateOp {
     Int64Equal = 5,
     Int64NotEqual = 6,
     ScalarRange = 7,
+    ScalarAddLessThan = 8,
+    ScalarTerm = 9,
 };
 
 enum class CardinalDownpushPredicateValueType {
@@ -68,6 +70,9 @@ struct CardinalDownpushPredicate {
     double double_arg1_{0.0};
     std::string string_arg0_;
     std::string string_arg1_;
+    std::vector<int64_t> int64_terms_;
+    std::vector<double> double_terms_;
+    std::vector<std::string> string_terms_;
     bool lower_inclusive_{true};
     bool upper_inclusive_{true};
     int64_t estimated_filtered_out_count_{0};
