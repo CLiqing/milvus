@@ -61,6 +61,9 @@ struct RangeTiming {
     uint64_t open_us = 0;
     uint64_t alloc_us = 0;
     uint64_t submit_us = 0;
+    uint64_t queue_us = 0;
+    uint64_t read_us = 0;
+    uint64_t future_wait_us = 0;
     uint64_t wait_us = 0;
     uint64_t post_us = 0;
     uint64_t total_us = 0;
@@ -79,6 +82,9 @@ struct Stats {
     std::vector<uint64_t> open_us;
     std::vector<uint64_t> alloc_us;
     std::vector<uint64_t> submit_us;
+    std::vector<uint64_t> queue_us;
+    std::vector<uint64_t> read_us;
+    std::vector<uint64_t> future_wait_us;
     std::vector<uint64_t> wait_us;
     std::vector<uint64_t> post_us;
     std::vector<uint64_t> total_us;
@@ -878,6 +884,9 @@ RecordRangeTiming(Stats& stats, const RangeTiming& timing) {
     stats.open_us.push_back(timing.open_us);
     stats.alloc_us.push_back(timing.alloc_us);
     stats.submit_us.push_back(timing.submit_us);
+    stats.queue_us.push_back(timing.queue_us);
+    stats.read_us.push_back(timing.read_us);
+    stats.future_wait_us.push_back(timing.future_wait_us);
     stats.wait_us.push_back(timing.wait_us);
     stats.post_us.push_back(timing.post_us);
     stats.total_us.push_back(timing.total_us);
@@ -1142,15 +1151,21 @@ RunOneRangeSteady(const Options& options,
     if (options.mode == "baseline") {
         auto submit_start = Clock::now();
         size_t read_result = 0;
+        Clock::time_point task_started;
+        Clock::time_point task_done;
         std::vector<std::function<void()>> tasks;
         tasks.emplace_back([&]() {
+            task_started = Clock::now();
             read_result = stream->ReadAt(buffer.data(), spec.offset, spec.size);
+            task_done = Clock::now();
         });
         auto submit_done = Clock::now();
         timing.submit_us = ElapsedMicros(submit_start, submit_done);
 
         cardinalv2::ParallelFetchTask(tasks);
         auto wait_done = Clock::now();
+        timing.queue_us = ElapsedMicros(submit_done, task_started);
+        timing.read_us = ElapsedMicros(task_started, task_done);
         timing.wait_us = ElapsedMicros(submit_done, wait_done);
         bytes_read = read_result;
     } else {
@@ -1162,6 +1177,7 @@ RunOneRangeSteady(const Options& options,
 
         auto result = future.get();
         auto wait_done = Clock::now();
+        timing.future_wait_us = ElapsedMicros(submit_done, wait_done);
         timing.wait_us = ElapsedMicros(submit_done, wait_done);
         bytes_read = result.bytes_read;
     }
@@ -1316,6 +1332,9 @@ PrintResult(const Options& options,
         std::vector<uint64_t> open_us;
         std::vector<uint64_t> alloc_us;
         std::vector<uint64_t> submit_us;
+        std::vector<uint64_t> queue_us;
+        std::vector<uint64_t> read_us;
+        std::vector<uint64_t> future_wait_us;
         std::vector<uint64_t> wait_us;
         std::vector<uint64_t> post_us;
         std::vector<uint64_t> total_us;
@@ -1325,6 +1344,9 @@ PrintResult(const Options& options,
         phases.open_us = stats.open_us;
         phases.alloc_us = stats.alloc_us;
         phases.submit_us = stats.submit_us;
+        phases.queue_us = stats.queue_us;
+        phases.read_us = stats.read_us;
+        phases.future_wait_us = stats.future_wait_us;
         phases.wait_us = stats.wait_us;
         phases.post_us = stats.post_us;
         phases.total_us = stats.total_us;
@@ -1400,6 +1422,12 @@ PrintResult(const Options& options,
               << phase_json(std::move(phases.alloc_us)) << ","
               << "\"phase_submit_us\":"
               << phase_json(std::move(phases.submit_us)) << ","
+              << "\"phase_queue_us\":"
+              << phase_json(std::move(phases.queue_us)) << ","
+              << "\"phase_read_us\":" << phase_json(std::move(phases.read_us))
+              << ","
+              << "\"phase_future_wait_us\":"
+              << phase_json(std::move(phases.future_wait_us)) << ","
               << "\"phase_wait_us\":" << phase_json(std::move(phases.wait_us))
               << ","
               << "\"phase_post_us\":" << phase_json(std::move(phases.post_us))

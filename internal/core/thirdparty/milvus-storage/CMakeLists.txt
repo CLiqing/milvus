@@ -14,8 +14,8 @@
 # Update milvus-storage_VERSION for the first occurrence
 milvus_add_pkg_config("milvus-storage")
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES "")
-set( milvus-storage_VERSION ddc6ec7)
-set( GIT_REPOSITORY  "https://github.com/milvus-io/milvus-storage.git")
+set( milvus-storage_VERSION bc1e1985ac4e94421862435311128a28c8eb3cfd)
+set( GIT_REPOSITORY  "https://github.com/CLiqing/milvus-storage.git")
 message(STATUS "milvus-storage repo: ${GIT_REPOSITORY}")
 message(STATUS "milvus-storage version: ${milvus-storage_VERSION}")
 if(DEFINED ENV{MILVUS_STORAGE_LOCAL_SOURCE_DIR} AND NOT "$ENV{MILVUS_STORAGE_LOCAL_SOURCE_DIR}" STREQUAL "")
@@ -81,33 +81,6 @@ else()
     FetchContent_GetProperties( milvus-storage )
     if ( NOT milvus-storage_POPULATED )
         FetchContent_Populate( milvus-storage )
-        set( MILVUS_STORAGE_S3_ASYNC_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/s3_async_read_path.patch )
-        execute_process(
-                COMMAND git apply --unidiff-zero --check ${MILVUS_STORAGE_S3_ASYNC_PATCH}
-                WORKING_DIRECTORY ${milvus-storage_SOURCE_DIR}
-                RESULT_VARIABLE MILVUS_STORAGE_S3_ASYNC_PATCH_CHECK_RESULT
-                OUTPUT_QUIET
-                ERROR_QUIET )
-        if ( MILVUS_STORAGE_S3_ASYNC_PATCH_CHECK_RESULT EQUAL 0 )
-            execute_process(
-                    COMMAND git apply --unidiff-zero ${MILVUS_STORAGE_S3_ASYNC_PATCH}
-                    WORKING_DIRECTORY ${milvus-storage_SOURCE_DIR}
-                    RESULT_VARIABLE MILVUS_STORAGE_S3_ASYNC_PATCH_APPLY_RESULT )
-            if ( NOT MILVUS_STORAGE_S3_ASYNC_PATCH_APPLY_RESULT EQUAL 0 )
-                message( FATAL_ERROR "Failed to apply milvus-storage S3 async read-path patch" )
-            endif()
-        else()
-            execute_process(
-                    COMMAND git apply --unidiff-zero --reverse --check ${MILVUS_STORAGE_S3_ASYNC_PATCH}
-                    WORKING_DIRECTORY ${milvus-storage_SOURCE_DIR}
-                    RESULT_VARIABLE MILVUS_STORAGE_S3_ASYNC_PATCH_REVERSE_CHECK_RESULT
-                    OUTPUT_QUIET
-                    ERROR_QUIET )
-            if ( NOT MILVUS_STORAGE_S3_ASYNC_PATCH_REVERSE_CHECK_RESULT EQUAL 0 )
-                message( FATAL_ERROR "milvus-storage S3 async read-path patch is neither applicable nor already applied" )
-            endif()
-        endif()
-
         # Adding the following target:
         # milvus-storage
         add_subdirectory( ${milvus-storage_SOURCE_DIR}/cpp
