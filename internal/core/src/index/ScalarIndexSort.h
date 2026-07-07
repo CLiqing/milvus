@@ -250,6 +250,7 @@ class ScalarIndexSort : public ScalarIndex<T> {
         }
     }
 
+    int64_t segment_id_ = 0;
     int64_t field_id_ = 0;
 
     bool is_nested_index_ = false;

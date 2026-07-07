@@ -19,6 +19,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstdlib>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -26,6 +29,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "Meta.h"
@@ -66,6 +70,62 @@ constexpr size_t ALIGNMENT = 32;  // 32-byte alignment
 
 const uint64_t MMAP_INDEX_PADDING = 1;
 
+namespace {
+
+bool
+RangeDebugEnabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("MILVUS_RANGE_DEBUG");
+        if (value == nullptr) {
+            return false;
+        }
+        std::string flag(value);
+        std::transform(flag.begin(), flag.end(), flag.begin(), [](char c) {
+            return static_cast<char>(
+                std::tolower(static_cast<unsigned char>(c)));
+        });
+        return flag == "1" || flag == "true" || flag == "yes" || flag == "on";
+    }();
+    return enabled;
+}
+
+int
+RangeDebugLimit() {
+    static const int limit = [] {
+        const auto* value = std::getenv("MILVUS_RANGE_DEBUG_LIMIT");
+        if (value == nullptr) {
+            return 200;
+        }
+        auto parsed = std::atoi(value);
+        return parsed > 0 ? parsed : 200;
+    }();
+    return limit;
+}
+
+bool
+ConsumeRangeDebugBudget() {
+    if (!RangeDebugEnabled()) {
+        return false;
+    }
+    static std::atomic<int> remaining{RangeDebugLimit()};
+    auto previous = remaining.fetch_sub(1, std::memory_order_relaxed);
+    return previous > 0;
+}
+
+template <typename T>
+auto
+RangeDebugValue(T value) {
+    if constexpr (std::is_same_v<T, bool>) {
+        return value ? 1 : 0;
+    } else if constexpr (std::is_integral_v<T>) {
+        return static_cast<int64_t>(value);
+    } else {
+        return static_cast<double>(value);
+    }
+}
+
+}  // namespace
+
 template <typename T>
 ScalarIndexSort<T>::ScalarIndexSort(
     const storage::FileManagerContext& file_manager_context,
@@ -76,6 +136,7 @@ ScalarIndexSort<T>::ScalarIndexSort(
       data_() {
     // not valid means we are in unit test
     if (file_manager_context.Valid()) {
+        segment_id_ = file_manager_context.fieldDataMeta.segment_id;
         field_id_ = file_manager_context.fieldDataMeta.field_id;
         this->file_manager_ =
             std::make_shared<storage::MemFileManagerImpl>(file_manager_context);
@@ -511,6 +572,24 @@ ScalarIndexSort<T>::Range(const T& value, const OpType op) {
     auto lb = begin();
     auto ub = end();
     if (ShouldSkip(value, value, op)) {
+        if (ConsumeRangeDebugBudget()) {
+            const auto min_value =
+                Empty() ? std::string("empty")
+                        : fmt::format("{}", RangeDebugValue(begin()->a_));
+            const auto max_value =
+                Empty() ? std::string("empty")
+                        : fmt::format("{}", RangeDebugValue(rbegin()->a_));
+            LOG_WARN(
+                "[RANGE_DEBUG] segment={} field={} op={} value={} min={} "
+                "max={} total={} hit=0 skip=true branch=skip",
+                segment_id_,
+                field_id_,
+                op,
+                RangeDebugValue(value),
+                min_value,
+                max_value,
+                Count());
+        }
         TargetBitmap bitset(Count());
         return bitset;
     }
@@ -534,6 +613,23 @@ ScalarIndexSort<T>::Range(const T& value, const OpType op) {
 
     size_t hit_count = ub - lb;
     size_t total_count = Count();
+    const auto branch =
+        hit_count > total_count / 2 ? "clear_misses" : "set_hits";
+
+    if (ConsumeRangeDebugBudget()) {
+        LOG_WARN(
+            "[RANGE_DEBUG] segment={} field={} op={} value={} min={} max={} "
+            "total={} hit={} skip=false branch={}",
+            segment_id_,
+            field_id_,
+            op,
+            RangeDebugValue(value),
+            RangeDebugValue(begin()->a_),
+            RangeDebugValue(rbegin()->a_),
+            total_count,
+            hit_count,
+            branch);
+    }
 
     if (hit_count > total_count / 2) {
         // Most elements are in range, initialize with `valid_bitset` and set non-matching to false
