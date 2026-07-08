@@ -49,6 +49,9 @@ enum class CardinalDownpushPredicateOp {
     ScalarRange = 7,
     ScalarAddLessThan = 8,
     ScalarTerm = 9,
+    ScalarSubLessThan = 10,
+    ScalarMulLessThan = 11,
+    ScalarDivLessThan = 12,
 };
 
 enum class CardinalDownpushPredicateValueType {

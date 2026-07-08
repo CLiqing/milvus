@@ -289,6 +289,22 @@ TryFoldInt64TermsToRange(CardinalDownpushPredicate& predicate) {
     return true;
 }
 
+std::optional<CardinalDownpushPredicateOp>
+ToDownpushArithLessThanOp(proto::plan::ArithOpType arith_op) {
+    switch (arith_op) {
+        case proto::plan::ArithOpType::Add:
+            return CardinalDownpushPredicateOp::ScalarAddLessThan;
+        case proto::plan::ArithOpType::Sub:
+            return CardinalDownpushPredicateOp::ScalarSubLessThan;
+        case proto::plan::ArithOpType::Mul:
+            return CardinalDownpushPredicateOp::ScalarMulLessThan;
+        case proto::plan::ArithOpType::Div:
+            return CardinalDownpushPredicateOp::ScalarDivLessThan;
+        default:
+            return std::nullopt;
+    }
+}
+
 std::optional<CardinalDownpushPredicate>
 TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
                                     QueryContext* query_context) {
@@ -388,28 +404,34 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
             return predicate;
         }
 
-        if (arith->arith_op_type_ == proto::plan::ArithOpType::Add) {
+        auto arith_less_than_op =
+            ToDownpushArithLessThanOp(arith->arith_op_type_);
+        if (arith_less_than_op.has_value()) {
             if (predicate->value_type_ ==
                 CardinalDownpushPredicateValueType::Int64) {
-                auto addend = GetInt64Value(arith->right_operand_);
+                auto right_operand = GetInt64Value(arith->right_operand_);
                 auto threshold = GetInt64Value(arith->value_);
-                if (!addend.has_value() || !threshold.has_value()) {
+                if (!right_operand.has_value() || !threshold.has_value() ||
+                    (arith->arith_op_type_ == proto::plan::ArithOpType::Div &&
+                     right_operand.value() == 0)) {
                     return std::nullopt;
                 }
-                predicate->op_ = CardinalDownpushPredicateOp::ScalarAddLessThan;
-                predicate->arg0_ = addend.value();
+                predicate->op_ = arith_less_than_op.value();
+                predicate->arg0_ = right_operand.value();
                 predicate->arg1_ = threshold.value();
                 return predicate;
             }
             if (predicate->value_type_ ==
                 CardinalDownpushPredicateValueType::Float) {
-                auto addend = GetDoubleValue(arith->right_operand_);
+                auto right_operand = GetDoubleValue(arith->right_operand_);
                 auto threshold = GetDoubleValue(arith->value_);
-                if (!addend.has_value() || !threshold.has_value()) {
+                if (!right_operand.has_value() || !threshold.has_value() ||
+                    (arith->arith_op_type_ == proto::plan::ArithOpType::Div &&
+                     right_operand.value() == 0.0)) {
                     return std::nullopt;
                 }
-                predicate->op_ = CardinalDownpushPredicateOp::ScalarAddLessThan;
-                predicate->double_arg0_ = addend.value();
+                predicate->op_ = arith_less_than_op.value();
+                predicate->double_arg0_ = right_operand.value();
                 predicate->double_arg1_ = threshold.value();
                 return predicate;
             }
@@ -504,8 +526,8 @@ PhyFilterBitsNode::PhyFilterBitsNode(
         if (!predicate.has_value()) {
             ThrowInfo(Unsupported,
                       "downpush hint only supports sealed non-nullable "
-                      "scalar int/float/varchar range, term, add-less-than, "
-                      "and int mod predicates in v1");
+                      "scalar int/float/varchar range, term, arithmetic "
+                      "less-than, and int mod predicates in v1");
         }
 
         std::optional<int64_t> estimated_filtered_out_count;

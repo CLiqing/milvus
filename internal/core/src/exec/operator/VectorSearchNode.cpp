@@ -126,6 +126,12 @@ ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
             return KnowhereOp::kAddLessThan;
         case CardinalDownpushPredicateOp::ScalarTerm:
             return KnowhereOp::kTerm;
+        case CardinalDownpushPredicateOp::ScalarSubLessThan:
+            return KnowhereOp::kSubLessThan;
+        case CardinalDownpushPredicateOp::ScalarMulLessThan:
+            return KnowhereOp::kMulLessThan;
+        case CardinalDownpushPredicateOp::ScalarDivLessThan:
+            return KnowhereOp::kDivLessThan;
     }
     return std::nullopt;
 }
