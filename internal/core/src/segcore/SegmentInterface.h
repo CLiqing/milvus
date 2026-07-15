@@ -415,6 +415,13 @@ class SegmentInternalInterface : public SegmentInterface {
         }
     }
 
+    PinWrapper<RawStringChunkView>
+    raw_string_chunk_view(milvus::OpContext* op_ctx,
+                          FieldId field_id,
+                          int64_t chunk_id) const {
+        return raw_string_chunk_view_impl(op_ctx, field_id, chunk_id);
+    }
+
     template <typename ViewType>
     PinWrapper<std::pair<std::vector<ViewType>, FixedVector<bool>>>
     get_batch_views(milvus::OpContext* op_ctx,
@@ -737,6 +744,15 @@ class SegmentInternalInterface : public SegmentInterface {
         FieldId field_id,
         int64_t chunk_id,
         std::optional<std::pair<int64_t, int64_t>> offset_len) const = 0;
+
+    virtual PinWrapper<RawStringChunkView>
+    raw_string_chunk_view_impl(milvus::OpContext* op_ctx,
+                               FieldId field_id,
+                               int64_t chunk_id) const {
+        ThrowInfo(ErrorCode::Unsupported,
+                  "raw string chunk view is only supported for sealed "
+                  "segments");
+    }
 
     virtual PinWrapper<std::pair<std::vector<ArrayView>, FixedVector<bool>>>
     chunk_array_view_impl(

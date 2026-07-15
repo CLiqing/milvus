@@ -40,6 +40,16 @@ constexpr uint64_t MMAP_STRING_PADDING = 1;
 constexpr uint64_t MMAP_GEOMETRY_PADDING = 1;
 constexpr uint64_t MMAP_ARRAY_PADDING = 1;
 
+struct RawStringChunkView {
+    const char* base = nullptr;
+    const uint32_t* offsets = nullptr;
+    const bool* valid_data = nullptr;
+    uint32_t row_count = 0;
+};
+
+static_assert(std::is_trivially_copyable_v<RawStringChunkView>);
+static_assert(std::is_standard_layout_v<RawStringChunkView>);
+
 // Shared mmap region manager for group chunks
 class ChunkMmapGuard {
  public:
@@ -130,6 +140,16 @@ class Chunk {
     FixedVector<bool>&
     Valid() {
         return valid_;
+    }
+
+    const FixedVector<bool>&
+    Valid() const {
+        return valid_;
+    }
+
+    const bool*
+    ValidData() const {
+        return nullable_ ? valid_.data() : nullptr;
     }
 
     virtual bool
@@ -357,6 +377,17 @@ class StringChunk : public Chunk {
     uint32_t*
     Offsets() {
         return offsets_;
+    }
+
+    const uint32_t*
+    Offsets() const {
+        return offsets_;
+    }
+
+    RawStringChunkView
+    RawView() const {
+        return RawStringChunkView{
+            data_, offsets_, ValidData(), static_cast<uint32_t>(row_nums_)};
     }
 
  protected:

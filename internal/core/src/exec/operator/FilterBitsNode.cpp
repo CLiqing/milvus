@@ -18,12 +18,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <optional>
 #include <ratio>
 #include <utility>
 #include <vector>
 
 #include "common/EasyAssert.h"
+#include "common/RegexQuery.h"
 #include "common/Tracer.h"
 #include "common/Types.h"
 #include "exec/QueryContext.h"
@@ -124,9 +126,25 @@ ToDownpushRangeOp(proto::plan::OpType op_type) {
             return CardinalDownpushPredicateOp::Int64Equal;
         case proto::plan::OpType::NotEqual:
             return CardinalDownpushPredicateOp::Int64NotEqual;
+        case proto::plan::OpType::PrefixMatch:
+            return CardinalDownpushPredicateOp::StringPrefixMatch;
+        case proto::plan::OpType::PostfixMatch:
+            return CardinalDownpushPredicateOp::StringPostfixMatch;
+        case proto::plan::OpType::InnerMatch:
+            return CardinalDownpushPredicateOp::StringInnerMatch;
+        case proto::plan::OpType::Match:
+            return CardinalDownpushPredicateOp::StringLikeMatch;
         default:
             return std::nullopt;
     }
+}
+
+bool
+IsStringMatchOp(CardinalDownpushPredicateOp op) {
+    return op == CardinalDownpushPredicateOp::StringPrefixMatch ||
+           op == CardinalDownpushPredicateOp::StringPostfixMatch ||
+           op == CardinalDownpushPredicateOp::StringInnerMatch ||
+           op == CardinalDownpushPredicateOp::StringLikeMatch;
 }
 
 bool
@@ -254,9 +272,71 @@ FillPredicateTermArgs(CardinalDownpushPredicate& predicate,
                 }
                 predicate.string_terms_.push_back(arg.value());
             }
+            std::sort(predicate.string_terms_.begin(),
+                      predicate.string_terms_.end());
+            predicate.string_terms_.erase(
+                std::unique(predicate.string_terms_.begin(),
+                            predicate.string_terms_.end()),
+                predicate.string_terms_.end());
             return true;
     }
     return false;
+}
+
+enum class DownpushLikeTokenType : uint8_t {
+    Literal = 0,
+    AnyOne = 1,
+    AnyMany = 2,
+};
+
+bool
+CompileLikePattern(CardinalDownpushPredicate& predicate) {
+    const auto& pattern = predicate.string_arg0_;
+    if (pattern.size() > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+
+    auto add_token = [&](DownpushLikeTokenType type,
+                         size_t offset,
+                         size_t size) {
+        predicate.like_token_offsets_.push_back(static_cast<uint32_t>(offset));
+        predicate.like_token_sizes_.push_back(static_cast<uint32_t>(size));
+        predicate.like_token_types_.push_back(static_cast<uint8_t>(type));
+    };
+
+    for (size_t i = 0; i < pattern.size();) {
+        const auto c = pattern[i];
+        if (c == '\\') {
+            ++i;
+            if (i == pattern.size()) {
+                return false;
+            }
+            const auto char_len = Utf8ValidatedCharByteLen(pattern.data() + i,
+                                                           pattern.size() - i);
+            add_token(DownpushLikeTokenType::Literal, i, char_len);
+            i += char_len;
+            continue;
+        }
+        if (c == '%') {
+            if (predicate.like_token_types_.empty() ||
+                predicate.like_token_types_.back() !=
+                    static_cast<uint8_t>(DownpushLikeTokenType::AnyMany)) {
+                add_token(DownpushLikeTokenType::AnyMany, i, 1);
+            }
+            ++i;
+            continue;
+        }
+        if (c == '_') {
+            add_token(DownpushLikeTokenType::AnyOne, i, 1);
+            ++i;
+            continue;
+        }
+        const auto char_len =
+            Utf8ValidatedCharByteLen(pattern.data() + i, pattern.size() - i);
+        add_token(DownpushLikeTokenType::Literal, i, char_len);
+        i += char_len;
+    }
+    return true;
 }
 
 bool
@@ -272,11 +352,10 @@ TryFoldInt64TermsToRange(CardinalDownpushPredicate& predicate) {
         return false;
     }
 
-    const auto expected_size = static_cast<__int128>(last) -
-                               static_cast<__int128>(first) + 1;
+    const auto expected_size =
+        static_cast<__int128>(last) - static_cast<__int128>(first) + 1;
     if (expected_size <= 0 ||
-        expected_size !=
-            static_cast<__int128>(predicate.int64_terms_.size())) {
+        expected_size != static_cast<__int128>(predicate.int64_terms_.size())) {
         return false;
     }
 
@@ -318,13 +397,20 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
 
     auto try_field = [&](const expr::ColumnInfo& column)
         -> std::optional<CardinalDownpushPredicate> {
-        if (column.element_level_ || column.nullable_ ||
-            !column.nested_path_.empty()) {
+        if (column.element_level_ || !column.nested_path_.empty()) {
             return std::nullopt;
         }
         auto field_id = column.field_id_;
         auto value_type = GetDownpushValueType(column.data_type_);
         if (!value_type.has_value()) {
+            return std::nullopt;
+        }
+        if (column.nullable_ &&
+            value_type.value() != CardinalDownpushPredicateValueType::String) {
+            return std::nullopt;
+        }
+        if (value_type.value() == CardinalDownpushPredicateValueType::String &&
+            !segment->HasFieldData(field_id)) {
             return std::nullopt;
         }
         if (!segment->HasFieldData(field_id) && !segment->HasIndex(field_id)) {
@@ -346,7 +432,16 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
             !FillPredicateArg(predicate.value(), unary->val_)) {
             return std::nullopt;
         }
+        if (IsStringMatchOp(op.value()) &&
+            predicate->value_type_ !=
+                CardinalDownpushPredicateValueType::String) {
+            return std::nullopt;
+        }
         predicate->op_ = op.value();
+        if (predicate->op_ == CardinalDownpushPredicateOp::StringLikeMatch &&
+            !CompileLikePattern(predicate.value())) {
+            return std::nullopt;
+        }
         return predicate;
     }
 
@@ -525,9 +620,9 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                                                              query_context_);
         if (!predicate.has_value()) {
             ThrowInfo(Unsupported,
-                      "downpush hint only supports sealed non-nullable "
-                      "scalar int/float/varchar range, term, arithmetic "
-                      "less-than, and int mod predicates in v1");
+                      "downpush hint only supports sealed scalar "
+                      "int/float/varchar range, term, varchar match, "
+                      "arithmetic less-than, and int mod predicates in v1");
         }
 
         std::optional<int64_t> estimated_filtered_out_count;

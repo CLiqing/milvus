@@ -527,6 +527,11 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         int64_t chunk_id,
         std::optional<std::pair<int64_t, int64_t>> offset_len) const override;
 
+    PinWrapper<RawStringChunkView>
+    raw_string_chunk_view_impl(milvus::OpContext* op_ctx,
+                               FieldId field_id,
+                               int64_t chunk_id) const override;
+
     PinWrapper<std::pair<std::vector<ArrayView>, FixedVector<bool>>>
     chunk_array_view_impl(
         milvus::OpContext* op_ctx,

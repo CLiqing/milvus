@@ -280,4 +280,16 @@ TEST_F(ChunkedColumnGroupTest, ProxyChunkColumn) {
     EXPECT_EQ(proxy_string->NumRows(), 5);
     EXPECT_EQ(proxy_string->num_chunks(), 1);
     EXPECT_FALSE(proxy_string->IsNullable());
+    auto raw_string = proxy_string->RawStringView(nullptr, 0);
+    const auto& raw_view = raw_string.get();
+    ASSERT_NE(raw_view.base, nullptr);
+    ASSERT_NE(raw_view.offsets, nullptr);
+    EXPECT_EQ(raw_view.valid_data, nullptr);
+    EXPECT_EQ(raw_view.row_count, string_data.size());
+    for (size_t i = 0; i < string_data.size(); ++i) {
+        const auto begin = raw_view.offsets[i];
+        const auto end = raw_view.offsets[i + 1];
+        EXPECT_EQ(std::string_view(raw_view.base + begin, end - begin),
+                  string_data[i]);
+    }
 }

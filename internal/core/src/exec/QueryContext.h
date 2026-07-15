@@ -52,6 +52,10 @@ enum class CardinalDownpushPredicateOp {
     ScalarSubLessThan = 10,
     ScalarMulLessThan = 11,
     ScalarDivLessThan = 12,
+    StringPrefixMatch = 13,
+    StringPostfixMatch = 14,
+    StringInnerMatch = 15,
+    StringLikeMatch = 16,
 };
 
 enum class CardinalDownpushPredicateValueType {
@@ -76,6 +80,9 @@ struct CardinalDownpushPredicate {
     std::vector<int64_t> int64_terms_;
     std::vector<double> double_terms_;
     std::vector<std::string> string_terms_;
+    std::vector<uint32_t> like_token_offsets_;
+    std::vector<uint32_t> like_token_sizes_;
+    std::vector<uint8_t> like_token_types_;
     bool lower_inclusive_{true};
     bool upper_inclusive_{true};
     int64_t estimated_filtered_out_count_{0};

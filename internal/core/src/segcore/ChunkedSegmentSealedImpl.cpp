@@ -1499,6 +1499,21 @@ ChunkedSegmentSealedImpl::chunk_string_view_impl(
               "chunk_string_view_impl only used for variable column field ");
 }
 
+PinWrapper<RawStringChunkView>
+ChunkedSegmentSealedImpl::raw_string_chunk_view_impl(milvus::OpContext* op_ctx,
+                                                     FieldId field_id,
+                                                     int64_t chunk_id) const {
+    std::shared_lock lck(mutex_);
+    AssertInfo(get_bit(field_data_ready_bitset_, field_id),
+               "Can't get raw string chunk for field " +
+                   std::to_string(field_id.get()));
+    if (auto column = get_column(field_id)) {
+        return column->RawStringView(op_ctx, chunk_id);
+    }
+    ThrowInfo(ErrorCode::UnexpectedError,
+              "raw_string_chunk_view_impl only supports variable columns");
+}
+
 PinWrapper<std::pair<std::vector<std::string_view>, FixedVector<bool>>>
 ChunkedSegmentSealedImpl::chunk_string_views_by_offsets(
     milvus::OpContext* op_ctx,

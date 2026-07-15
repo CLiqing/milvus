@@ -59,11 +59,15 @@ constexpr size_t kDownpushRowValuesCacheMaxEntries = 16;
 struct CardinalDownpushSearchContext {
     std::vector<milvus::cachinglayer::PinWrapper<Span<int64_t>>> int64_pins_;
     std::vector<milvus::cachinglayer::PinWrapper<Span<float>>> float_pins_;
+    std::vector<milvus::cachinglayer::PinWrapper<RawStringChunkView>>
+        string_pins_;
     std::shared_ptr<std::vector<int64_t>> int64_row_values_;
     std::shared_ptr<std::vector<float>> float_row_values_;
-    std::shared_ptr<std::vector<std::string>> string_row_values_;
-    std::vector<const char*> string_row_value_ptrs_;
-    std::vector<uint32_t> string_row_value_sizes_;
+    std::vector<const char*> string_chunk_bases_;
+    std::vector<const uint32_t*> string_chunk_value_offsets_;
+    std::vector<const bool*> string_chunk_valid_data_;
+    std::vector<size_t> string_chunk_row_counts_;
+    size_t string_uniform_chunk_rows_{0};
     std::vector<const char*> string_term_value_ptrs_;
     std::vector<uint32_t> string_term_value_sizes_;
     std::vector<const int64_t*> int64_chunk_values_;
@@ -132,6 +136,14 @@ ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
             return KnowhereOp::kMulLessThan;
         case CardinalDownpushPredicateOp::ScalarDivLessThan:
             return KnowhereOp::kDivLessThan;
+        case CardinalDownpushPredicateOp::StringPrefixMatch:
+            return KnowhereOp::kPrefixMatch;
+        case CardinalDownpushPredicateOp::StringPostfixMatch:
+            return KnowhereOp::kPostfixMatch;
+        case CardinalDownpushPredicateOp::StringInnerMatch:
+            return KnowhereOp::kInnerMatch;
+        case CardinalDownpushPredicateOp::StringLikeMatch:
+            return KnowhereOp::kLikeMatch;
     }
     return std::nullopt;
 }
@@ -262,27 +274,6 @@ BuildFloatRowValuesFromBulkSubscript(
     return std::make_shared<std::vector<float>>(data.begin(), data.end());
 }
 
-std::shared_ptr<std::vector<std::string>>
-BuildStringRowValuesFromBulkSubscript(
-    const segcore::SegmentInternalInterface* segment,
-    milvus::OpContext* op_context,
-    FieldId field_id,
-    int64_t row_count) {
-    std::vector<int64_t> offsets(row_count);
-    std::iota(offsets.begin(), offsets.end(), 0);
-
-    auto field_data = segment->bulk_subscript(
-        op_context, field_id, offsets.data(), row_count);
-    if (field_data == nullptr || !field_data->has_scalars() ||
-        !field_data->scalars().has_string_data() ||
-        field_data->scalars().string_data().data_size() != row_count) {
-        return nullptr;
-    }
-
-    const auto& data = field_data->scalars().string_data().data();
-    return std::make_shared<std::vector<std::string>>(data.begin(), data.end());
-}
-
 std::shared_ptr<CardinalDownpushSearchContext>
 BuildCardinalDownpushSearchContext(
     const segcore::SegmentInternalInterface* segment,
@@ -366,18 +357,58 @@ BuildCardinalDownpushSearchContext(
     }
 
     if (predicate.value_type_ == CardinalDownpushPredicateValueType::String &&
-        IsDownpushStringField(field_data_type)) {
-        ctx->string_row_values_ = BuildStringRowValuesFromBulkSubscript(
-            segment, op_context, predicate.field_id_, row_count);
-        if (ctx->string_row_values_ == nullptr) {
+        IsDownpushStringField(field_data_type) &&
+        segment->HasFieldData(predicate.field_id_)) {
+        auto num_chunks = segment->num_chunk_data(predicate.field_id_);
+        if (num_chunks <= 0) {
             return nullptr;
         }
-        ctx->string_row_value_ptrs_.reserve(ctx->string_row_values_->size());
-        ctx->string_row_value_sizes_.reserve(ctx->string_row_values_->size());
-        for (const auto& value : *ctx->string_row_values_) {
-            ctx->string_row_value_ptrs_.push_back(value.data());
-            ctx->string_row_value_sizes_.push_back(
-                static_cast<uint32_t>(value.size()));
+        ctx->string_pins_.reserve(num_chunks);
+        ctx->string_chunk_bases_.reserve(num_chunks);
+        ctx->string_chunk_value_offsets_.reserve(num_chunks);
+        ctx->string_chunk_valid_data_.reserve(num_chunks);
+        ctx->string_chunk_row_counts_.reserve(num_chunks);
+        ctx->chunk_offsets_.reserve(num_chunks + 1);
+        int64_t expected_row_offset = 0;
+        for (int64_t chunk_id = 0; chunk_id < num_chunks; ++chunk_id) {
+            const auto chunk_row_offset =
+                segment->num_rows_until_chunk(predicate.field_id_, chunk_id);
+            if (chunk_row_offset != expected_row_offset) {
+                return nullptr;
+            }
+            auto pin = segment->raw_string_chunk_view(
+                op_context, predicate.field_id_, chunk_id);
+            const auto view = pin.get();
+            if (view.base == nullptr || view.offsets == nullptr ||
+                view.row_count == 0 || expected_row_offset > row_count ||
+                static_cast<int64_t>(view.row_count) >
+                    row_count - expected_row_offset) {
+                return nullptr;
+            }
+            ctx->chunk_offsets_.push_back(chunk_row_offset);
+            ctx->string_chunk_bases_.push_back(view.base);
+            ctx->string_chunk_value_offsets_.push_back(view.offsets);
+            ctx->string_chunk_valid_data_.push_back(view.valid_data);
+            ctx->string_chunk_row_counts_.push_back(view.row_count);
+            ctx->string_pins_.push_back(std::move(pin));
+            expected_row_offset += view.row_count;
+        }
+        if (expected_row_offset != row_count) {
+            return nullptr;
+        }
+        ctx->chunk_offsets_.push_back(row_count);
+        const auto uniform_rows = ctx->string_chunk_row_counts_.front();
+        bool has_uniform_chunks = uniform_rows > 0;
+        for (size_t i = 1; i + 1 < ctx->string_chunk_row_counts_.size(); ++i) {
+            has_uniform_chunks =
+                has_uniform_chunks &&
+                ctx->string_chunk_row_counts_[i] == uniform_rows;
+        }
+        if (ctx->string_chunk_row_counts_.back() > uniform_rows) {
+            has_uniform_chunks = false;
+        }
+        if (has_uniform_chunks) {
+            ctx->string_uniform_chunk_rows_ = uniform_rows;
         }
         return ctx;
     }
@@ -412,8 +443,18 @@ FillKnowhereDownpushValueSource(
                                   ? nullptr
                                   : ctx.float_row_values_->data();
     filter.chunk_float_values = ctx.float_chunk_values_.data();
-    filter.row_string_values = ctx.string_row_value_ptrs_.data();
-    filter.row_string_sizes = ctx.string_row_value_sizes_.data();
+    filter.string_column.chunk_bases = ctx.string_chunk_bases_.data();
+    filter.string_column.chunk_value_offsets =
+        ctx.string_chunk_value_offsets_.data();
+    filter.string_column.chunk_valid_data = ctx.string_chunk_valid_data_.data();
+    filter.string_column.chunk_row_counts = ctx.string_chunk_row_counts_.data();
+    filter.string_column.chunk_row_offsets = ctx.chunk_offsets_.data();
+    filter.string_column.num_chunks = ctx.string_pins_.size();
+    filter.string_column.row_count =
+        ctx.string_chunk_row_counts_.empty()
+            ? 0
+            : static_cast<size_t>(ctx.chunk_offsets_.back());
+    filter.string_column.uniform_chunk_rows = ctx.string_uniform_chunk_rows_;
     filter.chunk_offsets = ctx.chunk_offsets_.data();
     if (!ctx.int64_chunk_values_.empty()) {
         filter.num_chunks = ctx.int64_chunk_values_.size();
@@ -437,6 +478,10 @@ FillKnowhereDownpushArgs(
     filter.string_arg1_data = predicate.string_arg1_.data();
     filter.string_arg1_size =
         static_cast<uint32_t>(predicate.string_arg1_.size());
+    filter.like_pattern.token_offsets = predicate.like_token_offsets_.data();
+    filter.like_pattern.token_sizes = predicate.like_token_sizes_.data();
+    filter.like_pattern.token_types = predicate.like_token_types_.data();
+    filter.like_pattern.token_count = predicate.like_token_types_.size();
     filter.int64_terms = predicate.int64_terms_.data();
     filter.int64_term_count = predicate.int64_terms_.size();
     filter.double_terms = predicate.double_terms_.data();
@@ -452,6 +497,7 @@ FillKnowhereDownpushArgs(
         filter.string_term_values = ctx.string_term_value_ptrs_.data();
         filter.string_term_sizes = ctx.string_term_value_sizes_.data();
         filter.string_term_count = ctx.string_term_value_ptrs_.size();
+        filter.string_terms_sorted = true;
     }
     filter.lower_inclusive = predicate.lower_inclusive_;
     filter.upper_inclusive = predicate.upper_inclusive_;
@@ -468,8 +514,8 @@ IsDownpushPredicateSourceReady(const CardinalDownpushSearchContext& ctx,
             return ctx.float_row_values_ != nullptr ||
                    !ctx.float_chunk_values_.empty();
         case CardinalDownpushPredicateValueType::String:
-            return ctx.string_row_values_ != nullptr &&
-                   !ctx.string_row_value_ptrs_.empty();
+            return !ctx.string_pins_.empty() &&
+                   ctx.string_chunk_bases_.size() == ctx.string_pins_.size();
     }
     return false;
 }
@@ -610,7 +656,8 @@ PhyVectorSearchNode::GetOutput() {
 
     auto op_context = query_context_->get_op_context();
     std::shared_ptr<CardinalDownpushSearchContext> downpush_ctx;
-    if (auto predicate = query_context_->get_cardinal_downpush_predicate();
+    if (const auto& predicate =
+            query_context_->get_cardinal_downpush_predicate();
         predicate.has_value()) {
         if (ph.element_level_) {
             ThrowInfo(

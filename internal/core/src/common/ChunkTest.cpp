@@ -172,8 +172,15 @@ TEST(chunk, test_variable_field) {
     auto chunk = create_chunk(field_meta, array_vec);
     auto string_chunk = static_cast<StringChunk*>(chunk.get());
     auto views = string_chunk->StringViews(std::nullopt);
+    auto raw_view = string_chunk->RawView();
+    EXPECT_EQ(raw_view.row_count, data.size());
+    EXPECT_EQ(raw_view.valid_data, nullptr);
     for (size_t i = 0; i < data.size(); ++i) {
         EXPECT_EQ(views.first[i], data[i]);
+        auto begin = raw_view.offsets[i];
+        auto end = raw_view.offsets[i + 1];
+        EXPECT_EQ(std::string_view(raw_view.base + begin, end - begin),
+                  data[i]);
     }
 }
 
@@ -217,10 +224,18 @@ TEST(chunk, test_variable_field_nullable) {
     auto chunk = create_chunk(field_meta, array_vec);
     auto string_chunk = static_cast<StringChunk*>(chunk.get());
     auto views = string_chunk->StringViews(std::nullopt);
+    auto raw_view = string_chunk->RawView();
+    ASSERT_NE(raw_view.valid_data, nullptr);
+    EXPECT_EQ(raw_view.row_count, data.size());
     for (size_t i = 0; i < data.size(); ++i) {
         EXPECT_EQ(views.second[i], validity[i]);
+        EXPECT_EQ(raw_view.valid_data[i], validity[i]);
         if (validity[i]) {
             EXPECT_EQ(views.first[i], data[i]);
+            auto begin = raw_view.offsets[i];
+            auto end = raw_view.offsets[i + 1];
+            EXPECT_EQ(std::string_view(raw_view.base + begin, end - begin),
+                      data[i]);
         }
     }
 }

@@ -89,6 +89,16 @@ class ChunkedColumnInterface {
     virtual PinWrapper<SpanBase>
     Span(milvus::OpContext* op_ctx, int64_t chunk_id) const = 0;
 
+    PinWrapper<RawStringChunkView>
+    RawStringView(milvus::OpContext* op_ctx, int64_t chunk_id) const {
+        auto pin = GetChunk(op_ctx, chunk_id);
+        auto* string_chunk = dynamic_cast<StringChunk*>(pin.get());
+        AssertInfo(string_chunk != nullptr,
+                   "RawStringView only supports string chunks");
+        return PinWrapper<RawStringChunkView>(std::move(pin),
+                                              string_chunk->RawView());
+    }
+
     virtual void
     PrefetchChunks(milvus::OpContext* op_ctx,
                    const std::vector<int64_t>& chunk_ids) const = 0;
