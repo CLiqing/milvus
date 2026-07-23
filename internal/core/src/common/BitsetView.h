@@ -20,6 +20,7 @@
 
 #include <boost_ext/dynamic_bitset_ext.hpp>
 #include <deque>
+#include <memory>
 
 #include "bitset/detail/element_wise.h"
 #include "common/Types.h"
@@ -39,6 +40,21 @@ class BitsetView : public knowhere::BitsetView {
 
     BitsetView(const uint8_t* data, size_t num_bits)
         : knowhere::BitsetView(data, num_bits) {  // NOLINT
+    }
+
+    BitsetView(const uint8_t* data,
+               size_t num_bits,
+               size_t num_filtered_out_bits)
+        : knowhere::BitsetView(data,
+                               num_bits,
+                               num_filtered_out_bits) {  // NOLINT
+    }
+
+    BitsetView(std::shared_ptr<const roaring_bitmap_t> bitmap,
+               size_t num_bits,
+               size_t num_filtered_out_bits)
+        : knowhere::BitsetView(knowhere::BitsetView::FromOwnedRoaring(
+              std::move(bitmap), num_bits, num_filtered_out_bits)) {  // NOLINT
     }
 
     BitsetView(const BitsetType& bitset)  // NOLINT

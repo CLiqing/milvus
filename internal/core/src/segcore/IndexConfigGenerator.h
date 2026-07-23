@@ -36,7 +36,11 @@ enum class IndexConfigLevel {
 // when the segment is sealed before the index is built.
 class VecIndexConfig {
     inline static const std::unordered_set<std::string> maintain_params = {
-        "radius", "range_filter", "drop_ratio_search", "dim_max_score_ratio"};
+        "radius", "range_filter", "drop_ratio_search", "dim_max_score_ratio",
+        // Kept when a sealed segment is searched through its temporary index.
+        // Cardinal consumes this experiment-only setting; VectorSearchNode uses
+        // it to create the matching per-query bitset representation.
+        "bf_filter_scan_mode"};
 
  public:
     VecIndexConfig(const int64_t max_index_row_count,
