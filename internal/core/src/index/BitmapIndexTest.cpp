@@ -658,6 +658,23 @@ TYPED_TEST_P(BitmapIndexTestV2, TestRangeCompareFuncTest) {
     this->TestRangeCompareFunc();
 }
 
+TYPED_TEST_P(BitmapIndexTestV2, NativeRoaringEqualFuncTest) {
+    auto* index_ptr =
+        dynamic_cast<index::BitmapIndex<TypeParam>*>(this->index_.get());
+    ASSERT_NE(index_ptr, nullptr);
+
+    const auto value = this->data_[0];
+    const auto native = index_ptr->TryGetRoaringEqual(value);
+    ASSERT_NE(native, nullptr);
+
+    const auto dense = index_ptr->In(1, &value);
+    for (size_t id = 0; id < dense.size(); ++id) {
+        EXPECT_EQ(
+            roaring_bitmap_contains(native.get(), static_cast<uint32_t>(id)),
+            dense[id]);
+    }
+}
+
 TYPED_TEST_P(BitmapIndexTestV2, IsNullFuncTest) {
     this->TestIsNullFunc();
 }
@@ -679,6 +696,7 @@ REGISTER_TYPED_TEST_SUITE_P(BitmapIndexTestV2,
                             NotINFuncTest,
                             CompareValFuncTest,
                             TestRangeCompareFuncTest,
+                            NativeRoaringEqualFuncTest,
                             IsNullFuncTest,
                             IsNotNullFuncTest,
                             PatternMatchFuncTest);

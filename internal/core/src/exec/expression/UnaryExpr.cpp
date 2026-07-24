@@ -50,6 +50,7 @@
 #include "fmt/core.h"
 #include "folly/FBVector.h"
 #include "glog/logging.h"
+#include "index/BitmapIndex.h"
 #include "index/NgramInvertedIndex.h"
 #include "index/TextMatchIndex.h"
 #include "index/json_stats/JsonKeyStats.h"
@@ -361,6 +362,28 @@ PhyUnaryRangeFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
                       "unsupported data type: {}",
                       expr_->column_.data_type_);
     }
+}
+
+std::shared_ptr<roaring_bitmap_t>
+PhyUnaryRangeFilterExpr::TryGetNativeRoaringValidIds() {
+    // Keep the first native path deliberately narrow: one non-element-level
+    // INT64 equality predicate backed by a BitmapIndex in Roaring mode.
+    if (expr_->column_.element_level_ ||
+        expr_->column_.data_type_ != DataType::INT64 ||
+        expr_->op_type_ != proto::plan::OpType::Equal) {
+        return nullptr;
+    }
+
+    EnsureExecPathDetermined();
+    if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
+        pinned_index_.empty()) {
+        return nullptr;
+    }
+
+    const auto value = GetValueFromProto<int64_t>(expr_->val_);
+    auto* scalar_index = dynamic_cast<const index::BitmapIndex<int64_t>*>(
+        pinned_index_[0].get());
+    return scalar_index == nullptr ? nullptr : scalar_index->TryGetRoaringEqual(value);
 }
 
 VectorPtr

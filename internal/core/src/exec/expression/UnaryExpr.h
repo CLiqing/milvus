@@ -1026,6 +1026,9 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
+    std::shared_ptr<roaring_bitmap_t>
+    TryGetNativeRoaringValidIds() override;
+
     void
     DetermineExecPath() override;
 

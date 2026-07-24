@@ -405,6 +405,28 @@ BitmapIndex<T>::ConvertRoaringToBitset(const roaring::Roaring& values) {
 }
 
 template <typename T>
+std::shared_ptr<roaring_bitmap_t>
+BitmapIndex<T>::TryGetRoaringEqual(const T& value) const {
+    if (!is_built_ || build_mode_ != BitmapIndexBuildMode::ROARING) {
+        return nullptr;
+    }
+
+    const auto& postings = is_mmap_ ? bitmap_info_map_ : data_;
+    const auto it = postings.find(value);
+    if (it == postings.end()) {
+        return nullptr;
+    }
+
+    auto* result = roaring_bitmap_create();
+    AssertInfo(result != nullptr, "failed to allocate Roaring posting copy");
+    for (const auto id : it->second) {
+        roaring_bitmap_add(result, static_cast<uint32_t>(id));
+    }
+    return std::shared_ptr<roaring_bitmap_t>(
+        result, [](roaring_bitmap_t* p) { roaring_bitmap_free(p); });
+}
+
+template <typename T>
 std::pair<size_t, size_t>
 BitmapIndex<T>::DeserializeIndexMeta(const uint8_t* data_ptr,
                                      size_t data_size) {

@@ -21,7 +21,6 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
-#include <limits>
 #include <ratio>
 #include <string>
 #include <utility>
@@ -182,59 +181,30 @@ PhyVectorSearchNode::GetOutput() {
             return input_;
         }
 
-        // `bf_filter_scan_mode` is an experiment-only Cardinal parameter.  The
-        // two explicit modes deliberately create their bitset representation
-        // here, once for the one query being executed.  There is no request or
-        // batch cache: NQ > 1 is rejected so a result cannot accidentally be
-        // attributed to shared filter preparation.
+        // This opt-in mode consumes the native scalar BitmapIndex posting.
+        // It deliberately rejects NQ > 1: no request or batch cache is part
+        // of this experiment.
         const auto bf_filter_scan_mode = search_info_.search_params_.value(
             "bf_filter_scan_mode", std::string{"auto"});
-        if (bf_filter_scan_mode == "dense_per_query" ||
-            bf_filter_scan_mode == "roaring_per_query") {
+        if (bf_filter_scan_mode == "roaring_native_valid") {
             if (num_queries != 1) {
                 ThrowInfo(ConfigInvalid,
                           "bf_filter_scan_mode={} requires NQ=1, got {}",
                           bf_filter_scan_mode,
                           num_queries);
             }
-
-            const auto* filter_data =
-                static_cast<const uint8_t*>(col_input->GetRawData());
-            const size_t filter_bits = col_input->size();
-            size_t filtered_count = 0;
-
-            if (bf_filter_scan_mode == "dense_per_query") {
-                for (size_t i = 0; i < filter_bits; ++i) {
-                    filtered_count +=
-                        (filter_data[i >> 3] & (1U << (i & 7))) != 0;
-                }
-                search_view = milvus::BitsetView(
-                    filter_data, filter_bits, filtered_count);
-            } else {
-                if (filter_bits > std::numeric_limits<uint32_t>::max()) {
-                    ThrowInfo(ConfigInvalid,
-                              "Roaring filter bitmap supports at most {} rows, got {}",
-                              std::numeric_limits<uint32_t>::max(),
-                              filter_bits);
-                }
-                auto* bitmap = roaring_bitmap_create();
-                AssertInfo(bitmap != nullptr,
-                           "failed to allocate Roaring filter bitmap");
-                for (size_t i = 0; i < filter_bits; ++i) {
-                    if (filter_data[i >> 3] & (1U << (i & 7))) {
-                        roaring_bitmap_add(bitmap, static_cast<uint32_t>(i));
-                        ++filtered_count;
-                    }
-                }
-                auto bitmap_owner = std::shared_ptr<const roaring_bitmap_t>(
-                    bitmap,
-                    [](const roaring_bitmap_t* p) {
-                        roaring_bitmap_free(
-                            const_cast<roaring_bitmap_t*>(p));
-                    });
-                search_view = milvus::BitsetView(
-                    std::move(bitmap_owner), filter_bits, filtered_count);
+            auto native_ids = query_context_->get_native_roaring_valid_ids();
+            if (native_ids == nullptr) {
+                ThrowInfo(ConfigInvalid,
+                          "roaring_native_valid requires a native Roaring "
+                          "BitmapIndex equality predicate");
             }
+            const auto valid_count =
+                roaring_bitmap_get_cardinality(native_ids.get());
+            search_view = milvus::BitsetView::FromOwnedRoaringValid(
+                std::shared_ptr<const roaring_bitmap_t>(std::move(native_ids)),
+                static_cast<size_t>(active_count_),
+                static_cast<size_t>(active_count_ - valid_count));
         } else {
             // TODO: uniform knowhere BitsetView and milvus BitsetView
             search_view = milvus::BitsetView(

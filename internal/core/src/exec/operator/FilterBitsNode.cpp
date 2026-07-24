@@ -143,12 +143,17 @@ PhyFilterBitsNode::GetOutput() {
         return nullptr;
     }
 
+    const auto search_info = query_context_->get_search_info();
+    const auto scan_mode = search_info.search_params_.value(
+        "bf_filter_scan_mode", std::string{"auto"});
+
     // Cache read: Stage 2 of two-stage search reuses the bitset cached by Stage 1.
     // Cache lives in the process-level ExprResCacheManager keyed by
     // (segment_id, FilterBitsNode signature + dynamic filter context), so
     // cross-query reuse is automatic only when the effective predicate matches.
     auto* cache_segment = query_context_->get_segment();
-    const bool can_use_cache = enable_expr_cache_ && !expr_cache_key_.empty() &&
+    const bool can_use_cache = scan_mode != "roaring_native_valid" &&
+                               enable_expr_cache_ && !expr_cache_key_.empty() &&
                                cache_segment != nullptr &&
                                cache_segment->type() == SegmentType::Sealed &&
                                ExprResCacheManager::IsEnabled();
@@ -166,6 +171,29 @@ PhyFilterBitsNode::GetOutput() {
                 cached.result->clone(),
                 cached.valid_result ? cached.valid_result->clone()
                                     : TargetBitmap(need_process_rows_, true)));
+            return std::make_shared<RowVector>(col_res);
+        }
+    }
+
+    // Native accepted-ID path for the Cardinal BF experiment.  It is limited
+    // to the sealed/no-TTL Mvcc regime, one expression, and an explicit
+    // search parameter.  Every other expression keeps the dense path below.
+    if (scan_mode == "roaring_native_valid" && exprs_->size() == 1 &&
+        cache_segment != nullptr &&
+        cache_segment->type() == SegmentType::Sealed &&
+        query_context_->get_collection_ttl() == 0 &&
+        query_context_->get_query_timestamp() >=
+            cache_segment->get_max_timestamp()) {
+        auto native_ids = exprs_->expr(0)->TryGetNativeRoaringValidIds();
+        if (native_ids != nullptr) {
+            query_context_->set_native_roaring_valid_ids(std::move(native_ids));
+            num_processed_rows_ = need_process_rows_;
+            std::vector<VectorPtr> col_res;
+            // MvccNode uses this empty dense bitmap only for deletes; it is
+            // not the scalar predicate and is never converted to Roaring.
+            col_res.push_back(std::make_shared<ColumnVector>(
+                TargetBitmap(need_process_rows_, false),
+                TargetBitmap(need_process_rows_, true)));
             return std::make_shared<RowVector>(col_res);
         }
     }

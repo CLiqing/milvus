@@ -26,6 +26,8 @@
 #include <string>
 #include <type_traits>
 
+#include <roaring/roaring.h>
+
 #include "common/Array.h"
 #include "common/ArrayOffsets.h"
 #include "common/FieldDataInterface.h"
@@ -147,6 +149,13 @@ class Expr : public std::enable_shared_from_this<Expr> {
     virtual void
     Eval(EvalCtx& context, VectorPtr& result) {
         ThrowInfo(ErrorCode::NotImplemented, "not implemented");
+    }
+
+    // Opt-in Cardinal BF experiment.  The default preserves the normal dense
+    // expression path for every unsupported expression.
+    virtual std::shared_ptr<roaring_bitmap_t>
+    TryGetNativeRoaringValidIds() {
+        return nullptr;
     }
 
     // Only move cursor to next batch

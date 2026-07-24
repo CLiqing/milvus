@@ -89,6 +89,7 @@ PhyMvccNode::GetOutput() {
             TargetBitmap(active_count_), TargetBitmap(active_count_));
         TargetBitmapView data(col_input->GetRawData(), col_input->size());
         segment_->mask_with_delete(data, active_count_, query_timestamp_);
+        query_context->remove_native_roaring_valid_ids(data);
 
         if (data.none()) {
             query_context->set_all_rows_visible(true);
@@ -110,6 +111,7 @@ PhyMvccNode::GetOutput() {
     segment_->mask_with_timestamps(
         data, query_timestamp_, collection_ttl_timestamp_);
     segment_->mask_with_delete(data, active_count_, query_timestamp_);
+    query_context->remove_native_roaring_valid_ids(data);
     is_finished_ = true;
 
     // input_ have already been updated

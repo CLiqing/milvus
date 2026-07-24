@@ -57,6 +57,20 @@ class BitsetView : public knowhere::BitsetView {
               std::move(bitmap), num_bits, num_filtered_out_bits)) {  // NOLINT
     }
 
+    static BitsetView
+    FromOwnedRoaringValid(std::shared_ptr<const roaring_bitmap_t> bitmap,
+                          size_t num_bits,
+                          size_t num_filtered_out_bits) {
+        return BitsetView(knowhere::BitsetView::FromOwnedRoaringValid(
+            std::move(bitmap), num_bits, num_filtered_out_bits));
+    }
+
+ private:
+    explicit BitsetView(knowhere::BitsetView bitset)
+        : knowhere::BitsetView(std::move(bitset)) {
+    }
+
+ public:
     BitsetView(const BitsetType& bitset)  // NOLINT
         : BitsetView((uint8_t*)(bitset.data()), bitset.size()) {
     }

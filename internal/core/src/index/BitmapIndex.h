@@ -119,6 +119,11 @@ class BitmapIndex : public ScalarIndex<T> {
           const T& upper_bound_value,
           bool ub_inclusive) override;
 
+    // Experimental Cardinal BF producer. Returns accepted IDs directly from
+    // a Roaring posting, or null when this index uses dense storage.
+    std::shared_ptr<roaring_bitmap_t>
+    TryGetRoaringEqual(const T& value) const;
+
     std::optional<T>
     Reverse_Lookup(size_t offset) const override;
 

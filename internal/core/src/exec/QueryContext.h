@@ -24,6 +24,7 @@
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/Optional.h>
 #include <folly/CancellationToken.h>
+#include <roaring/roaring.h>
 
 #include "common/Common.h"
 #include "common/Types.h"
@@ -389,6 +390,29 @@ class QueryContext : public Context {
     }
 
     void
+    set_native_roaring_valid_ids(std::shared_ptr<roaring_bitmap_t> ids) {
+        native_roaring_valid_ids_ = std::move(ids);
+    }
+
+    std::shared_ptr<roaring_bitmap_t>
+    get_native_roaring_valid_ids() const {
+        return native_roaring_valid_ids_;
+    }
+
+    void
+    remove_native_roaring_valid_ids(TargetBitmapView filtered) {
+        if (native_roaring_valid_ids_ == nullptr) {
+            return;
+        }
+        for (size_t id = 0; id < filtered.size(); ++id) {
+            if (filtered[id]) {
+                roaring_bitmap_remove(native_roaring_valid_ids_.get(),
+                                      static_cast<uint32_t>(id));
+            }
+        }
+    }
+
+    void
     set_enable_expr_cache(bool enable) {
         enable_expr_cache_ = enable;
     }
@@ -451,6 +475,10 @@ class QueryContext : public Context {
 
     // MVCC fast path: set true when sealed + no-filter + no-delete + no-TTL
     bool all_rows_visible_{false};
+
+    // Accepted IDs for the opt-in Cardinal BF experiment. MvccNode removes
+    // deleted rows before VectorSearchNode consumes the payload.
+    std::shared_ptr<roaring_bitmap_t> native_roaring_valid_ids_{nullptr};
 
     // Expression filter cache for two-stage search
     bool enable_expr_cache_ = false;
