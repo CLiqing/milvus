@@ -409,10 +409,6 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
             value_type.value() != CardinalDownpushPredicateValueType::String) {
             return std::nullopt;
         }
-        if (value_type.value() == CardinalDownpushPredicateValueType::String &&
-            !segment->HasFieldData(field_id)) {
-            return std::nullopt;
-        }
         if (!segment->HasFieldData(field_id) && !segment->HasIndex(field_id)) {
             return std::nullopt;
         }

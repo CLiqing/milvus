@@ -265,6 +265,57 @@ TEST_F(StringIndexSortTest, ReverseLookupMmap) {
     }
 }
 
+TEST_F(StringIndexSortTest, DictionaryIdColumnViewMemory) {
+    std::vector<std::string> values = {
+        "tokyo", "beijing", "tokyo", "shanghai", "beijing"};
+    const bool valid[] = {true, true, false, true, true};
+    auto index = milvus::index::CreateStringIndexSort({});
+    index->Build(values.size(), values.data(), valid);
+
+    auto tokyo = index->GetDictionaryIdColumnView("tokyo");
+    ASSERT_TRUE(tokyo.has_value());
+    ASSERT_TRUE(tokyo->target_dictionary_id_found);
+    ASSERT_EQ(tokyo->row_count, values.size());
+    ASSERT_EQ(tokyo->row_value_ids[0], tokyo->target_dictionary_id);
+    ASSERT_EQ(tokyo->row_value_ids[2], -1);
+    ASSERT_EQ(tokyo->row_value_ids[1], tokyo->row_value_ids[4]);
+
+    auto missing = index->GetDictionaryIdColumnView("missing");
+    ASSERT_TRUE(missing.has_value());
+    ASSERT_FALSE(missing->target_dictionary_id_found);
+    ASSERT_EQ(missing->target_dictionary_id, -1);
+    ASSERT_EQ(missing->row_value_ids, tokyo->row_value_ids);
+}
+
+TEST_F(StringIndexSortTest, DictionaryIdColumnViewMmap) {
+    std::vector<std::string> values = {
+        "tokyo", "beijing", "tokyo", "shanghai", "beijing"};
+    const bool valid[] = {true, true, false, true, true};
+    auto build_index = milvus::index::CreateStringIndexSort({});
+    build_index->Build(values.size(), values.data(), valid);
+    auto binary_set = build_index->Serialize({});
+
+    Config mmap_config;
+    mmap_config[MMAP_FILE_PATH] =
+        TestLocalPath + "test_dictionary_id_view_mmap.idx";
+    auto mmap_index = milvus::index::CreateStringIndexSort({});
+    mmap_index->Load(binary_set, mmap_config);
+
+    auto beijing = mmap_index->GetDictionaryIdColumnView("beijing");
+    ASSERT_TRUE(beijing.has_value());
+    ASSERT_TRUE(beijing->target_dictionary_id_found);
+    ASSERT_EQ(beijing->row_count, values.size());
+    ASSERT_EQ(beijing->row_value_ids[1], beijing->target_dictionary_id);
+    ASSERT_EQ(beijing->row_value_ids[4], beijing->target_dictionary_id);
+    ASSERT_EQ(beijing->row_value_ids[2], -1);
+
+    auto missing = mmap_index->GetDictionaryIdColumnView("missing");
+    ASSERT_TRUE(missing.has_value());
+    ASSERT_FALSE(missing->target_dictionary_id_found);
+    std::remove(
+        (TestLocalPath + "test_dictionary_id_view_mmap.idx").c_str());
+}
+
 TEST_F(StringIndexSortTest, SerializeDeserializeMemory) {
     Config config;
     auto index = milvus::index::CreateStringIndexSort({});

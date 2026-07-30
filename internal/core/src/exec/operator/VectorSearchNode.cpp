@@ -42,6 +42,8 @@
 #include "exec/expression/Utils.h"
 #include "exec/operator/Utils.h"
 #include "index/ScalarIndex.h"
+#include "index/StringIndex.h"
+#include "log/Log.h"
 #include "monitor/Monitor.h"
 #include "opentelemetry/trace/span.h"
 #include "plan/PlanNode.h"
@@ -61,6 +63,9 @@ struct CardinalDownpushSearchContext {
     std::vector<milvus::cachinglayer::PinWrapper<Span<float>>> float_pins_;
     std::vector<milvus::cachinglayer::PinWrapper<RawStringChunkView>>
         string_pins_;
+    std::vector<
+        milvus::cachinglayer::PinWrapper<const index::IndexBase*>>
+        scalar_index_pins_;
     std::shared_ptr<std::vector<int64_t>> int64_row_values_;
     std::shared_ptr<std::vector<float>> float_row_values_;
     std::vector<const char*> string_chunk_bases_;
@@ -73,6 +78,10 @@ struct CardinalDownpushSearchContext {
     std::vector<const int64_t*> int64_chunk_values_;
     std::vector<const float*> float_chunk_values_;
     std::vector<int64_t> chunk_offsets_;
+    const int32_t* row_dictionary_ids_{nullptr};
+    size_t dictionary_row_count_{0};
+    int32_t target_dictionary_id_{-1};
+    bool target_dictionary_id_found_{false};
 };
 
 struct DownpushRowValuesCacheKey {
@@ -413,11 +422,46 @@ BuildCardinalDownpushSearchContext(
         return ctx;
     }
 
+    if (predicate.value_type_ == CardinalDownpushPredicateValueType::String &&
+        IsDownpushStringField(field_data_type) &&
+        (predicate.op_ == CardinalDownpushPredicateOp::Int64Equal ||
+         predicate.op_ == CardinalDownpushPredicateOp::Int64NotEqual) &&
+        segment->HasIndex(predicate.field_id_)) {
+        auto pins = segment->PinIndex(op_context, predicate.field_id_);
+        if (pins.size() != 1) {
+            return nullptr;
+        }
+        const auto* string_index =
+            dynamic_cast<const index::StringIndex*>(pins.front().get());
+        if (string_index == nullptr) {
+            return nullptr;
+        }
+        auto view = string_index->GetDictionaryIdColumnView(
+            predicate.string_arg0_);
+        if (!view.has_value() || view->row_value_ids == nullptr ||
+            view->row_count != static_cast<size_t>(row_count)) {
+            return nullptr;
+        }
+        ctx->row_dictionary_ids_ = view->row_value_ids;
+        ctx->dictionary_row_count_ = view->row_count;
+        ctx->target_dictionary_id_ = view->target_dictionary_id;
+        ctx->target_dictionary_id_found_ =
+            view->target_dictionary_id_found;
+        ctx->scalar_index_pins_ = std::move(pins);
+        LOG_INFO(
+            "Cardinal downpush scalar source selected: source=stl_sort_dictionary_id, field_id={}, rows={}, target_found={}",
+            predicate.field_id_.get(),
+            ctx->dictionary_row_count_,
+            ctx->target_dictionary_id_found_);
+        return ctx;
+    }
+
     return nullptr;
 }
 
 std::optional<knowhere::BitsetView::ExtraScalarPredicateValueType>
-ToKnowherePredicateValueType(CardinalDownpushPredicateValueType value_type) {
+ToKnowherePredicateValueType(CardinalDownpushPredicateValueType value_type,
+                             const CardinalDownpushSearchContext& ctx) {
     using KnowhereValueType =
         knowhere::BitsetView::ExtraScalarPredicateValueType;
     switch (value_type) {
@@ -426,7 +470,9 @@ ToKnowherePredicateValueType(CardinalDownpushPredicateValueType value_type) {
         case CardinalDownpushPredicateValueType::Float:
             return KnowhereValueType::kFloat;
         case CardinalDownpushPredicateValueType::String:
-            return KnowhereValueType::kString;
+            return ctx.row_dictionary_ids_ == nullptr
+                       ? KnowhereValueType::kString
+                       : KnowhereValueType::kDictionaryId;
     }
     return std::nullopt;
 }
@@ -455,6 +501,9 @@ FillKnowhereDownpushValueSource(
             ? 0
             : static_cast<size_t>(ctx.chunk_offsets_.back());
     filter.string_column.uniform_chunk_rows = ctx.string_uniform_chunk_rows_;
+    filter.row_dictionary_ids = ctx.row_dictionary_ids_;
+    filter.target_dictionary_id = ctx.target_dictionary_id_;
+    filter.target_dictionary_id_found = ctx.target_dictionary_id_found_;
     filter.chunk_offsets = ctx.chunk_offsets_.data();
     if (!ctx.int64_chunk_values_.empty()) {
         filter.num_chunks = ctx.int64_chunk_values_.size();
@@ -514,8 +563,11 @@ IsDownpushPredicateSourceReady(const CardinalDownpushSearchContext& ctx,
             return ctx.float_row_values_ != nullptr ||
                    !ctx.float_chunk_values_.empty();
         case CardinalDownpushPredicateValueType::String:
-            return !ctx.string_pins_.empty() &&
-                   ctx.string_chunk_bases_.size() == ctx.string_pins_.size();
+            return (!ctx.string_pins_.empty() &&
+                    ctx.string_chunk_bases_.size() == ctx.string_pins_.size()) ||
+                   (ctx.row_dictionary_ids_ != nullptr &&
+                    ctx.dictionary_row_count_ > 0 &&
+                    !ctx.scalar_index_pins_.empty());
     }
     return false;
 }
@@ -665,9 +717,14 @@ PhyVectorSearchNode::GetOutput() {
                 "downpush hint does not support element-level vector search");
         }
         auto op = ToKnowherePredicateOp(predicate->op_);
-        auto value_type = ToKnowherePredicateValueType(predicate->value_type_);
         downpush_ctx = BuildCardinalDownpushSearchContext(
             segment_, op_context, predicate.value());
+        std::optional<knowhere::BitsetView::ExtraScalarPredicateValueType>
+            value_type;
+        if (downpush_ctx != nullptr) {
+            value_type = ToKnowherePredicateValueType(predicate->value_type_,
+                                                      *downpush_ctx);
+        }
         if (!op.has_value() || !value_type.has_value() ||
             downpush_ctx == nullptr ||
             !IsDownpushPredicateSourceReady(*downpush_ctx,

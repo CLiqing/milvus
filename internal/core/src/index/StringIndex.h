@@ -27,6 +27,13 @@
 
 namespace milvus::index {
 
+struct DictionaryIdColumnView {
+    const int32_t* row_value_ids = nullptr;
+    size_t row_count = 0;
+    int32_t target_dictionary_id = -1;
+    bool target_dictionary_id_found = false;
+};
+
 class StringIndex : public ScalarIndex<std::string> {
  public:
     StringIndex(const std::string& index_type)
@@ -45,6 +52,11 @@ class StringIndex : public ScalarIndex<std::string> {
 
     virtual const TargetBitmap
     PrefixMatch(const std::string_view prefix) = 0;
+
+    virtual std::optional<DictionaryIdColumnView>
+    GetDictionaryIdColumnView(const std::string& value) const {
+        return std::nullopt;
+    }
 };
 using StringIndexPtr = std::unique_ptr<StringIndex>;
 }  // namespace milvus::index

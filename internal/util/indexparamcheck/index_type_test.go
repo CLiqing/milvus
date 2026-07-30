@@ -27,6 +27,9 @@ import (
 )
 
 func TestIsScalarMmapIndex(t *testing.T) {
+	t.Run("stl sort index", func(t *testing.T) {
+		assert.True(t, IsScalarMmapIndex(IndexSTLSORT))
+	})
 	t.Run("inverted index", func(t *testing.T) {
 		assert.True(t, IsScalarMmapIndex(IndexINVERTED))
 	})
@@ -66,8 +69,8 @@ func TestValidateMmapTypeParams(t *testing.T) {
 		assert.Error(t, err)
 	})
 
-	t.Run("stl_mmap mmap enable", func(t *testing.T) {
-		err := ValidateMmapIndexParams(IndexNGRAM, map[string]string{
+	t.Run("stl sort mmap enable", func(t *testing.T) {
+		err := ValidateMmapIndexParams(IndexSTLSORT, map[string]string{
 			common.MmapEnabledKey: "true",
 		})
 		assert.NoError(t, err)

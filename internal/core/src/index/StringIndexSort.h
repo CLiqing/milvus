@@ -138,6 +138,9 @@ class StringIndexSort : public StringIndex {
     std::optional<std::string>
     Reverse_Lookup(size_t offset) const override;
 
+    std::optional<DictionaryIdColumnView>
+    GetDictionaryIdColumnView(const std::string& value) const override;
+
     int64_t
     Size() override;
 
@@ -252,6 +255,9 @@ class StringIndexSortImpl {
                    const int32_t* idx_to_offsets_ptr,
                    size_t idx_to_offsets_size) const = 0;
 
+    virtual std::optional<int32_t>
+    ResolveValueIndex(const std::string& value) const = 0;
+
     virtual int64_t
     Size() = 0;
 
@@ -347,6 +353,9 @@ class StringIndexSortMemoryImpl : public StringIndexSortImpl {
                    const TargetBitmap& valid_bitset,
                    const int32_t* idx_to_offsets_ptr,
                    size_t idx_to_offsets_size) const override;
+
+    std::optional<int32_t>
+    ResolveValueIndex(const std::string& value) const override;
 
     int64_t
     Size() override;
@@ -503,6 +512,9 @@ class StringIndexSortMmapImpl : public StringIndexSortImpl {
                    const TargetBitmap& valid_bitset,
                    const int32_t* idx_to_offsets_ptr,
                    size_t idx_to_offsets_size) const override;
+
+    std::optional<int32_t>
+    ResolveValueIndex(const std::string& value) const override;
 
     int64_t
     Size() override;

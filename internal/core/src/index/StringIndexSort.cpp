@@ -516,6 +516,23 @@ StringIndexSort::Reverse_Lookup(size_t offset) const {
                                  idx_to_offsets_size_);
 }
 
+std::optional<DictionaryIdColumnView>
+StringIndexSort::GetDictionaryIdColumnView(const std::string& value) const {
+    if (!is_built_ || impl_ == nullptr || idx_to_offsets_ptr_ == nullptr ||
+        idx_to_offsets_size_ != total_num_rows_) {
+        return std::nullopt;
+    }
+    DictionaryIdColumnView view;
+    view.row_value_ids = idx_to_offsets_ptr_;
+    view.row_count = idx_to_offsets_size_;
+    auto target_id = impl_->ResolveValueIndex(value);
+    if (target_id.has_value()) {
+        view.target_dictionary_id = target_id.value();
+        view.target_dictionary_id_found = true;
+    }
+    return view;
+}
+
 int64_t
 StringIndexSort::Size() {
     return total_size_;
@@ -1327,6 +1344,16 @@ StringIndexSortMemoryImpl::Reverse_Lookup(size_t offset,
     return std::nullopt;
 }
 
+std::optional<int32_t>
+StringIndexSortMemoryImpl::ResolveValueIndex(const std::string& value) const {
+    const auto idx = FindValueIndex(value);
+    if (idx == std::numeric_limits<size_t>::max() ||
+        idx > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        return std::nullopt;
+    }
+    return static_cast<int32_t>(idx);
+}
+
 int64_t
 StringIndexSortMemoryImpl::Size() {
     size_t size = 0;
@@ -1829,6 +1856,16 @@ StringIndexSortMmapImpl::Reverse_Lookup(size_t offset,
     }
 
     return std::nullopt;
+}
+
+std::optional<int32_t>
+StringIndexSortMmapImpl::ResolveValueIndex(const std::string& value) const {
+    const auto idx = FindValueIndex(value);
+    if (idx >= unique_count_ ||
+        idx > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        return std::nullopt;
+    }
+    return static_cast<int32_t>(idx);
 }
 
 int64_t
