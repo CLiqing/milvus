@@ -18,6 +18,7 @@
 #include "exec/QueryContext.h"
 #include "exec/Task.h"
 #include "expr/ITypeExpr.h"
+#include "index/ScalarIndexSort.h"
 #include "pb/plan.pb.h"
 #include "plan/PlanNode.h"
 #include "segcore/SegcoreConfig.h"
@@ -112,6 +113,48 @@ class MvccFastPathTest : public ::testing::Test {
         return result;
     }
 
+    // Execute the real FilterBitsNode -> MvccNode topology with a pre-built
+    // scalar candidate list.  This models the native STLSORT producer: the
+    // upstream bitmap is intentionally ignored by MvccNode once the list is
+    // present, while timestamp/delete visibility must still be identical.
+    std::shared_ptr<const std::vector<int32_t>>
+    RunNativeListMvccPlan(const SegmentInternalInterface* segment,
+                          std::vector<int32_t> candidate_ids,
+                          Timestamp collection_ttl = 0,
+                          Timestamp query_timestamp = MAX_TIMESTAMP) {
+        proto::plan::GenericValue value;
+        value.set_int64_val(N_ / 2);
+        auto expr = std::make_shared<expr::UnaryRangeFilterExpr>(
+            expr::ColumnInfo(int64_fid_, DataType::INT64),
+            proto::plan::OpType::LessThan,
+            value,
+            std::vector<proto::plan::GenericValue>{});
+        auto filter_node =
+            std::make_shared<plan::FilterBitsNode>("filter_native_list", expr);
+        auto mvcc_node = std::make_shared<plan::MvccNode>(
+            "mvcc_native_list", std::vector<plan::PlanNodePtr>{filter_node});
+        auto query_context = std::make_shared<QueryContext>(
+            "test_native_list_mvcc",
+            segment,
+            N_,
+            query_timestamp,
+            collection_ttl,
+            0,
+            query::PlanOptions{false},
+            std::make_shared<QueryConfig>(
+                std::unordered_map<std::string, std::string>{}));
+        query_context->set_native_valid_ids(
+            std::make_shared<const std::vector<int32_t>>(std::move(candidate_ids)));
+
+        auto task = Task::Create("task_native_list_mvcc",
+                                 plan::PlanFragment(mvcc_node),
+                                 0,
+                                 query_context);
+        while (task->Next()) {
+        }
+        return query_context->get_native_valid_ids();
+    }
+
     SchemaPtr schema_;
     FieldId vec_fid_;
     FieldId int64_fid_;
@@ -173,6 +216,62 @@ TEST_F(MvccFastPathTest, Level3_SealedWithTTL_DefaultPath) {
     EXPECT_EQ(result.num_rows, N_);
     EXPECT_FALSE(result.all_rows_visible)
         << "Level 3: TTL set should NOT trigger fast path";
+}
+
+// Native valid-ID lists are scalar candidates, not an MVCC bypass.  Verify
+// that delete visibility is applied by compacting only the candidate IDs.
+TEST_F(MvccFastPathTest, NativeValidIds_CompactsDeletedCandidates) {
+    auto segment = CreateSealedSegmentWithDeletes(/*num_deletes=*/5);
+    auto survivors = RunNativeListMvccPlan(
+        segment.get(), std::vector<int32_t>{0, 2, 5, 42, 999});
+
+    ASSERT_NE(survivors, nullptr);
+    EXPECT_EQ(*survivors, (std::vector<int32_t>{5, 42, 999}));
+}
+
+// TTL uses the same invalid mask as the Dense route.  The test deliberately
+// includes the boundary so a future list-only shortcut cannot silently change
+// the <= collection_ttl expiration rule.
+TEST_F(MvccFastPathTest, NativeValidIds_CompactsTtlExpiredCandidates) {
+    auto segment = CreateSealedSegment();
+    auto survivors = RunNativeListMvccPlan(
+        segment.get(),
+        std::vector<int32_t>{50, 100, 101, 500},
+        /*collection_ttl=*/100);
+
+    ASSERT_NE(survivors, nullptr);
+    EXPECT_EQ(*survivors, (std::vector<int32_t>{101, 500}));
+}
+
+// Historical reads also use the regular timestamp invalid mask.  Rows whose
+// insert timestamp is newer than the snapshot must not reach Cardinal.
+TEST_F(MvccFastPathTest, NativeValidIds_CompactsFutureCandidatesAtSnapshot) {
+    auto segment = CreateSealedSegment();
+    auto survivors = RunNativeListMvccPlan(
+        segment.get(),
+        std::vector<int32_t>{50, 100, 101, 500},
+        /*collection_ttl=*/0,
+        /*query_timestamp=*/100);
+
+    ASSERT_NE(survivors, nullptr);
+    EXPECT_EQ(*survivors, (std::vector<int32_t>{50, 100}));
+}
+
+// STLSORT produces the native list in scalar-index order (not row-ID order).
+// Cardinal must therefore accept the producer order without an extra sort.
+TEST_F(MvccFastPathTest, NativeValidIds_StlSortRangeKeepsProducerOrder) {
+    const std::vector<int64_t> values{50, 5, 100, 7, 75};
+    auto sort_index = index::CreateScalarIndexSort<int64_t>();
+    sort_index->Build(values.size(), values.data());
+
+    auto ids = sort_index->TryGetValidIdRange(
+        /*lower_bound_value=*/7,
+        /*lb_inclusive=*/true,
+        /*upper_bound_value=*/75,
+        /*ub_inclusive=*/true);
+
+    ASSERT_NE(ids, nullptr);
+    EXPECT_EQ(*ids, (std::vector<int32_t>{3, 0, 4}));
 }
 
 // ---------------------------------------------------------------------------
