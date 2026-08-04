@@ -16,7 +16,7 @@ milvus_add_pkg_config("knowhere")
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES "")
 # Experiment chain: this commit pins the matching Cardinal revision in
 # zilliztech/cardinal and carries the owned Roaring BitsetView boundary.
-set( KNOWHERE_VERSION f69cdef48d40f08bc0f6279c11c83a83b5945ed6 )
+set( KNOWHERE_VERSION 557e896b8000034da258dcb43907b43f0b85ae7e )
 set( GIT_REPOSITORY  "https://github.com/CLiqing/knowhere.git")
 
 message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")

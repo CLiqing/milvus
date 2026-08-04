@@ -119,9 +119,11 @@ class BitmapIndex : public ScalarIndex<T> {
           const T& upper_bound_value,
           bool ub_inclusive) override;
 
-    // Experimental Cardinal BF producer. Returns accepted IDs directly from
-    // a Roaring posting, or null when this index uses dense storage.
-    std::shared_ptr<roaring_bitmap_t>
+    // Experimental Cardinal BF producer. Low-cardinality indexes retain an
+    // index-owned C Roaring copy of each serialized posting while the normal
+    // expression path keeps using bitsets_. Null means unsupported; an empty
+    // bitmap means a supported equality with no matches.
+    std::shared_ptr<const roaring_bitmap_t>
     TryGetRoaringEqual(const T& value) const;
 
     std::optional<T>
@@ -181,6 +183,19 @@ class BitmapIndex : public ScalarIndex<T> {
                 }
                 // std::map red-black tree node overhead (~40 bytes per node)
                 total += num_entries * 40;
+            }
+
+            // The native BF sidecar is a second map plus owned C Roaring
+            // postings. Count it separately from Dense bitsets_ so index
+            // load-memory reporting includes the integration trade-off.
+            for (const auto& [key, posting] : native_roaring_postings_) {
+                if constexpr (std::is_same_v<T, std::string>) {
+                    total += key.capacity();
+                } else {
+                    total += sizeof(T);
+                }
+                total += sizeof(posting) + 40;
+                total += roaring_bitmap_size_in_bytes(posting.get());
             }
         }
 
@@ -396,6 +411,12 @@ class BitmapIndex : public ScalarIndex<T> {
     TargetBitmap
     ConvertRoaringToBitset(const roaring::Roaring& values);
 
+    std::shared_ptr<const roaring_bitmap_t>
+    CopyRoaringPosting(const roaring::Roaring& values) const;
+
+    size_t
+    NativeRoaringSidecarByteSize() const;
+
     TargetBitmap
     RangeForRoaring(const T& value, OpType op);
 
@@ -450,6 +471,10 @@ class BitmapIndex : public ScalarIndex<T> {
     BitmapIndexBuildMode build_mode_;
     std::map<T, roaring::Roaring> data_;
     std::map<T, TargetBitmap> bitsets_;
+    // Present only for BITSET mode. This avoids rebuilding a Roaring payload
+    // by scanning the Dense TargetBitmap on every native BF request.
+    std::map<T, std::shared_ptr<const roaring_bitmap_t>>
+        native_roaring_postings_;
     bool is_mmap_{false};
     bool is_nested_index_{false};
     char* mmap_data_;

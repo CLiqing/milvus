@@ -26,6 +26,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/FieldData.h"
@@ -122,6 +123,24 @@ class ScalarIndexSort : public ScalarIndex<T> {
           const T& upper_bound_value,
           bool ub_inclusive) override;
 
+    std::shared_ptr<const roaring_bitmap_t>
+    TryGetRoaringRange(const T& value, OpType op) const override;
+
+    std::shared_ptr<const roaring_bitmap_t>
+    TryGetRoaringRange(const T& lower_bound_value,
+                       bool lb_inclusive,
+                       const T& upper_bound_value,
+                       bool ub_inclusive) const override;
+
+    std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdRange(const T& value, OpType op) const override;
+
+    std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdRange(const T& lower_bound_value,
+                       bool lb_inclusive,
+                       const T& upper_bound_value,
+                       bool ub_inclusive) const override;
+
     std::optional<T>
     Reverse_Lookup(size_t offset) const override;
 
@@ -177,7 +196,24 @@ class ScalarIndexSort : public ScalarIndex<T> {
     BuildWithArrayDataNested(const std::vector<FieldDataPtr>& datas);
 
     bool
-    ShouldSkip(const T lower_value, const T upper_value, const OpType op);
+    ShouldSkip(const T lower_value, const T upper_value, const OpType op) const;
+
+    std::pair<const IndexStructure<T>*, const IndexStructure<T>*>
+    FindRangeBounds(const T& value, OpType op) const;
+
+    std::pair<const IndexStructure<T>*, const IndexStructure<T>*>
+    FindRangeBounds(const T& lower_bound_value,
+                    bool lb_inclusive,
+                    const T& upper_bound_value,
+                    bool ub_inclusive) const;
+
+    std::shared_ptr<const roaring_bitmap_t>
+    BuildRoaringFromBounds(const IndexStructure<T>* lb,
+                           const IndexStructure<T>* ub) const;
+
+    std::shared_ptr<const std::vector<int32_t>>
+    BuildValidIdsFromBounds(const IndexStructure<T>* lb,
+                            const IndexStructure<T>* ub) const;
 
  public:
     const IndexStructure<T>*

@@ -298,6 +298,12 @@ class PhyBinaryRangeFilterExpr : public SegmentExpr {
     void
     DetermineExecPath() override;
 
+    std::shared_ptr<const roaring_bitmap_t>
+    TryGetNativeRoaringValidIds() override;
+
+    std::shared_ptr<const std::vector<int32_t>>
+    TryGetNativeValidIds() override;
+
     std::string
     ToString() const override {
         return fmt::format("{}", expr_->ToString());

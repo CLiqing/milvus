@@ -15,6 +15,8 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <limits>
+
 #include "common/FastMem.h"
 #include <boost/algorithm/string.hpp>
 #include <folly/ScopeGuard.h>
@@ -116,6 +118,8 @@ BitmapIndex<T>::Build(size_t n, const T* data, const bool* valid_data) {
     if (data_.size() < DEFAULT_BITMAP_INDEX_BUILD_MODE_BOUND) {
         for (auto it = data_.begin(); it != data_.end(); ++it) {
             bitsets_[it->first] = ConvertRoaringToBitset(it->second);
+            native_roaring_postings_[it->first] =
+                CopyRoaringPosting(it->second);
         }
         build_mode_ = BitmapIndexBuildMode::BITSET;
     } else {
@@ -405,10 +409,47 @@ BitmapIndex<T>::ConvertRoaringToBitset(const roaring::Roaring& values) {
 }
 
 template <typename T>
-std::shared_ptr<roaring_bitmap_t>
+std::shared_ptr<const roaring_bitmap_t>
+BitmapIndex<T>::CopyRoaringPosting(const roaring::Roaring& values) const {
+    // Bitmap postings may originate from a frozen/view representation. Build
+    // an ordinary owned Roaring at index load time rather than propagating a
+    // frozen view (even through the C++ copy constructor); downstream gets
+    // only an aliasing C pointer while this wrapper owns its storage.
+    auto owner = std::make_shared<roaring::Roaring>();
+    for (const auto id : values) {
+        owner->add(id);
+    }
+    return std::shared_ptr<const roaring_bitmap_t>(owner, &owner->roaring);
+}
+
+template <typename T>
+size_t
+BitmapIndex<T>::NativeRoaringSidecarByteSize() const {
+    size_t total = 0;
+    for (const auto& entry : native_roaring_postings_) {
+        total += roaring_bitmap_size_in_bytes(entry.second.get());
+    }
+    return total;
+}
+
+template <typename T>
+std::shared_ptr<const roaring_bitmap_t>
 BitmapIndex<T>::TryGetRoaringEqual(const T& value) const {
-    if (!is_built_ || build_mode_ != BitmapIndexBuildMode::ROARING) {
+    constexpr size_t kMaxRoaringUniverse =
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max()) + 1;
+    if (!is_built_ || total_num_rows_ > kMaxRoaringUniverse) {
         return nullptr;
+    }
+
+    if (build_mode_ == BitmapIndexBuildMode::BITSET) {
+        const auto it = native_roaring_postings_.find(value);
+        if (it != native_roaring_postings_.end()) {
+            return it->second;
+        }
+
+        // Preserve tri-state semantics: null is unsupported, while an empty
+        // posting is a valid equality result that simply has no matches.
+        return CopyRoaringPosting(roaring::Roaring{});
     }
 
     const auto& postings = is_mmap_ ? bitmap_info_map_ : data_;
@@ -417,13 +458,7 @@ BitmapIndex<T>::TryGetRoaringEqual(const T& value) const {
         return nullptr;
     }
 
-    auto* result = roaring_bitmap_create();
-    AssertInfo(result != nullptr, "failed to allocate Roaring posting copy");
-    for (const auto id : it->second) {
-        roaring_bitmap_add(result, static_cast<uint32_t>(id));
-    }
-    return std::shared_ptr<roaring_bitmap_t>(
-        result, [](roaring_bitmap_t* p) { roaring_bitmap_free(p); });
+    return CopyRoaringPosting(it->second);
 }
 
 template <typename T>
@@ -482,6 +517,7 @@ BitmapIndex<T>::DeserializeIndexData(const uint8_t* data_ptr,
 
         if (build_mode_ == BitmapIndexBuildMode::BITSET) {
             bitsets_[key] = ConvertRoaringToBitset(value);
+            native_roaring_postings_[key] = CopyRoaringPosting(value);
         } else {
             data_[key] = value;
         }
@@ -549,6 +585,7 @@ BitmapIndex<std::string>::DeserializeIndexData(
 
         if (build_mode_ == BitmapIndexBuildMode::BITSET) {
             bitsets_[key] = ConvertRoaringToBitset(value);
+            native_roaring_postings_[key] = CopyRoaringPosting(value);
         } else {
             data_[key] = value;
         }
@@ -707,12 +744,15 @@ BitmapIndex<T>::LoadWithoutAssemble(const BinarySet& binary_set,
     auto file_index_meta = this->file_manager_->GetIndexMeta();
     LOG_INFO(
         "load bitmap index with cardinality = {}, num_rows = {} for segment_id "
-        "= {}, field_id = {}, mmap = {}",
+        "= {}, field_id = {}, mmap = {}, native_roaring_sidecar_entries = {}, "
+        "native_roaring_sidecar_bytes = {}",
         Cardinality(),
         total_num_rows_,
         file_index_meta.segment_id,
         file_index_meta.field_id,
-        is_mmap_);
+        is_mmap_,
+        native_roaring_postings_.size(),
+        NativeRoaringSidecarByteSize());
 
     is_built_ = true;
     ComputeByteSize();

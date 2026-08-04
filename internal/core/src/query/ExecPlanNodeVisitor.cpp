@@ -69,7 +69,16 @@ ExecPlanNodeVisitor::ExecuteTask(
                     std::dynamic_pointer_cast<ColumnVector>(ret->child(0));
                 AssertInfo(first_column,
                            "first column must be a column vector");
-                if (first_column->IsBitmap()) {
+                // The native Roaring valid-ID path uses a one-row sentinel to
+                // satisfy the Driver's non-empty output contract. Its actual
+                // predicate result is owned by QueryContext and consumed by
+                // VectorSearchNode, so it is intentionally not an
+                // active_count-sized bitmap here.
+                const auto native_roaring =
+                    query_context->get_search_info().search_params_.value(
+                        "bf_filter_scan_mode", std::string{"auto"}) ==
+                    "roaring_valid_per_query";
+                if (first_column->IsBitmap() && !native_roaring) {
                     if (query_context->bitset_is_element_level()) {
                         Assert(processed_num ==
                                query_context->get_active_element_count());

@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -46,6 +47,7 @@
 #include "knowhere/binaryset.h"
 #include "log/Log.h"
 #include "nlohmann/json.hpp"
+#include "roaring/roaring.hh"
 #include "pb/common.pb.h"
 #include "pb/schema.pb.h"
 #include "storage/DiskFileManagerImpl.h"
@@ -526,29 +528,7 @@ template <typename T>
 const TargetBitmap
 ScalarIndexSort<T>::Range(const T& value, const OpType op) {
     AssertInfo(is_built_, "index has not been built");
-    auto lb = begin();
-    auto ub = end();
-    if (ShouldSkip(value, value, op)) {
-        TargetBitmap bitset(Count());
-        return bitset;
-    }
-    switch (op) {
-        case OpType::LessThan:
-            ub = std::lower_bound(begin(), end(), IndexStructure<T>(value));
-            break;
-        case OpType::LessEqual:
-            ub = std::upper_bound(begin(), end(), IndexStructure<T>(value));
-            break;
-        case OpType::GreaterThan:
-            lb = std::upper_bound(begin(), end(), IndexStructure<T>(value));
-            break;
-        case OpType::GreaterEqual:
-            lb = std::lower_bound(begin(), end(), IndexStructure<T>(value));
-            break;
-        default:
-            ThrowInfo(OpTypeInvalid,
-                      fmt::format("Invalid OperatorType: {}", op));
-    }
+    auto [lb, ub] = FindRangeBounds(value, op);
 
     size_t hit_count = ub - lb;
     size_t total_count = Count();
@@ -582,32 +562,8 @@ ScalarIndexSort<T>::Range(const T& lower_bound_value,
                           const T& upper_bound_value,
                           bool ub_inclusive) {
     AssertInfo(is_built_, "index has not been built");
-    if (lower_bound_value > upper_bound_value ||
-        (lower_bound_value == upper_bound_value &&
-         !(lb_inclusive && ub_inclusive))) {
-        TargetBitmap bitset(Count());
-        return bitset;
-    }
-    if (ShouldSkip(lower_bound_value, upper_bound_value, OpType::Range)) {
-        TargetBitmap bitset(Count());
-        return bitset;
-    }
-    auto lb = begin();
-    auto ub = end();
-    if (lb_inclusive) {
-        lb = std::lower_bound(
-            begin(), end(), IndexStructure<T>(lower_bound_value));
-    } else {
-        lb = std::upper_bound(
-            begin(), end(), IndexStructure<T>(lower_bound_value));
-    }
-    if (ub_inclusive) {
-        ub = std::upper_bound(
-            begin(), end(), IndexStructure<T>(upper_bound_value));
-    } else {
-        ub = std::lower_bound(
-            begin(), end(), IndexStructure<T>(upper_bound_value));
-    }
+    auto [lb, ub] = FindRangeBounds(
+        lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
 
     size_t hit_count = ub - lb;
     size_t total_count = Count();
@@ -635,6 +591,182 @@ ScalarIndexSort<T>::Range(const T& lower_bound_value,
 }
 
 template <typename T>
+std::pair<const IndexStructure<T>*, const IndexStructure<T>*>
+ScalarIndexSort<T>::FindRangeBounds(const T& value, const OpType op) const {
+    if (ShouldSkip(value, value, op)) {
+        return {begin(), begin()};
+    }
+
+    auto lb = begin();
+    auto ub = end();
+    switch (op) {
+        case OpType::LessThan:
+            ub = std::lower_bound(begin(), end(), IndexStructure<T>(value));
+            break;
+        case OpType::LessEqual:
+            ub = std::upper_bound(begin(), end(), IndexStructure<T>(value));
+            break;
+        case OpType::GreaterThan:
+            lb = std::upper_bound(begin(), end(), IndexStructure<T>(value));
+            break;
+        case OpType::GreaterEqual:
+            lb = std::lower_bound(begin(), end(), IndexStructure<T>(value));
+            break;
+        default:
+            ThrowInfo(OpTypeInvalid,
+                      fmt::format("Invalid OperatorType: {}", op));
+    }
+    return {lb, ub};
+}
+
+template <typename T>
+std::pair<const IndexStructure<T>*, const IndexStructure<T>*>
+ScalarIndexSort<T>::FindRangeBounds(const T& lower_bound_value,
+                                    bool lb_inclusive,
+                                    const T& upper_bound_value,
+                                    bool ub_inclusive) const {
+    if (lower_bound_value > upper_bound_value ||
+        (lower_bound_value == upper_bound_value &&
+         !(lb_inclusive && ub_inclusive)) ||
+        ShouldSkip(lower_bound_value, upper_bound_value, OpType::Range)) {
+        return {begin(), begin()};
+    }
+
+    const auto lb =
+        lb_inclusive
+            ? std::lower_bound(
+                  begin(), end(), IndexStructure<T>(lower_bound_value))
+            : std::upper_bound(
+                  begin(), end(), IndexStructure<T>(lower_bound_value));
+    const auto ub =
+        ub_inclusive
+            ? std::upper_bound(
+                  begin(), end(), IndexStructure<T>(upper_bound_value))
+            : std::lower_bound(
+                  begin(), end(), IndexStructure<T>(upper_bound_value));
+    return {lb, ub};
+}
+
+template <typename T>
+std::shared_ptr<const roaring_bitmap_t>
+ScalarIndexSort<T>::BuildRoaringFromBounds(const IndexStructure<T>* lb,
+                                           const IndexStructure<T>* ub) const {
+    // Cardinal's brute-force consumer represents IDs as int32_t even though
+    // CRoaring supports the full uint32_t universe.
+    constexpr uint64_t kMaxCardinalRoaringUniverse =
+        static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+    if (!is_built_ || is_nested_index_ ||
+        static_cast<uint64_t>(total_num_rows_) > kMaxCardinalRoaringUniverse) {
+        return nullptr;
+    }
+
+    // The scalar index is ordered by value, whereas posting IDs are row
+    // offsets and therefore normally random in this span.  CRoaring's bulk
+    // insertion benefits when both the high-16-bit container key and the
+    // low-16-bit values are ordered.  For normal and large hit sets, a
+    // radix sort supplies that ordering in O(V) time.  The 64K-entry histogram
+    // has a fixed cost: very small hit sets use std::sort, and small/medium
+    // sets use four 8-bit radix passes before large sets switch to two 16-bit
+    // passes.
+    auto owner = std::make_shared<roaring::Roaring>();
+    std::vector<uint32_t> ids;
+    ids.reserve(static_cast<size_t>(ub - lb));
+    for (auto it = lb; it != ub; ++it) {
+        if (it->idx_ < 0 || it->idx_ >= total_num_rows_) {
+            return nullptr;
+        }
+        ids.push_back(static_cast<uint32_t>(it->idx_));
+    }
+    constexpr size_t kSmallHitCount = 4096;
+    if (ids.size() <= kSmallHitCount) {
+        std::sort(ids.begin(), ids.end());
+    } else if (!ids.empty()) {
+        const uint32_t radix_bits = ids.size() < (1U << 16) ? 8U : 16U;
+        const uint32_t radix = 1U << radix_bits;
+        std::vector<uint32_t> scratch(ids.size());
+        std::vector<uint32_t> counts(radix);
+        for (uint32_t shift = 0; shift < 32; shift += radix_bits) {
+            std::fill(counts.begin(), counts.end(), 0);
+            for (const auto id : ids) {
+                ++counts[(id >> shift) & (radix - 1)];
+            }
+            for (uint32_t key = 1; key < radix; ++key) {
+                counts[key] += counts[key - 1];
+            }
+            for (auto it = ids.rbegin(); it != ids.rend(); ++it) {
+                scratch[--counts[(*it >> shift) & (radix - 1)]] = *it;
+            }
+            ids.swap(scratch);
+        }
+    }
+    if (!ids.empty()) {
+        owner->addMany(ids.size(), ids.data());
+    }
+    return std::shared_ptr<const roaring_bitmap_t>(owner, &owner->roaring);
+}
+
+template <typename T>
+std::shared_ptr<const roaring_bitmap_t>
+ScalarIndexSort<T>::TryGetRoaringRange(const T& value, const OpType op) const {
+    AssertInfo(is_built_, "index has not been built");
+    const auto [lb, ub] = FindRangeBounds(value, op);
+    return BuildRoaringFromBounds(lb, ub);
+}
+
+template <typename T>
+std::shared_ptr<const roaring_bitmap_t>
+ScalarIndexSort<T>::TryGetRoaringRange(const T& lower_bound_value,
+                                       bool lb_inclusive,
+                                       const T& upper_bound_value,
+                                       bool ub_inclusive) const {
+    AssertInfo(is_built_, "index has not been built");
+    const auto [lb, ub] = FindRangeBounds(
+        lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
+    return BuildRoaringFromBounds(lb, ub);
+}
+
+template <typename T>
+std::shared_ptr<const std::vector<int32_t>>
+ScalarIndexSort<T>::BuildValidIdsFromBounds(const IndexStructure<T>* lb,
+                                            const IndexStructure<T>* ub) const {
+    constexpr uint64_t kMaxCardinalId =
+        static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+    if (!is_built_ || is_nested_index_ ||
+        static_cast<uint64_t>(total_num_rows_) > kMaxCardinalId) {
+        return nullptr;
+    }
+    auto ids = std::make_shared<std::vector<int32_t>>();
+    ids->reserve(static_cast<size_t>(ub - lb));
+    for (auto it = lb; it != ub; ++it) {
+        if (it->idx_ < 0 || it->idx_ >= total_num_rows_) {
+            return nullptr;
+        }
+        ids->push_back(static_cast<int32_t>(it->idx_));
+    }
+    return ids;
+}
+
+template <typename T>
+std::shared_ptr<const std::vector<int32_t>>
+ScalarIndexSort<T>::TryGetValidIdRange(const T& value, const OpType op) const {
+    AssertInfo(is_built_, "index has not been built");
+    const auto [lb, ub] = FindRangeBounds(value, op);
+    return BuildValidIdsFromBounds(lb, ub);
+}
+
+template <typename T>
+std::shared_ptr<const std::vector<int32_t>>
+ScalarIndexSort<T>::TryGetValidIdRange(const T& lower_bound_value,
+                                       bool lb_inclusive,
+                                       const T& upper_bound_value,
+                                       bool ub_inclusive) const {
+    AssertInfo(is_built_, "index has not been built");
+    const auto [lb, ub] = FindRangeBounds(
+        lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
+    return BuildValidIdsFromBounds(lb, ub);
+}
+
+template <typename T>
 std::optional<T>
 ScalarIndexSort<T>::Reverse_Lookup(size_t idx) const {
     AssertInfo(idx < idx_to_offsets_size_, "out of range of total count");
@@ -651,7 +783,7 @@ template <typename T>
 bool
 ScalarIndexSort<T>::ShouldSkip(const T lower_value,
                                const T upper_value,
-                               const milvus::OpType op) {
+                               const milvus::OpType op) const {
     if (!Empty()) {
         auto lower_bound = begin();
         auto upper_bound = rbegin();

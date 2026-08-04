@@ -153,8 +153,13 @@ class Expr : public std::enable_shared_from_this<Expr> {
 
     // Opt-in Cardinal BF experiment.  The default preserves the normal dense
     // expression path for every unsupported expression.
-    virtual std::shared_ptr<roaring_bitmap_t>
+    virtual std::shared_ptr<const roaring_bitmap_t>
     TryGetNativeRoaringValidIds() {
+        return nullptr;
+    }
+
+    virtual std::shared_ptr<const std::vector<int32_t>>
+    TryGetNativeValidIds() {
         return nullptr;
     }
 

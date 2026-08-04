@@ -605,6 +605,29 @@ TYPED_TEST_P(BitmapIndexTest, PatternMatchFuncTest) {
     this->TestPatternMatchFunc();
 }
 
+TYPED_TEST_P(BitmapIndexTest, NativeRoaringLowCardinalitySidecarTest) {
+    auto* index_ptr =
+        dynamic_cast<index::BitmapIndex<TypeParam>*>(this->index_.get());
+    ASSERT_NE(index_ptr, nullptr);
+
+    const auto value = this->data_[0];
+    const auto native = index_ptr->TryGetRoaringEqual(value);
+    const auto native_again = index_ptr->TryGetRoaringEqual(value);
+    ASSERT_NE(native, nullptr);
+    ASSERT_NE(native_again, nullptr);
+
+    // The low-cardinality load path must return the owned posting rather than
+    // build a fresh Roaring object from the Dense TargetBitmap per query.
+    EXPECT_EQ(native.get(), native_again.get());
+
+    const auto dense = index_ptr->In(1, &value);
+    for (size_t id = 0; id < dense.size(); ++id) {
+        EXPECT_EQ(
+            roaring_bitmap_contains(native.get(), static_cast<uint32_t>(id)),
+            dense[id]);
+    }
+}
+
 using BitmapType =
     testing::Types<int8_t, int16_t, int32_t, int64_t, std::string>;
 
@@ -615,7 +638,8 @@ REGISTER_TYPED_TEST_SUITE_P(BitmapIndexTest,
                             CompareValFuncTest,
                             IsNullFuncTest,
                             IsNotNullFuncTest,
-                            PatternMatchFuncTest);
+                            PatternMatchFuncTest,
+                            NativeRoaringLowCardinalitySidecarTest);
 
 INSTANTIATE_TYPED_TEST_SUITE_P(BitmapE2ECheck, BitmapIndexTest, BitmapType);
 

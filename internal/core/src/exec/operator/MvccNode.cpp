@@ -76,6 +76,68 @@ PhyMvccNode::GetOutput() {
     tracer::AddEvent(fmt::format("input_rows: {}", active_count_));
     WaitPrefetch();
 
+    // A native valid-ID list is the scalar predicate candidate set, not an
+    // assertion that every candidate is visible at this snapshot. Compact it
+    // against the same timestamp/delete/TTL mask used by the Dense path.
+    if (auto native_ids = query_context->get_native_valid_ids();
+        native_ids != nullptr) {
+        AssertInfo(!is_source_node_ &&
+                       segment_->type() == SegmentType::Sealed,
+                   "native valid IDs require a sealed FilterBits input");
+        if (native_ids->empty()) {
+            is_finished_ = true;
+            return input_;
+        }
+
+        const bool all_rows_visible =
+            collection_ttl_timestamp_ == 0 &&
+            query_timestamp_ >= segment_->get_max_timestamp() &&
+            segment_->get_deleted_count() == 0;
+        if (!all_rows_visible) {
+            TargetBitmap invalid(active_count_);
+            TargetBitmapView invalid_view(invalid.data(), invalid.size());
+            segment_->mask_with_timestamps(
+                invalid_view, query_timestamp_, collection_ttl_timestamp_);
+            segment_->mask_with_delete(
+                invalid_view, active_count_, query_timestamp_);
+
+            if (!invalid_view.none()) {
+                auto surviving_ids =
+                    std::make_shared<std::vector<int32_t>>();
+                surviving_ids->reserve(native_ids->size());
+                for (const auto id : *native_ids) {
+                    AssertInfo(id >= 0 && id < active_count_,
+                               "native valid ID {} is outside active row "
+                               "range {}",
+                               id,
+                               active_count_);
+                    if (!invalid_view[id]) {
+                        surviving_ids->push_back(id);
+                    }
+                }
+                query_context->set_native_valid_ids(
+                    std::shared_ptr<const std::vector<int32_t>>(
+                        std::move(surviving_ids)));
+            }
+        }
+        is_finished_ = true;
+        return input_;
+    }
+
+    // The native Roaring path is admitted only for an immutable visibility
+    // regime, so it can bypass construction of an N-bit MVCC bitmap.
+    if (query_context->get_native_roaring_valid_ids() != nullptr) {
+        AssertInfo(!is_source_node_ &&
+                       segment_->type() == SegmentType::Sealed &&
+                       collection_ttl_timestamp_ == 0 &&
+                       query_timestamp_ >= segment_->get_max_timestamp() &&
+                       segment_->get_deleted_count() == 0,
+                   "native Roaring valid IDs require sealed/latest/no-delete "
+                   "MVCC state");
+        is_finished_ = true;
+        return input_;
+    }
+
     // ── Sealed-segment fast path (skip timestamp mask) ──
     // On a sealed segment without TTL, when query_ts covers all inserts,
     // mask_with_timestamps is redundant (all rows pass).  Only apply the
@@ -89,7 +151,6 @@ PhyMvccNode::GetOutput() {
             TargetBitmap(active_count_), TargetBitmap(active_count_));
         TargetBitmapView data(col_input->GetRawData(), col_input->size());
         segment_->mask_with_delete(data, active_count_, query_timestamp_);
-        query_context->remove_native_roaring_valid_ids(data);
 
         if (data.none()) {
             query_context->set_all_rows_visible(true);
@@ -111,7 +172,6 @@ PhyMvccNode::GetOutput() {
     segment_->mask_with_timestamps(
         data, query_timestamp_, collection_ttl_timestamp_);
     segment_->mask_with_delete(data, active_count_, query_timestamp_);
-    query_context->remove_native_roaring_valid_ids(data);
     is_finished_ = true;
 
     // input_ have already been updated

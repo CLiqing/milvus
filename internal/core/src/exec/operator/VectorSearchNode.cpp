@@ -128,6 +128,12 @@ PhyVectorSearchNode::GetOutput() {
     // Normal path: build BitsetView from the bitmap produced upstream.
     milvus::BitsetView search_view;
     int64_t data_cnt = active_count_;
+    const auto bf_filter_scan_mode = search_info_.search_params_.value(
+        "bf_filter_scan_mode", std::string{"auto"});
+    const bool roaring_valid_per_query =
+        bf_filter_scan_mode == "roaring_valid_per_query";
+    const bool valid_ids_per_query =
+        bf_filter_scan_mode == "valid_ids_per_query";
 
     if (!ph.element_level_ && query_context_->bitset_is_element_level()) {
         ThrowInfo(ExprInvalid,
@@ -136,7 +142,61 @@ PhyVectorSearchNode::GetOutput() {
                   "array filtering");
     }
 
-    if (query_context_->get_all_rows_visible() && !ph.element_level_) {
+    if (roaring_valid_per_query || valid_ids_per_query) {
+        if (ph.element_level_) {
+            ThrowInfo(ConfigInvalid,
+                      "roaring_valid_per_query does not support "
+                      "element-level filtering");
+        }
+        if (num_queries != 1) {
+            ThrowInfo(ConfigInvalid,
+                      "bf_filter_scan_mode={} requires NQ=1, got {}",
+                      bf_filter_scan_mode,
+                      num_queries);
+        }
+        auto native_roaring_ids = roaring_valid_per_query
+                                      ? query_context_->get_native_roaring_valid_ids()
+                                      : nullptr;
+        auto native_ids = valid_ids_per_query
+                              ? query_context_->get_native_valid_ids()
+                              : nullptr;
+        if (native_roaring_ids == nullptr && native_ids == nullptr) {
+            ThrowInfo(ConfigInvalid,
+                      "native valid-ID BF mode requires a matching native "
+                      "scalar-index payload");
+        }
+        const auto valid_count = roaring_valid_per_query
+                                     ? roaring_bitmap_get_cardinality(native_roaring_ids.get())
+                                     : native_ids->size();
+        AssertInfo(valid_count <= static_cast<uint64_t>(active_count_),
+                   "native Roaring posting cardinality {} exceeds active "
+                   "row count {}",
+                   valid_count,
+                   active_count_);
+        search_view = roaring_valid_per_query
+                          ? milvus::BitsetView::FromOwnedRoaringValid(
+                                std::move(native_roaring_ids),
+                                static_cast<size_t>(active_count_),
+                                static_cast<size_t>(active_count_ - valid_count))
+                          : milvus::BitsetView::FromOwnedValidIdList(
+                                std::move(native_ids),
+                                static_cast<size_t>(active_count_),
+                                static_cast<size_t>(active_count_ - valid_count));
+        // Keep the native valid-ID fast path semantically and operationally
+        // equivalent to the dense path below: a dense bitmap with every bit
+        // filtered (`view.all()`) returns before touching the vector index.
+        // Without the same guard, an empty native posting reaches Cardinal
+        // and creates useless BF work for segments that contain no matching
+        // scalar value.
+        if (valid_count == 0) {
+            auto search_result = empty_search_result(num_queries);
+            search_result.total_data_cnt_ = data_cnt;
+            search_result.element_level_ = ph.element_level_;
+            query_context_->set_search_result(std::move(search_result));
+            return input_;
+        }
+        data_cnt = search_view.size();
+    } else if (query_context_->get_all_rows_visible() && !ph.element_level_) {
         // search_view stays default-constructed (empty)
     } else {
         // There are two types of execution: pre-filter and iterative filter
@@ -181,36 +241,10 @@ PhyVectorSearchNode::GetOutput() {
             return input_;
         }
 
-        // This opt-in mode consumes the native scalar BitmapIndex posting.
-        // It deliberately rejects NQ > 1: no request or batch cache is part
-        // of this experiment.
-        const auto bf_filter_scan_mode = search_info_.search_params_.value(
-            "bf_filter_scan_mode", std::string{"auto"});
-        if (bf_filter_scan_mode == "roaring_native_valid") {
-            if (num_queries != 1) {
-                ThrowInfo(ConfigInvalid,
-                          "bf_filter_scan_mode={} requires NQ=1, got {}",
-                          bf_filter_scan_mode,
-                          num_queries);
-            }
-            auto native_ids = query_context_->get_native_roaring_valid_ids();
-            if (native_ids == nullptr) {
-                ThrowInfo(ConfigInvalid,
-                          "roaring_native_valid requires a native Roaring "
-                          "BitmapIndex equality predicate");
-            }
-            const auto valid_count =
-                roaring_bitmap_get_cardinality(native_ids.get());
-            search_view = milvus::BitsetView::FromOwnedRoaringValid(
-                std::shared_ptr<const roaring_bitmap_t>(std::move(native_ids)),
-                static_cast<size_t>(active_count_),
-                static_cast<size_t>(active_count_ - valid_count));
-        } else {
-            // TODO: uniform knowhere BitsetView and milvus BitsetView
-            search_view = milvus::BitsetView(
-                static_cast<const uint8_t*>(col_input->GetRawData()),
-                col_input->size());
-        }
+        // TODO: uniform knowhere BitsetView and milvus BitsetView
+        search_view = milvus::BitsetView(
+            static_cast<const uint8_t*>(col_input->GetRawData()),
+            col_input->size());
         data_cnt = search_view.size();
     }
 

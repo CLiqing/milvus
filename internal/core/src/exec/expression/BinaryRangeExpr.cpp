@@ -50,6 +50,50 @@ namespace milvus {
 
 namespace exec {
 
+std::shared_ptr<const roaring_bitmap_t>
+PhyBinaryRangeFilterExpr::TryGetNativeRoaringValidIds() {
+    if (expr_->column_.element_level_ ||
+        expr_->column_.data_type_ != DataType::INT64) {
+        return nullptr;
+    }
+    EnsureExecPathDetermined();
+    if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
+        pinned_index_.empty()) {
+        return nullptr;
+    }
+    auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
+        pinned_index_[0].get());
+    return scalar_index == nullptr
+               ? nullptr
+               : scalar_index->TryGetRoaringRange(
+                     GetValueFromProto<int64_t>(expr_->lower_val_),
+                     expr_->lower_inclusive_,
+                     GetValueFromProto<int64_t>(expr_->upper_val_),
+                     expr_->upper_inclusive_);
+}
+
+std::shared_ptr<const std::vector<int32_t>>
+PhyBinaryRangeFilterExpr::TryGetNativeValidIds() {
+    if (expr_->column_.element_level_ ||
+        expr_->column_.data_type_ != DataType::INT64) {
+        return nullptr;
+    }
+    EnsureExecPathDetermined();
+    if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
+        pinned_index_.empty()) {
+        return nullptr;
+    }
+    auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
+        pinned_index_[0].get());
+    return scalar_index == nullptr
+               ? nullptr
+               : scalar_index->TryGetValidIdRange(
+                     GetValueFromProto<int64_t>(expr_->lower_val_),
+                     expr_->lower_inclusive_,
+                     GetValueFromProto<int64_t>(expr_->upper_val_),
+                     expr_->upper_inclusive_);
+}
+
 void
 PhyBinaryRangeFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
     WaitPrefetch();

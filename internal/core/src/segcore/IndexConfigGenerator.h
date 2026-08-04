@@ -40,7 +40,11 @@ class VecIndexConfig {
         // Kept when a sealed segment is searched through its temporary index.
         // Cardinal consumes this experiment-only setting; VectorSearchNode uses
         // it to create the matching per-query bitset representation.
-        "bf_filter_scan_mode"};
+        "bf_filter_scan_mode",
+        // Required to force Cardinal's BF route in an isolated A/B.  Keep
+        // the caller-supplied search algorithm when a sealed segment falls
+        // back through this temporary-index config path.
+        "index_algo"};
 
  public:
     VecIndexConfig(const int64_t max_index_row_count,

@@ -19,6 +19,7 @@
 #include <boost/dynamic_bitset.hpp>
 #include <map>
 #include <memory>
+#include <roaring/roaring.h>
 #include <string>
 
 #include "common/Types.h"
@@ -159,6 +160,36 @@ class ScalarIndex : public IndexBase {
           bool lb_inclusive,
           const T& upper_bound_value,
           bool ub_inclusive) = 0;
+
+    // Optional native valid-ID producer for callers that can consume a
+    // Roaring bitmap directly.  nullptr means that this index does not
+    // provide the representation; a non-null empty bitmap is a supported
+    // range with no matches.
+    virtual std::shared_ptr<const roaring_bitmap_t>
+    TryGetRoaringRange(const T& value, OpType op) const {
+        return nullptr;
+    }
+
+    virtual std::shared_ptr<const roaring_bitmap_t>
+    TryGetRoaringRange(const T& lower_bound_value,
+                       bool lb_inclusive,
+                       const T& upper_bound_value,
+                       bool ub_inclusive) const {
+        return nullptr;
+    }
+
+    virtual std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdRange(const T& value, OpType op) const {
+        return nullptr;
+    }
+
+    virtual std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdRange(const T& lower_bound_value,
+                       bool lb_inclusive,
+                       const T& upper_bound_value,
+                       bool ub_inclusive) const {
+        return nullptr;
+    }
 
     virtual std::optional<T>
     Reverse_Lookup(size_t offset) const = 0;

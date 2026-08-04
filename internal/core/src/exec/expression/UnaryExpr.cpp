@@ -364,13 +364,13 @@ PhyUnaryRangeFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
     }
 }
 
-std::shared_ptr<roaring_bitmap_t>
+std::shared_ptr<const roaring_bitmap_t>
 PhyUnaryRangeFilterExpr::TryGetNativeRoaringValidIds() {
-    // Keep the first native path deliberately narrow: one non-element-level
-    // INT64 equality predicate backed by a BitmapIndex in Roaring mode.
+    // Keep the native path to one row-level INT64 predicate. Bitmap equality
+    // reuses its index-owned posting; STLSORT range creates a query-owned
+    // Roaring directly from the matching sort interval.
     if (expr_->column_.element_level_ ||
-        expr_->column_.data_type_ != DataType::INT64 ||
-        expr_->op_type_ != proto::plan::OpType::Equal) {
+        expr_->column_.data_type_ != DataType::INT64) {
         return nullptr;
     }
 
@@ -381,9 +381,58 @@ PhyUnaryRangeFilterExpr::TryGetNativeRoaringValidIds() {
     }
 
     const auto value = GetValueFromProto<int64_t>(expr_->val_);
-    auto* scalar_index = dynamic_cast<const index::BitmapIndex<int64_t>*>(
+    if (expr_->op_type_ == proto::plan::OpType::Equal) {
+        auto* bitmap_index = dynamic_cast<const index::BitmapIndex<int64_t>*>(
+            pinned_index_[0].get());
+        return bitmap_index == nullptr
+                   ? nullptr
+                   : bitmap_index->TryGetRoaringEqual(value);
+    }
+
+    switch (expr_->op_type_) {
+        case proto::plan::OpType::LessThan:
+        case proto::plan::OpType::LessEqual:
+        case proto::plan::OpType::GreaterThan:
+        case proto::plan::OpType::GreaterEqual:
+            break;
+        default:
+            return nullptr;
+    }
+
+    auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
         pinned_index_[0].get());
-    return scalar_index == nullptr ? nullptr : scalar_index->TryGetRoaringEqual(value);
+    return scalar_index == nullptr
+               ? nullptr
+               : scalar_index->TryGetRoaringRange(value, expr_->op_type_);
+}
+
+std::shared_ptr<const std::vector<int32_t>>
+PhyUnaryRangeFilterExpr::TryGetNativeValidIds() {
+    if (expr_->column_.element_level_ ||
+        expr_->column_.data_type_ != DataType::INT64 ||
+        expr_->op_type_ == proto::plan::OpType::Equal) {
+        return nullptr;
+    }
+    EnsureExecPathDetermined();
+    if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
+        pinned_index_.empty()) {
+        return nullptr;
+    }
+    switch (expr_->op_type_) {
+        case proto::plan::OpType::LessThan:
+        case proto::plan::OpType::LessEqual:
+        case proto::plan::OpType::GreaterThan:
+        case proto::plan::OpType::GreaterEqual:
+            break;
+        default:
+            return nullptr;
+    }
+    auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
+        pinned_index_[0].get());
+    return scalar_index == nullptr
+               ? nullptr
+               : scalar_index->TryGetValidIdRange(
+                     GetValueFromProto<int64_t>(expr_->val_), expr_->op_type_);
 }
 
 VectorPtr

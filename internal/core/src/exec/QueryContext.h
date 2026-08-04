@@ -390,26 +390,23 @@ class QueryContext : public Context {
     }
 
     void
-    set_native_roaring_valid_ids(std::shared_ptr<roaring_bitmap_t> ids) {
+    set_native_roaring_valid_ids(std::shared_ptr<const roaring_bitmap_t> ids) {
         native_roaring_valid_ids_ = std::move(ids);
     }
 
-    std::shared_ptr<roaring_bitmap_t>
+    std::shared_ptr<const roaring_bitmap_t>
     get_native_roaring_valid_ids() const {
         return native_roaring_valid_ids_;
     }
 
     void
-    remove_native_roaring_valid_ids(TargetBitmapView filtered) {
-        if (native_roaring_valid_ids_ == nullptr) {
-            return;
-        }
-        for (size_t id = 0; id < filtered.size(); ++id) {
-            if (filtered[id]) {
-                roaring_bitmap_remove(native_roaring_valid_ids_.get(),
-                                      static_cast<uint32_t>(id));
-            }
-        }
+    set_native_valid_ids(std::shared_ptr<const std::vector<int32_t>> ids) {
+        native_valid_ids_ = std::move(ids);
+    }
+
+    std::shared_ptr<const std::vector<int32_t>>
+    get_native_valid_ids() const {
+        return native_valid_ids_;
     }
 
     void
@@ -476,9 +473,11 @@ class QueryContext : public Context {
     // MVCC fast path: set true when sealed + no-filter + no-delete + no-TTL
     bool all_rows_visible_{false};
 
-    // Accepted IDs for the opt-in Cardinal BF experiment. MvccNode removes
-    // deleted rows before VectorSearchNode consumes the payload.
-    std::shared_ptr<roaring_bitmap_t> native_roaring_valid_ids_{nullptr};
+    // Accepted IDs for the opt-in Cardinal BF experiment. The first native
+    // path admits only sealed/latest/no-delete searches, so it borrows an
+    // immutable index-owned posting without a dense MVCC overlay.
+    std::shared_ptr<const roaring_bitmap_t> native_roaring_valid_ids_{nullptr};
+    std::shared_ptr<const std::vector<int32_t>> native_valid_ids_{nullptr};
 
     // Expression filter cache for two-stage search
     bool enable_expr_cache_ = false;

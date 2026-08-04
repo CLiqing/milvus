@@ -1,11 +1,16 @@
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <chrono>
 #include <nlohmann/json.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <numeric>
+#include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "bitset/bitset.h"
@@ -17,6 +22,7 @@
 #include "index/ScalarIndexSort.h"
 #include "milvus-storage/filesystem/fs.h"
 #include "pb/common.pb.h"
+#include "roaring/roaring.hh"
 #include "storage/ChunkManager.h"
 #include "storage/FileManager.h"
 #include "storage/ThreadPools.h"
@@ -111,6 +117,140 @@ TEST(StlSortIndexTest, TestRange) {
 
         test_stlsort_for_range(
             data, DataType::INT64, true, exec_expr, expected_result);
+    }
+}
+
+TEST(StlSortIndexTest, NativeRoaringRangeMatchesDenseRange) {
+    // Values deliberately do not follow row offsets: a range's value-order
+    // interval must still yield row-offset membership equivalent to Range().
+    const std::vector<int64_t> data = {50, 10, 80, 20, 70, 30, 60, 40};
+    const bool valid[] = {true, true, false, true, true, false, true, true};
+    ScalarIndexSort<int64_t> index;
+    index.Build(data.size(), data.data(), valid);
+
+    const auto assert_matches_dense = [&index](
+                                          const TargetBitmap& dense,
+                                          const roaring_bitmap_t* roaring) {
+        ASSERT_NE(roaring, nullptr);
+        ASSERT_EQ(roaring_bitmap_get_cardinality(roaring), dense.count());
+        for (size_t offset = 0; offset < dense.size(); ++offset) {
+            ASSERT_EQ(roaring_bitmap_contains(roaring, offset), dense[offset])
+                << "offset=" << offset;
+        }
+    };
+
+    const auto greater = index.TryGetRoaringRange(30, OpType::GreaterThan);
+    assert_matches_dense(index.Range(30, OpType::GreaterThan), greater.get());
+
+    const auto closed = index.TryGetRoaringRange(20, true, 60, true);
+    assert_matches_dense(index.Range(20, true, 60, true), closed.get());
+
+    const auto native_list = index.TryGetValidIdRange(20, true, 60, true);
+    ASSERT_NE(native_list, nullptr);
+    const auto dense_closed = index.Range(20, true, 60, true);
+    ASSERT_EQ(native_list->size(), dense_closed.count());
+    for (const auto id : *native_list) {
+        ASSERT_GE(id, 0);
+        ASSERT_LT(static_cast<size_t>(id), dense_closed.size());
+        ASSERT_TRUE(dense_closed[id]);
+    }
+
+    // A supported but empty range must not be reported as an unsupported
+    // producer, because the vector path can short-circuit it safely.
+    const auto empty = index.TryGetRoaringRange(80, false, 90, true);
+    ASSERT_NE(empty, nullptr);
+    assert_matches_dense(index.Range(80, false, 90, true), empty.get());
+}
+
+TEST(StlSortIndexBenchmark, DISABLED_ProducerDenseVsRoaringRandom1M) {
+    // Producer-only microbenchmark.  Scalar values are a permutation of row
+    // offsets so the value-ordered range span has random row IDs; this avoids
+    // overestimating Roaring construction from a value=row-id layout.
+    constexpr size_t kRows = 1'000'000;
+    constexpr size_t kWarmups = 5;
+    constexpr size_t kSamples = 20;
+    std::vector<int64_t> values(kRows);
+    std::iota(values.begin(), values.end(), 0);
+    std::mt19937_64 rng(1732);
+    std::shuffle(values.begin(), values.end(), rng);
+
+    ScalarIndexSort<int64_t> index;
+    index.Build(values.size(), values.data());
+
+    for (const double ratio : {0.001, 0.01, 0.10, 0.50}) {
+        const auto upper = static_cast<int64_t>(kRows * ratio);
+        const auto dense = index.Range(upper, OpType::LessThan);
+        const auto roaring = index.TryGetRoaringRange(upper, OpType::LessThan);
+        ASSERT_NE(roaring, nullptr);
+        ASSERT_EQ(dense.count(), roaring_bitmap_get_cardinality(roaring.get()));
+
+        auto run_dense = [&]() {
+            const auto result = index.Range(upper, OpType::LessThan);
+            return result.count();
+        };
+        auto run_roaring = [&]() {
+            const auto result = index.TryGetRoaringRange(upper, OpType::LessThan);
+            return result == nullptr ? size_t{0}
+                                     : roaring_bitmap_get_cardinality(result.get());
+        };
+        auto run_streaming_bulk = [&]() {
+            roaring::Roaring result;
+            roaring::BulkContext context;
+            const auto* data = index.GetData();
+            for (int64_t i = 0; i < upper; ++i) {
+                result.addBulk(context, static_cast<uint32_t>(data[i].idx_));
+            }
+            return result.cardinality();
+        };
+        for (size_t i = 0; i < kWarmups; ++i) {
+            ASSERT_EQ(run_dense(), dense.count());
+            ASSERT_EQ(run_roaring(), dense.count());
+            ASSERT_EQ(run_streaming_bulk(), dense.count());
+        }
+
+        std::vector<double> dense_us;
+        std::vector<double> roaring_us;
+        std::vector<double> streaming_bulk_us;
+        dense_us.reserve(kSamples);
+        roaring_us.reserve(kSamples);
+        streaming_bulk_us.reserve(kSamples);
+        for (size_t sample = 0; sample < kSamples; ++sample) {
+            const auto measure = [](auto&& function) {
+                const auto start = std::chrono::steady_clock::now();
+                const auto cardinality = function();
+                const auto end = std::chrono::steady_clock::now();
+                return std::make_pair(
+                    cardinality,
+                    std::chrono::duration<double, std::micro>(end - start)
+                        .count());
+            };
+            const bool dense_first = sample % 2 == 0;
+            const auto first = dense_first ? measure(run_dense) : measure(run_roaring);
+            const auto second = dense_first ? measure(run_roaring) : measure(run_dense);
+            const auto bulk = measure(run_streaming_bulk);
+            ASSERT_EQ(first.first, dense.count());
+            ASSERT_EQ(second.first, dense.count());
+            ASSERT_EQ(bulk.first, dense.count());
+            dense_us.push_back(dense_first ? first.second : second.second);
+            roaring_us.push_back(dense_first ? second.second : first.second);
+            streaming_bulk_us.push_back(bulk.second);
+        }
+        std::sort(dense_us.begin(), dense_us.end());
+        std::sort(roaring_us.begin(), roaring_us.end());
+        std::sort(streaming_bulk_us.begin(), streaming_bulk_us.end());
+        const auto dense_median = dense_us[dense_us.size() / 2];
+        const auto roaring_median = roaring_us[roaring_us.size() / 2];
+        const auto streaming_bulk_median =
+            streaming_bulk_us[streaming_bulk_us.size() / 2];
+        std::cout << "STLSORT producer N=" << kRows << " ratio=" << ratio
+                  << " dense_median_us=" << dense_median
+                  << " roaring_median_us=" << roaring_median
+                  << " roaring_vs_dense_delta="
+                  << (dense_median - roaring_median) / dense_median
+                  << " streaming_bulk_median_us=" << streaming_bulk_median
+                  << " streaming_bulk_vs_dense_delta="
+                  << (dense_median - streaming_bulk_median) / dense_median
+                  << std::endl;
     }
 }
 
