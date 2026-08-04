@@ -143,6 +143,11 @@ class MvccFastPathTest : public ::testing::Test {
             query::PlanOptions{false},
             std::make_shared<QueryConfig>(
                 std::unordered_map<std::string, std::string>{}));
+        SearchInfo search_info;
+        search_info.search_params_ = knowhere::Json{
+            {"bf_filter_scan_mode", "valid_ids_per_query"},
+        };
+        query_context->set_search_info(search_info);
         query_context->set_native_valid_ids(
             std::make_shared<const std::vector<int32_t>>(std::move(candidate_ids)));
 

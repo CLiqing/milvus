@@ -65,6 +65,14 @@ class BitsetView : public knowhere::BitsetView {
             std::move(bitmap), num_bits, num_filtered_out_bits));
     }
 
+    static BitsetView
+    FromOwnedValidIdList(std::shared_ptr<const std::vector<int32_t>> ids,
+                         size_t num_bits,
+                         size_t num_filtered_out_bits) {
+        return BitsetView(knowhere::BitsetView::FromOwnedValidIdList(
+            std::move(ids), num_bits, num_filtered_out_bits));
+    }
+
  private:
     explicit BitsetView(knowhere::BitsetView bitset)
         : knowhere::BitsetView(std::move(bitset)) {
