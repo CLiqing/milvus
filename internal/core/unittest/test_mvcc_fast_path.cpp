@@ -424,6 +424,58 @@ TEST_F(MvccFastPathTest, VisibilityFilterDisabled_PreservesUpstreamFilter) {
 }
 
 // ---------------------------------------------------------------------------
+// A non-source MvccNode may still prove that the final combined bitmap is
+// empty.  Cardinal downpush uses this shape: FilterBitsNode emits an all-zero
+// placeholder and the scalar predicate is evaluated during Graph search.
+// ---------------------------------------------------------------------------
+TEST_F(MvccFastPathTest, UpstreamAllPassFilter_SetsAllRowsVisible) {
+    auto segment = CreateSealedSegment();
+
+    proto::plan::GenericValue value;
+    value.set_int64_val(N_ + 1);
+    auto expr = std::make_shared<expr::UnaryRangeFilterExpr>(
+        expr::ColumnInfo(int64_fid_, DataType::INT64),
+        proto::plan::OpType::LessThan,
+        value,
+        std::vector<proto::plan::GenericValue>{});
+
+    auto filter_node = std::make_shared<plan::FilterBitsNode>("filter_1", expr);
+    auto mvcc_node = std::make_shared<plan::MvccNode>(
+        "mvcc_1", std::vector<plan::PlanNodePtr>{filter_node});
+    auto plan = plan::PlanFragment(mvcc_node);
+
+    auto query_context = std::make_shared<QueryContext>(
+        "test_upstream_all_pass",
+        segment.get(),
+        N_,
+        MAX_TIMESTAMP,
+        0,
+        0,
+        query::PlanOptions{false},
+        std::make_shared<QueryConfig>(
+            std::unordered_map<std::string, std::string>{}));
+
+    auto task =
+        Task::Create("task_upstream_all_pass", plan, 0, query_context);
+    RowVectorPtr output;
+    for (;;) {
+        auto current = task->Next();
+        if (!current) {
+            break;
+        }
+        output = current;
+    }
+
+    EXPECT_TRUE(query_context->get_all_rows_visible())
+        << "the final combined bitmap is empty and should be skipped";
+    ASSERT_NE(output, nullptr);
+    auto col = std::dynamic_pointer_cast<ColumnVector>(output->child(0));
+    ASSERT_NE(col, nullptr);
+    TargetBitmapView view(col->GetRawData(), col->size());
+    EXPECT_EQ(view.count(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // visibilityFilterEnabled=false on growing segment: still skips all filtering
 // ---------------------------------------------------------------------------
 TEST_F(MvccFastPathTest, VisibilityFilterDisabled_GrowingSegment) {

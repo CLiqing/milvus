@@ -123,6 +123,19 @@ PhyMvccNode::GetOutput() {
     segment_->mask_with_timestamps(
         data, query_timestamp_, collection_ttl_timestamp_);
     segment_->mask_with_delete(data, active_count_, query_timestamp_);
+
+    // The MVCC node is not a source node when a FilterBitsNode is present.
+    // Cardinal downpush deliberately makes that upstream node emit an
+    // all-zero placeholder bitmap, then evaluates the user predicate inside
+    // Graph search.  If timestamp/delete masking also leaves the combined
+    // bitmap empty, every row is visible to the vector index and the bitmap
+    // need not be tested for every visited Graph node.
+    //
+    // This is also valid for an ordinary upstream filter that happens to pass
+    // every row: data reflects the final, combined pre-vector-search mask.
+    if (data.none()) {
+        query_context->set_all_rows_visible(true);
+    }
     is_finished_ = true;
 
     // input_ have already been updated
