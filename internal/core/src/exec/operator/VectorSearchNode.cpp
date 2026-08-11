@@ -16,8 +16,6 @@
 
 #include "VectorSearchNode.h"
 
-#include <roaring/roaring.h>
-
 #include <algorithm>
 #include <chrono>
 #include <functional>
@@ -130,8 +128,6 @@ PhyVectorSearchNode::GetOutput() {
     int64_t data_cnt = active_count_;
     const auto bf_filter_scan_mode = search_info_.search_params_.value(
         "bf_filter_scan_mode", std::string{"auto"});
-    const bool roaring_valid_per_query =
-        bf_filter_scan_mode == "roaring_valid_per_query";
     const bool valid_ids_per_query =
         bf_filter_scan_mode == "valid_ids_per_query";
 
@@ -142,46 +138,39 @@ PhyVectorSearchNode::GetOutput() {
                   "array filtering");
     }
 
-    if (roaring_valid_per_query || valid_ids_per_query) {
+    if (valid_ids_per_query) {
         if (ph.element_level_) {
             ThrowInfo(ConfigInvalid,
-                      "roaring_valid_per_query does not support "
+                      "valid_ids_per_query does not support "
                       "element-level filtering");
         }
-        if (num_queries != 1) {
-            ThrowInfo(ConfigInvalid,
-                      "bf_filter_scan_mode={} requires NQ=1, got {}",
-                      bf_filter_scan_mode,
-                      num_queries);
-        }
-        auto native_roaring_ids = roaring_valid_per_query
-                                      ? query_context_->get_native_roaring_valid_ids()
-                                      : nullptr;
-        auto native_ids = valid_ids_per_query
-                              ? query_context_->get_native_valid_ids()
-                              : nullptr;
-        if (native_roaring_ids == nullptr && native_ids == nullptr) {
+        // QueryNode may group independent NQ=1 RPCs into one task.  A scalar
+        // predicate is part of the merged plan identity, so this immutable
+        // payload has the same semantics as the ordinary Dense filter and can
+        // be applied to every query in the grouped placeholder batch.  The
+        // benchmark still disables grouping when it wants to exclude this
+        // payload reuse from a representation-only measurement.
+        auto payload = query_context_->get_valid_id_payload();
+        if (payload == nullptr) {
             ThrowInfo(ConfigInvalid,
                       "native valid-ID BF mode requires a matching native "
                       "scalar-index payload");
         }
-        const auto valid_count = roaring_valid_per_query
-                                     ? roaring_bitmap_get_cardinality(native_roaring_ids.get())
-                                     : native_ids->size();
+        AssertInfo(payload->universe == active_count_,
+                   "valid-ID payload universe {} does not match active row count {}",
+                   payload->universe,
+                   active_count_);
+        auto native_ids = std::move(payload->ids);
+        const auto valid_count = native_ids->size();
         AssertInfo(valid_count <= static_cast<uint64_t>(active_count_),
-                   "native Roaring posting cardinality {} exceeds active "
+                   "native valid-ID payload cardinality {} exceeds active "
                    "row count {}",
                    valid_count,
                    active_count_);
-        search_view = roaring_valid_per_query
-                          ? milvus::BitsetView::FromOwnedRoaringValid(
-                                std::move(native_roaring_ids),
-                                static_cast<size_t>(active_count_),
-                                static_cast<size_t>(active_count_ - valid_count))
-                          : milvus::BitsetView::FromOwnedValidIdList(
-                                std::move(native_ids),
-                                static_cast<size_t>(active_count_),
-                                static_cast<size_t>(active_count_ - valid_count));
+        search_view = milvus::BitsetView::FromOwnedValidIdList(
+            std::move(native_ids),
+            static_cast<size_t>(active_count_),
+            static_cast<size_t>(active_count_ - valid_count));
         // Keep the native valid-ID fast path semantically and operationally
         // equivalent to the dense path below: a dense bitmap with every bit
         // filtered (`view.all()`) returns before touching the vector index.

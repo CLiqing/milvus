@@ -50,28 +50,6 @@ namespace milvus {
 
 namespace exec {
 
-std::shared_ptr<const roaring_bitmap_t>
-PhyBinaryRangeFilterExpr::TryGetNativeRoaringValidIds() {
-    if (expr_->column_.element_level_ ||
-        expr_->column_.data_type_ != DataType::INT64) {
-        return nullptr;
-    }
-    EnsureExecPathDetermined();
-    if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
-        pinned_index_.empty()) {
-        return nullptr;
-    }
-    auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
-        pinned_index_[0].get());
-    return scalar_index == nullptr
-               ? nullptr
-               : scalar_index->TryGetRoaringRange(
-                     GetValueFromProto<int64_t>(expr_->lower_val_),
-                     expr_->lower_inclusive_,
-                     GetValueFromProto<int64_t>(expr_->upper_val_),
-                     expr_->upper_inclusive_);
-}
-
 std::shared_ptr<const std::vector<int32_t>>
 PhyBinaryRangeFilterExpr::TryGetNativeValidIds() {
     if (expr_->column_.element_level_ ||
@@ -92,6 +70,47 @@ PhyBinaryRangeFilterExpr::TryGetNativeValidIds() {
                      expr_->lower_inclusive_,
                      GetValueFromProto<int64_t>(expr_->upper_val_),
                      expr_->upper_inclusive_);
+}
+
+std::shared_ptr<const std::vector<int32_t>>
+PhyBinaryRangeFilterExpr::TryFilterNativeValidIds(
+    EvalCtx&, const std::shared_ptr<const std::vector<int32_t>>& input) {
+    if (expr_->column_.element_level_ ||
+        expr_->column_.data_type_ != DataType::INT64) {
+        return nullptr;
+    }
+
+    EnsureExecPathDetermined();
+    if (exec_path_ != ExprExecPath::RawData) {
+        return nullptr;
+    }
+
+    const auto lower = GetValueFromProto<int64_t>(expr_->lower_val_);
+    const auto upper = GetValueFromProto<int64_t>(expr_->upper_val_);
+    const bool lower_inclusive = expr_->lower_inclusive_;
+    const bool upper_inclusive = expr_->upper_inclusive_;
+    auto skip_index = segment_->GetSkipIndex();
+    auto match =
+        [lower, upper, lower_inclusive, upper_inclusive](int64_t candidate) {
+            const bool lower_match =
+                lower_inclusive ? candidate >= lower : candidate > lower;
+            const bool upper_match =
+                upper_inclusive ? candidate <= upper : candidate < upper;
+            return lower_match && upper_match;
+        };
+    auto can_skip =
+        [this, &skip_index, lower, upper, lower_inclusive, upper_inclusive](
+            int64_t chunk_id) {
+            return skip_index->CanSkipBinaryRange<int64_t>(op_ctx_,
+                                                           field_id_,
+                                                           chunk_id,
+                                                           lower,
+                                                           upper,
+                                                           lower_inclusive,
+                                                           upper_inclusive);
+        };
+    return FilterSortedNativeIdsByRawData<int64_t>(
+        input, std::move(match), std::move(can_skip));
 }
 
 void

@@ -17,6 +17,7 @@
 #include "ConjunctExpr.h"
 
 #include <algorithm>
+#include <numeric>
 
 #include "LikeConjunctExpr.h"
 #include "UnaryExpr.h"
@@ -78,6 +79,40 @@ PhyConjunctFilterExpr::BuildActiveBitmap(const ColumnVectorPtr& vec) {
     active_rows.inplace_and(valid, size);  // data & valid
     active_rows.flip();                    // ~data | ~valid
     return active_rows;
+}
+
+std::shared_ptr<const std::vector<int32_t>>
+PhyConjunctFilterExpr::TryGetNativeValidIds(EvalCtx& context) {
+    // Keep the prototype deliberately constrained.  OR/NULL three-valued
+    // logic and longer conjunctions need a general sparse-result contract;
+    // returning nullptr here preserves the established Dense behaviour.
+    if (!is_and_ || inputs_.size() != 2 ||
+        context.get_offset_input() != nullptr) {
+        return nullptr;
+    }
+    if (input_order_.empty()) {
+        input_order_.resize(inputs_.size());
+        std::iota(input_order_.begin(), input_order_.end(), 0);
+    }
+    if (input_order_.size() != 2 || input_order_[0] >= inputs_.size() ||
+        input_order_[1] >= inputs_.size()) {
+        return nullptr;
+    }
+
+    // A produces rows that are definitely TRUE.  Its producer already
+    // excludes nullable rows, so B only needs to retain rows that are also
+    // definitely TRUE; this is the AND result for the supported row-level
+    // scalar range subset.
+    auto first_ids = inputs_[input_order_[0]]->TryGetNativeValidIds(context);
+    if (first_ids == nullptr) {
+        return nullptr;
+    }
+    if (first_ids->empty()) {
+        return first_ids;
+    }
+
+    return inputs_[input_order_[1]]->TryFilterNativeValidIds(context,
+                                                             first_ids);
 }
 
 void

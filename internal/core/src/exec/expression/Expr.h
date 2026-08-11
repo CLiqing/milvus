@@ -26,8 +26,6 @@
 #include <string>
 #include <type_traits>
 
-#include <roaring/roaring.h>
-
 #include "common/Array.h"
 #include "common/ArrayOffsets.h"
 #include "common/FieldDataInterface.h"
@@ -151,15 +149,31 @@ class Expr : public std::enable_shared_from_this<Expr> {
         ThrowInfo(ErrorCode::NotImplemented, "not implemented");
     }
 
-    // Opt-in Cardinal BF experiment.  The default preserves the normal dense
-    // expression path for every unsupported expression.
-    virtual std::shared_ptr<const roaring_bitmap_t>
-    TryGetNativeRoaringValidIds() {
+    // Opt-in Cardinal BF producer. The only native runtime payload is a
+    // list of accepted row IDs; unsupported expressions retain the normal
+    // dense evaluation path.
+    virtual std::shared_ptr<const std::vector<int32_t>>
+    TryGetNativeValidIds() {
         return nullptr;
     }
 
+    // A Sparse candidate consumer may need the normal EvalCtx in order to
+    // evaluate a following predicate by offsets.  Leaf producers retain the
+    // existing context-free implementation; compound expressions override
+    // this overload when they can keep accepted row IDs sparse end to end.
     virtual std::shared_ptr<const std::vector<int32_t>>
-    TryGetNativeValidIds() {
+    TryGetNativeValidIds(EvalCtx& /* context */) {
+        return TryGetNativeValidIds();
+    }
+
+    // Consume an ascending, unique Sparse row-ID list and return the subset
+    // accepted by this expression.  Implementations must keep the result
+    // Sparse end to end; returning nullptr asks the caller to retain the
+    // established Dense executor.
+    virtual std::shared_ptr<const std::vector<int32_t>>
+    TryFilterNativeValidIds(
+        EvalCtx& /* context */,
+        const std::shared_ptr<const std::vector<int32_t>>& /* input */) {
         return nullptr;
     }
 
@@ -476,6 +490,73 @@ class SegmentExpr : public Expr {
                    TargetBitmapView valid_res,
                    const int size) {
         ApplyValidMask(valid_data, res, valid_res, size);
+    }
+
+    template <typename T, typename Match, typename CanSkip>
+    std::shared_ptr<const std::vector<int32_t>>
+    FilterSortedNativeIdsByRawData(
+        const std::shared_ptr<const std::vector<int32_t>>& input,
+        Match&& match,
+        CanSkip&& can_skip) {
+        if (input == nullptr || segment_ == nullptr ||
+            segment_->type() != SegmentType::Sealed ||
+            !segment_->HasFieldData(field_id_)) {
+            return nullptr;
+        }
+
+        auto output = std::make_shared<std::vector<int32_t>>();
+        output->reserve(input->size());
+        if (input->empty()) {
+            return output;
+        }
+
+        int32_t previous = -1;
+        for (const auto id : *input) {
+            if (id < 0 || id >= active_count_ || id <= previous) {
+                return nullptr;
+            }
+            previous = id;
+        }
+
+        size_t begin = 0;
+        while (begin < input->size()) {
+            const int64_t first_id = (*input)[begin];
+            int64_t chunk_id = 0;
+            int64_t chunk_begin = 0;
+            int64_t chunk_end = active_count_;
+            if (segment_->is_chunked()) {
+                const auto [located_chunk, offset_in_chunk] =
+                    segment_->get_chunk_by_offset(field_id_, first_id);
+                chunk_id = located_chunk;
+                chunk_begin = first_id - offset_in_chunk;
+                chunk_end = std::min<int64_t>(
+                    active_count_,
+                    chunk_begin + segment_->chunk_size(field_id_, chunk_id));
+            }
+
+            size_t end = begin + 1;
+            while (end < input->size() && (*input)[end] < chunk_end) {
+                ++end;
+            }
+
+            if (!can_skip(chunk_id)) {
+                auto pinned =
+                    segment_->chunk_data<T>(op_ctx_, field_id_, chunk_id);
+                const auto chunk = pinned.get();
+                const T* data = chunk.data();
+                const bool* valid = chunk.valid_data();
+                for (size_t i = begin; i < end; ++i) {
+                    const auto local_offset =
+                        static_cast<int64_t>((*input)[i]) - chunk_begin;
+                    if ((valid == nullptr || valid[local_offset]) &&
+                        match(data[local_offset])) {
+                        output->push_back((*input)[i]);
+                    }
+                }
+            }
+            begin = end;
+        }
+        return output;
     }
 
     // Try to load the full bitset from ExprResCache.

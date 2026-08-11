@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <array>
 #include <limits>
 
 #include "common/FastMem.h"
@@ -423,6 +424,41 @@ BitmapIndex<T>::CopyRoaringPosting(const roaring::Roaring& values) const {
 }
 
 template <typename T>
+std::shared_ptr<const std::vector<int32_t>>
+BitmapIndex<T>::MaterializeValidIds(const roaring_bitmap_t* values) const {
+    constexpr size_t kMaxCardinalRows =
+        static_cast<size_t>(std::numeric_limits<int32_t>::max());
+    if (values == nullptr || total_num_rows_ > kMaxCardinalRows) {
+        return nullptr;
+    }
+
+    auto ids = std::make_shared<std::vector<int32_t>>();
+    ids->reserve(roaring_bitmap_get_cardinality(values));
+
+    // Keep the producer-side conversion bulked.  Cardinal's previous native
+    // Roaring path performed this same decode once per BF query; the unified
+    // ValidIdList path performs it once for the query/segment payload.
+    constexpr uint32_t kExportBatchSize = 256;
+    std::array<uint32_t, kExportBatchSize> batch;
+    roaring_uint32_iterator_t iterator;
+    roaring_iterator_init(values, &iterator);
+    while (iterator.has_value) {
+        const auto count = roaring_uint32_iterator_read(
+            &iterator, batch.data(), static_cast<uint32_t>(batch.size()));
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto id = batch[i];
+            // A malformed posting must select the regular Dense path rather
+            // than leak an out-of-domain ID into Cardinal.
+            if (id >= total_num_rows_) {
+                return nullptr;
+            }
+            ids->push_back(static_cast<int32_t>(id));
+        }
+    }
+    return ids;
+}
+
+template <typename T>
 size_t
 BitmapIndex<T>::NativeRoaringSidecarByteSize() const {
     size_t total = 0;
@@ -455,10 +491,44 @@ BitmapIndex<T>::TryGetRoaringEqual(const T& value) const {
     const auto& postings = is_mmap_ ? bitmap_info_map_ : data_;
     const auto it = postings.find(value);
     if (it == postings.end()) {
-        return nullptr;
+        // Missing equality is a supported empty result in every Bitmap build
+        // mode.  Do not make the native route depend on cardinality/mmap.
+        return CopyRoaringPosting(roaring::Roaring{});
     }
 
     return CopyRoaringPosting(it->second);
+}
+
+template <typename T>
+std::shared_ptr<const std::vector<int32_t>>
+BitmapIndex<T>::TryGetValidIdEqual(const T& value) const {
+    constexpr size_t kMaxCardinalRows =
+        static_cast<size_t>(std::numeric_limits<int32_t>::max());
+    if (!is_built_ || total_num_rows_ > kMaxCardinalRows) {
+        return nullptr;
+    }
+
+    if (build_mode_ == BitmapIndexBuildMode::BITSET) {
+        const auto posting = native_roaring_postings_.find(value);
+        if (posting != native_roaring_postings_.end()) {
+            return MaterializeValidIds(posting->second.get());
+        }
+        // No value is a supported empty equality.  A value with no sidecar is
+        // an unsupported native producer so it falls back to Dense instead of
+        // silently returning an incorrect empty result.
+        return bitsets_.find(value) == bitsets_.end()
+                   ? std::make_shared<std::vector<int32_t>>()
+                   : nullptr;
+    }
+
+    const auto& postings = is_mmap_ ? bitmap_info_map_ : data_;
+    const auto posting = postings.find(value);
+    if (posting == postings.end()) {
+        return std::make_shared<std::vector<int32_t>>();
+    }
+    // Unlike TryGetRoaringEqual(), do not first copy a high-cardinality/mmap
+    // Roaring posting merely to decode it into the final list.
+    return MaterializeValidIds(&posting->second.roaring);
 }
 
 template <typename T>

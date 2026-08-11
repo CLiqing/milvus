@@ -144,16 +144,26 @@ PhyFilterBitsNode::GetOutput() {
     }
 
     const auto search_info = query_context_->get_search_info();
-    const auto scan_mode = search_info.search_params_.value(
-        "bf_filter_scan_mode", std::string{"auto"});
+    // Retrieve plans have no vector-search params.  They still pass through
+    // FilterBitsNode for ordinary scalar predicates, so treat a null params
+    // value exactly as the default vector-search mode.
+    const auto scan_mode = search_info.search_params_.is_object()
+                               ? search_info.search_params_.value(
+                                     "bf_filter_scan_mode",
+                                     std::string{"auto"})
+                               : std::string{"auto"};
+    if (scan_mode == "roaring_valid_per_query") {
+        ThrowInfo(ConfigInvalid,
+                  "roaring_valid_per_query has been retired; use "
+                  "valid_ids_per_query");
+    }
 
     // Cache read: Stage 2 of two-stage search reuses the bitset cached by Stage 1.
     // Cache lives in the process-level ExprResCacheManager keyed by
     // (segment_id, FilterBitsNode signature + dynamic filter context), so
     // cross-query reuse is automatic only when the effective predicate matches.
     auto* cache_segment = query_context_->get_segment();
-    const bool can_use_cache = scan_mode != "roaring_valid_per_query" &&
-                               scan_mode != "valid_ids_per_query" &&
+    const bool can_use_cache = scan_mode != "valid_ids_per_query" &&
                                enable_expr_cache_ && !expr_cache_key_.empty() &&
                                cache_segment != nullptr &&
                                cache_segment->type() == SegmentType::Sealed &&
@@ -176,47 +186,41 @@ PhyFilterBitsNode::GetOutput() {
         }
     }
 
-    // Native accepted-ID path for the Cardinal BF experiment.  The list
-    // producer is limited to one sealed scalar-index expression; MvccNode
-    // subsequently applies timestamp/delete visibility.  Every other
+    // Native accepted-ID path for Cardinal.  BitmapIndex may retain a
+    // Roaring posting internally, but the only payload crossing this boundary
+    // is a valid-ID list.  A supported AND conjunction may additionally
+    // retain that list across its second scalar predicate.  MvccNode
+    // subsequently applies timestamp/delete visibility; every unsupported
     // expression keeps the dense path below.
     const bool native_list_mode = scan_mode == "valid_ids_per_query";
-    const bool native_roaring_mode = scan_mode == "roaring_valid_per_query";
-    // A list is only the scalar candidate set.  MvccNode can compact it with
-    // the ordinary timestamp/delete invalid mask, so unlike the original
-    // Roaring POC it does not require latest/no-delete/TTL=0.  Keep Roaring
-    // on its existing immutable-snapshot gate until it gets the same overlay.
     const bool native_list_eligible = native_list_mode &&
                                       exprs_->size() == 1 &&
                                       cache_segment != nullptr &&
                                       cache_segment->type() == SegmentType::Sealed;
-    const bool native_roaring_eligible = native_roaring_mode &&
-                                         exprs_->size() == 1 &&
-                                         cache_segment != nullptr &&
-                                         cache_segment->type() == SegmentType::Sealed &&
-                                         query_context_->get_collection_ttl() == 0 &&
-                                         query_context_->get_query_timestamp() >=
-                                             cache_segment->get_max_timestamp() &&
-                                         cache_segment->get_deleted_count() == 0;
-    if (native_list_eligible || native_roaring_eligible) {
+    if (native_list_eligible) {
         // Keep the scalar-index readiness contract identical to the regular
         // expression path below.  A native lookup must not race an
         // asynchronously prefetched BitmapIndex on the first request.
         exprs_->WaitPrefetch();
-        const bool valid_id_list = native_list_mode;
-        auto native_roaring_ids = valid_id_list
-                                      ? nullptr
-                                      : exprs_->expr(0)->TryGetNativeRoaringValidIds();
-        auto native_ids = valid_id_list
-                              ? exprs_->expr(0)->TryGetNativeValidIds()
-                              : nullptr;
-        if (native_roaring_ids != nullptr || native_ids != nullptr) {
-            if (native_roaring_ids != nullptr) {
-                query_context_->set_native_roaring_valid_ids(
-                    std::move(native_roaring_ids));
-            } else {
-                query_context_->set_native_valid_ids(std::move(native_ids));
-            }
+        const auto native_scalar_start =
+            std::chrono::high_resolution_clock::now();
+        EvalCtx native_eval_ctx(operator_context_->get_exec_context());
+        auto native_ids = exprs_->expr(0)->TryGetNativeValidIds(native_eval_ctx);
+        if (native_ids != nullptr) {
+            const auto native_scalar_end =
+                std::chrono::high_resolution_clock::now();
+            const double native_scalar_cost =
+                std::chrono::duration<double, std::micro>(native_scalar_end -
+                                                           native_scalar_start)
+                    .count();
+            // Keep native-list producer timing in the same scalar histogram
+            // as the Dense FilterBits path so E2E collection can compare
+            // predicate-result construction without treating endpoint time
+            // as a producer proxy.
+            milvus::monitor::internal_core_search_latency_scalar.Observe(
+                native_scalar_cost / 1000);
+            query_context_->set_valid_id_payload(std::move(native_ids),
+                                                  need_process_rows_);
             num_processed_rows_ = need_process_rows_;
             std::vector<VectorPtr> col_res;
             // MvccNode and VectorSearchNode recognize the native payload and

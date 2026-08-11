@@ -76,14 +76,40 @@ PhyMvccNode::GetOutput() {
     tracer::AddEvent(fmt::format("input_rows: {}", active_count_));
     WaitPrefetch();
 
-    // A native valid-ID list is the scalar predicate candidate set, not an
-    // assertion that every candidate is visible at this snapshot. Compact it
-    // against the same timestamp/delete/TTL mask used by the Dense path.
-    if (auto native_ids = query_context->get_native_valid_ids();
-        native_ids != nullptr) {
-        AssertInfo(!is_source_node_ &&
-                       segment_->type() == SegmentType::Sealed,
+    // Native valid IDs are only the scalar predicate result. Respect the same
+    // global visibility switch as the Dense path before applying any MVCC
+    // overlay; when visibility filtering is disabled, VectorSearch consumes
+    // the candidate list directly.
+    if (!segcore::SegcoreConfig::default_config()
+             .get_visibility_filter_enabled()) {
+        if (query_context->get_valid_id_payload() != nullptr) {
+            is_finished_ = true;
+            return input_;
+        }
+        auto col_input = is_source_node_ ? std::make_shared<ColumnVector>(
+                                               TargetBitmap(active_count_),
+                                               TargetBitmap(active_count_))
+                                         : GetColumnVector(input_);
+        if (is_source_node_) {
+            query_context->set_all_rows_visible(true);
+        }
+        is_finished_ = true;
+        return std::make_shared<RowVector>(std::vector<VectorPtr>{col_input});
+    }
+
+    // A native valid-ID list is the scalar predicate's candidate set, not an
+    // assertion that every candidate is visible at this snapshot.  Preserve
+    // the regular MVCC semantics by compacting it against the same invalid
+    // timestamp/delete mask used by the Dense path.  In the immutable sealed
+    // case no mask is needed and the original query-owned list is forwarded.
+    if (auto payload = query_context->get_valid_id_payload(); payload != nullptr) {
+        AssertInfo(!is_source_node_ && segment_->type() == SegmentType::Sealed,
                    "native valid IDs require a sealed FilterBits input");
+        AssertInfo(payload->universe == active_count_,
+                   "valid-ID payload universe {} does not match active row count {}",
+                   payload->universe,
+                   active_count_);
+        const auto& native_ids = payload->ids;
         if (native_ids->empty()) {
             is_finished_ = true;
             return input_;
@@ -115,25 +141,12 @@ PhyMvccNode::GetOutput() {
                         surviving_ids->push_back(id);
                     }
                 }
-                query_context->set_native_valid_ids(
+                query_context->set_valid_id_payload(
                     std::shared_ptr<const std::vector<int32_t>>(
-                        std::move(surviving_ids)));
+                        std::move(surviving_ids)),
+                    payload->universe);
             }
         }
-        is_finished_ = true;
-        return input_;
-    }
-
-    // The native Roaring path is admitted only for an immutable visibility
-    // regime, so it can bypass construction of an N-bit MVCC bitmap.
-    if (query_context->get_native_roaring_valid_ids() != nullptr) {
-        AssertInfo(!is_source_node_ &&
-                       segment_->type() == SegmentType::Sealed &&
-                       collection_ttl_timestamp_ == 0 &&
-                       query_timestamp_ >= segment_->get_max_timestamp() &&
-                       segment_->get_deleted_count() == 0,
-                   "native Roaring valid IDs require sealed/latest/no-delete "
-                   "MVCC state");
         is_finished_ = true;
         return input_;
     }

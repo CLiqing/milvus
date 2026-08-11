@@ -364,68 +364,153 @@ PhyUnaryRangeFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
     }
 }
 
-std::shared_ptr<const roaring_bitmap_t>
-PhyUnaryRangeFilterExpr::TryGetNativeRoaringValidIds() {
-    // Keep the native path to one row-level INT64 predicate. Bitmap equality
-    // reuses its index-owned posting; STLSORT range creates a query-owned
-    // Roaring directly from the matching sort interval.
+std::shared_ptr<const std::vector<int32_t>>
+PhyUnaryRangeFilterExpr::TryGetNativeValidIds() {
     if (expr_->column_.element_level_ ||
         expr_->column_.data_type_ != DataType::INT64) {
         return nullptr;
     }
-
     EnsureExecPathDetermined();
-    if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
-        pinned_index_.empty()) {
-        return nullptr;
+    switch (expr_->op_type_) {
+        case proto::plan::OpType::Equal:
+        case proto::plan::OpType::LessThan:
+        case proto::plan::OpType::LessEqual:
+        case proto::plan::OpType::GreaterThan:
+        case proto::plan::OpType::GreaterEqual:
+            break;
+        default:
+            return nullptr;
     }
 
-    const auto value = GetValueFromProto<int64_t>(expr_->val_);
+    // BitmapIndex owns equality postings as Roaring.  Keep that compressed
+    // producer representation, but materialize the one native BF runtime
+    // payload here rather than carrying a second Roaring payload through the
+    // execution pipeline and decoding it again in Cardinal.
     if (expr_->op_type_ == proto::plan::OpType::Equal) {
-        auto* bitmap_index = dynamic_cast<const index::BitmapIndex<int64_t>*>(
-            pinned_index_[0].get());
-        return bitmap_index == nullptr
-                   ? nullptr
-                   : bitmap_index->TryGetRoaringEqual(value);
-    }
-
-    switch (expr_->op_type_) {
-        case proto::plan::OpType::LessThan:
-        case proto::plan::OpType::LessEqual:
-        case proto::plan::OpType::GreaterThan:
-        case proto::plan::OpType::GreaterEqual:
-            break;
-        default:
+        if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
+            pinned_index_.empty()) {
             return nullptr;
+        }
+        auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
+            pinned_index_[0].get());
+        return scalar_index == nullptr
+                   ? nullptr
+                   : scalar_index->TryGetValidIdEqual(
+                         GetValueFromProto<int64_t>(expr_->val_));
     }
 
-    auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
-        pinned_index_[0].get());
-    return scalar_index == nullptr
-               ? nullptr
-               : scalar_index->TryGetRoaringRange(value, expr_->op_type_);
-}
-
-std::shared_ptr<const std::vector<int32_t>>
-PhyUnaryRangeFilterExpr::TryGetNativeValidIds() {
-    if (expr_->column_.element_level_ ||
-        expr_->column_.data_type_ != DataType::INT64 ||
-        expr_->op_type_ == proto::plan::OpType::Equal) {
-        return nullptr;
+    // Raw-data producer: perform the same predicate scan as the Dense path,
+    // but write accepted row offsets directly into the query-owned list.  Do
+    // not first materialize an N-bit result and then enumerate it.  This is
+    // intentionally limited to sealed, row-level single-column INT64 range
+    // expressions; growing/offset/compound paths retain the regular Dense
+    // evaluation until their row-ID semantics are covered explicitly.
+    if (exec_path_ == ExprExecPath::RawData &&
+        segment_->type() == SegmentType::Sealed && !has_offset_input_) {
+        constexpr uint64_t kMaxCardinalId =
+            static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+        if (static_cast<uint64_t>(active_count_) > kMaxCardinalId) {
+            return nullptr;
+        }
+        const auto value = GetValueFromProto<int64_t>(expr_->val_);
+        auto ids = std::make_shared<std::vector<int32_t>>();
+        // Reuse a bounded scratch bitmap as a compare-mask producer.  This
+        // keeps the numeric range compare on the same vectorized bitset
+        // kernel as the Dense path without materializing an N-row bitmap.
+        constexpr int64_t kScratchRows = 32 * 1024;
+        TargetBitmap scratch(kScratchRows, false);
+        auto skip_index = segment_->GetSkipIndex();
+        int64_t global_offset = 0;
+        while (global_offset < active_count_) {
+            int64_t chunk_id = 0;
+            int64_t chunk_offset = global_offset;
+            int64_t rows =
+                std::min<int64_t>(batch_size_, active_count_ - global_offset);
+            rows = std::min<int64_t>(rows, kScratchRows);
+            if (segment_->is_chunked()) {
+                const auto chunk =
+                    segment_->get_chunk_by_offset(field_id_, global_offset);
+                chunk_id = chunk.first;
+                chunk_offset = chunk.second;
+                rows = std::min<int64_t>(
+                    rows,
+                    segment_->chunk_size(field_id_, chunk_id) - chunk_offset);
+            }
+            // The raw native-list producer is deliberately sealed-only.  The
+            // query view can be refreshed while this expression is alive, so
+            // re-check at the sealed-only view boundary instead of allowing a
+            // growing segment to reach get_batch_views().  Returning nullptr
+            // makes FilterBitsNode use the ordinary Dense executor.
+            if (segment_->type() != SegmentType::Sealed) {
+                return nullptr;
+            }
+            // chunk_data is the scalar executor's existing sealed-segment
+            // access primitive.  Unlike get_batch_views it does not carry a
+            // chunk-view-only contract into a query view transition.
+            if (skip_index->CanSkipUnaryRange<int64_t>(
+                    op_ctx_, field_id_, chunk_id, expr_->op_type_, value)) {
+                global_offset += rows;
+                continue;
+            }
+            auto pinned =
+                segment_->chunk_data<int64_t>(op_ctx_, field_id_, chunk_id);
+            const auto chunk = pinned.get();
+            const auto* data = chunk.data() + chunk_offset;
+            const auto* valid = chunk.valid_data();
+            if (valid != nullptr) {
+                valid += chunk_offset;
+            }
+            TargetBitmapView mask(scratch.data(), rows);
+            switch (expr_->op_type_) {
+                case proto::plan::OpType::LessThan:
+                    mask.inplace_compare_val<int64_t,
+                                             milvus::bitset::CompareOpType::LT>(
+                        data, rows, value);
+                    break;
+                case proto::plan::OpType::LessEqual:
+                    mask.inplace_compare_val<int64_t,
+                                             milvus::bitset::CompareOpType::LE>(
+                        data, rows, value);
+                    break;
+                case proto::plan::OpType::GreaterThan:
+                    mask.inplace_compare_val<int64_t,
+                                             milvus::bitset::CompareOpType::GT>(
+                        data, rows, value);
+                    break;
+                case proto::plan::OpType::GreaterEqual:
+                    mask.inplace_compare_val<int64_t,
+                                             milvus::bitset::CompareOpType::GE>(
+                        data, rows, value);
+                    break;
+                default:
+                    return nullptr;
+            }
+            const auto* words =
+                reinterpret_cast<const uint64_t*>(scratch.data());
+            const int64_t word_count = (rows + 63) / 64;
+            for (int64_t word_index = 0; word_index < word_count;
+                 ++word_index) {
+                uint64_t matches = words[word_index];
+                while (matches != 0) {
+                    const auto bit =
+                        static_cast<int64_t>(__builtin_ctzll(matches));
+                    const auto local_id = word_index * 64 + bit;
+                    if (local_id < rows &&
+                        (valid == nullptr || valid[local_id])) {
+                        ids->push_back(
+                            static_cast<int32_t>(global_offset + local_id));
+                    }
+                    matches &= matches - 1;
+                }
+            }
+            global_offset += rows;
+        }
+        return ids;
     }
-    EnsureExecPathDetermined();
+
     if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
         pinned_index_.empty()) {
         return nullptr;
-    }
-    switch (expr_->op_type_) {
-        case proto::plan::OpType::LessThan:
-        case proto::plan::OpType::LessEqual:
-        case proto::plan::OpType::GreaterThan:
-        case proto::plan::OpType::GreaterEqual:
-            break;
-        default:
-            return nullptr;
     }
     auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
         pinned_index_[0].get());
@@ -433,6 +518,56 @@ PhyUnaryRangeFilterExpr::TryGetNativeValidIds() {
                ? nullptr
                : scalar_index->TryGetValidIdRange(
                      GetValueFromProto<int64_t>(expr_->val_), expr_->op_type_);
+}
+
+std::shared_ptr<const std::vector<int32_t>>
+PhyUnaryRangeFilterExpr::TryFilterNativeValidIds(
+    EvalCtx&, const std::shared_ptr<const std::vector<int32_t>>& input) {
+    if (expr_->column_.element_level_ ||
+        expr_->column_.data_type_ != DataType::INT64) {
+        return nullptr;
+    }
+    switch (expr_->op_type_) {
+        case proto::plan::OpType::Equal:
+        case proto::plan::OpType::LessThan:
+        case proto::plan::OpType::LessEqual:
+        case proto::plan::OpType::GreaterThan:
+        case proto::plan::OpType::GreaterEqual:
+            break;
+        default:
+            return nullptr;
+    }
+
+    EnsureExecPathDetermined();
+    if (exec_path_ != ExprExecPath::RawData) {
+        return nullptr;
+    }
+
+    const auto value = GetValueFromProto<int64_t>(expr_->val_);
+    const auto op_type = expr_->op_type_;
+    auto skip_index = segment_->GetSkipIndex();
+    auto match = [op_type, value](int64_t candidate) {
+        switch (op_type) {
+            case proto::plan::OpType::Equal:
+                return candidate == value;
+            case proto::plan::OpType::LessThan:
+                return candidate < value;
+            case proto::plan::OpType::LessEqual:
+                return candidate <= value;
+            case proto::plan::OpType::GreaterThan:
+                return candidate > value;
+            case proto::plan::OpType::GreaterEqual:
+                return candidate >= value;
+            default:
+                return false;
+        }
+    };
+    auto can_skip = [this, &skip_index, op_type, value](int64_t chunk_id) {
+        return skip_index->CanSkipUnaryRange<int64_t>(
+            op_ctx_, field_id_, chunk_id, op_type, value);
+    };
+    return FilterSortedNativeIdsByRawData<int64_t>(
+        input, std::move(match), std::move(can_skip));
 }
 
 VectorPtr

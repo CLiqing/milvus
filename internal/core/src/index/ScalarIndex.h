@@ -179,6 +179,11 @@ class ScalarIndex : public IndexBase {
     }
 
     virtual std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdEqual(const T& value) const {
+        return nullptr;
+    }
+
+    virtual std::shared_ptr<const std::vector<int32_t>>
     TryGetValidIdRange(const T& value, OpType op) const {
         return nullptr;
     }

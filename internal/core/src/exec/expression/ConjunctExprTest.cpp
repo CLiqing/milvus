@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -66,6 +67,86 @@ class FixedBitmapExpr : public Expr {
  private:
     TargetBitmap data_;
     TargetBitmap valid_;
+};
+
+class FixedSparseProducerExpr : public Expr {
+ public:
+    explicit FixedSparseProducerExpr(std::vector<int32_t> ids)
+        : Expr(DataType::BOOL, {}, "FixedSparseProducerExpr", nullptr),
+          ids_(std::make_shared<const std::vector<int32_t>>(std::move(ids))) {
+    }
+
+    std::shared_ptr<const std::vector<int32_t>>
+    TryGetNativeValidIds() override {
+        return ids_;
+    }
+
+    std::string
+    ToString() const override {
+        return "FixedSparseProducerExpr";
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return std::nullopt;
+    }
+
+ private:
+    std::shared_ptr<const std::vector<int32_t>> ids_;
+};
+
+class OffsetMembershipExpr : public Expr {
+ public:
+    explicit OffsetMembershipExpr(std::unordered_set<int32_t> accepted)
+        : Expr(DataType::BOOL, {}, "OffsetMembershipExpr", nullptr),
+          accepted_(std::move(accepted)) {
+    }
+
+    void
+    Eval(EvalCtx& context, VectorPtr& result) override {
+        ++eval_count_;
+        auto* offsets = context.get_offset_input();
+        ASSERT_NE(offsets, nullptr);
+        seen_offsets_ = offsets->size();
+        TargetBitmap data(offsets->size(), false);
+        TargetBitmap valid(offsets->size(), true);
+        for (size_t i = 0; i < offsets->size(); ++i) {
+            data[i] = accepted_.contains((*offsets)[i]);
+        }
+        result =
+            std::make_shared<ColumnVector>(std::move(data), std::move(valid));
+    }
+
+    std::shared_ptr<const std::vector<int32_t>>
+    TryFilterNativeValidIds(
+        EvalCtx&,
+        const std::shared_ptr<const std::vector<int32_t>>& input) override {
+        seen_offsets_ = input->size();
+        auto output = std::make_shared<std::vector<int32_t>>();
+        output->reserve(input->size());
+        for (const auto id : *input) {
+            if (accepted_.contains(id)) {
+                output->push_back(id);
+            }
+        }
+        return output;
+    }
+
+    std::string
+    ToString() const override {
+        return "OffsetMembershipExpr";
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return std::nullopt;
+    }
+
+    size_t seen_offsets_ = 0;
+    int eval_count_ = 0;
+
+ private:
+    std::unordered_set<int32_t> accepted_;
 };
 
 // Each row given as {data, valid}.
@@ -334,6 +415,41 @@ TEST(ConjunctExprTest, MarkNullRejectingStopsAtNonConjunctNodes) {
     // ... but stops at any non-conjunct node (e.g. NOT), where FALSE and
     // UNKNOWN produce different results.
     EXPECT_FALSE(hidden_and->IsNullRejecting());
+}
+
+TEST(ConjunctExprTest, SparseAndPassesOnlyAcceptedOffsetsToSecondPredicate) {
+    auto producer = std::make_shared<FixedSparseProducerExpr>(
+        std::vector<int32_t>{3, 10, 18, 25});
+    auto consumer = std::make_shared<OffsetMembershipExpr>(
+        std::unordered_set<int32_t>{10, 25});
+    std::vector<ExprPtr> inputs{producer, consumer};
+    PhyConjunctFilterExpr conjunct(std::move(inputs), true, nullptr);
+
+    QueryContext query_context("sparse_conjunct_test", nullptr, 32, 0);
+    ExecContext exec_context(&query_context);
+    EvalCtx eval_context(&exec_context);
+
+    const auto ids = conjunct.TryGetNativeValidIds(eval_context);
+    ASSERT_NE(ids, nullptr);
+    EXPECT_EQ(*ids, (std::vector<int32_t>{10, 25}));
+    EXPECT_EQ(consumer->seen_offsets_, 4);
+    EXPECT_EQ(consumer->eval_count_, 0);
+}
+
+TEST(ConjunctExprTest,
+     SparseAndFallsBackWhenSecondPredicateHasNoSparseConsumer) {
+    auto producer = std::make_shared<FixedSparseProducerExpr>(
+        std::vector<int32_t>{3, 10, 18, 25});
+    auto consumer = FixedBool(true, true);
+    std::vector<ExprPtr> inputs{producer, consumer};
+    PhyConjunctFilterExpr conjunct(std::move(inputs), true, nullptr);
+
+    QueryContext query_context("sparse_conjunct_fallback_test", nullptr, 32, 0);
+    ExecContext exec_context(&query_context);
+    EvalCtx eval_context(&exec_context);
+
+    EXPECT_EQ(conjunct.TryGetNativeValidIds(eval_context), nullptr);
+    EXPECT_EQ(consumer->eval_count_, 0);
 }
 
 }  // namespace milvus::exec

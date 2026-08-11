@@ -148,8 +148,9 @@ class MvccFastPathTest : public ::testing::Test {
             {"bf_filter_scan_mode", "valid_ids_per_query"},
         };
         query_context->set_search_info(search_info);
-        query_context->set_native_valid_ids(
-            std::make_shared<const std::vector<int32_t>>(std::move(candidate_ids)));
+        query_context->set_valid_id_payload(
+            std::make_shared<const std::vector<int32_t>>(std::move(candidate_ids)),
+            N_);
 
         auto task = Task::Create("task_native_list_mvcc",
                                  plan::PlanFragment(mvcc_node),
@@ -157,7 +158,8 @@ class MvccFastPathTest : public ::testing::Test {
                                  query_context);
         while (task->Next()) {
         }
-        return query_context->get_native_valid_ids();
+        auto payload = query_context->get_valid_id_payload();
+        return payload ? payload->ids : nullptr;
     }
 
     SchemaPtr schema_;

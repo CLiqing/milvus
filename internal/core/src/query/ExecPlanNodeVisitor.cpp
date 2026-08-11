@@ -69,16 +69,24 @@ ExecPlanNodeVisitor::ExecuteTask(
                     std::dynamic_pointer_cast<ColumnVector>(ret->child(0));
                 AssertInfo(first_column,
                            "first column must be a column vector");
-                // The native Roaring valid-ID path uses a one-row sentinel to
+                // The native valid-ID path uses a one-row sentinel to
                 // satisfy the Driver's non-empty output contract. Its actual
                 // predicate result is owned by QueryContext and consumed by
                 // VectorSearchNode, so it is intentionally not an
                 // active_count-sized bitmap here.
-                const auto native_roaring =
-                    query_context->get_search_info().search_params_.value(
-                        "bf_filter_scan_mode", std::string{"auto"}) ==
-                    "roaring_valid_per_query";
-                if (first_column->IsBitmap() && !native_roaring) {
+                // Retrieve plans do not carry vector-search parameters.  Keep
+                // the normal bitmap result path usable for them instead of
+                // asking nlohmann::json::value() to read a null JSON value.
+                const auto& search_params =
+                    query_context->get_search_info().search_params_;
+                const auto bf_filter_scan_mode =
+                    search_params.is_object()
+                        ? search_params.value("bf_filter_scan_mode",
+                                              std::string{"auto"})
+                        : std::string{"auto"};
+                const bool native_valid_ids =
+                    bf_filter_scan_mode == "valid_ids_per_query";
+                if (first_column->IsBitmap() && !native_valid_ids) {
                     if (query_context->bitset_is_element_level()) {
                         Assert(processed_num ==
                                query_context->get_active_element_count());

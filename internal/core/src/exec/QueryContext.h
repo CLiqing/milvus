@@ -24,7 +24,6 @@
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/Optional.h>
 #include <folly/CancellationToken.h>
-#include <roaring/roaring.h>
 
 #include "common/Common.h"
 #include "common/Types.h"
@@ -177,6 +176,15 @@ class Context {
 
 class QueryContext : public Context {
  public:
+    // The only native pre-filter representation currently accepted by the
+    // Cardinal BF bridge. `ids` owns (or shares ownership of) immutable row
+    // IDs in the sealed segment's internal row-ID domain; `universe` makes
+    // that domain explicit at every consumer.
+    struct ValidIdPayload {
+        std::shared_ptr<const std::vector<int32_t>> ids;
+        int64_t universe;
+    };
+
     QueryContext(const std::string& query_id,
                  const milvus::segcore::SegmentInternalInterface* segment,
                  int64_t active_count,
@@ -390,23 +398,20 @@ class QueryContext : public Context {
     }
 
     void
-    set_native_roaring_valid_ids(std::shared_ptr<const roaring_bitmap_t> ids) {
-        native_roaring_valid_ids_ = std::move(ids);
+    set_valid_id_payload(std::shared_ptr<const std::vector<int32_t>> ids,
+                         int64_t universe) {
+        AssertInfo(ids != nullptr,
+                   "valid-ID payload must have an owning ID list");
+        AssertInfo(universe >= 0,
+                   "valid-ID payload universe {} must not be negative",
+                   universe);
+        valid_id_payload_ = std::make_shared<const ValidIdPayload>(
+            ValidIdPayload{std::move(ids), universe});
     }
 
-    std::shared_ptr<const roaring_bitmap_t>
-    get_native_roaring_valid_ids() const {
-        return native_roaring_valid_ids_;
-    }
-
-    void
-    set_native_valid_ids(std::shared_ptr<const std::vector<int32_t>> ids) {
-        native_valid_ids_ = std::move(ids);
-    }
-
-    std::shared_ptr<const std::vector<int32_t>>
-    get_native_valid_ids() const {
-        return native_valid_ids_;
+    std::shared_ptr<const ValidIdPayload>
+    get_valid_id_payload() const {
+        return valid_id_payload_;
     }
 
     void
@@ -473,11 +478,11 @@ class QueryContext : public Context {
     // MVCC fast path: set true when sealed + no-filter + no-delete + no-TTL
     bool all_rows_visible_{false};
 
-    // Accepted IDs for the opt-in Cardinal BF experiment. The first native
-    // path admits only sealed/latest/no-delete searches, so it borrows an
-    // immutable index-owned posting without a dense MVCC overlay.
-    std::shared_ptr<const roaring_bitmap_t> native_roaring_valid_ids_{nullptr};
-    std::shared_ptr<const std::vector<int32_t>> native_valid_ids_{nullptr};
+    // Accepted row IDs for the opt-in Cardinal BF experiment. This remains a
+    // single List representation even if BitmapIndex uses Roaring internally.
+    // MVCC may replace it with a query-owned compacted list while preserving
+    // the row-ID universe.
+    std::shared_ptr<const ValidIdPayload> valid_id_payload_{nullptr};
 
     // Expression filter cache for two-stage search
     bool enable_expr_cache_ = false;

@@ -628,6 +628,27 @@ TYPED_TEST_P(BitmapIndexTest, NativeRoaringLowCardinalitySidecarTest) {
     }
 }
 
+TYPED_TEST_P(BitmapIndexTest, NativeValidIdEqualMatchesDenseTest) {
+    auto* index_ptr =
+        dynamic_cast<index::BitmapIndex<TypeParam>*>(this->index_.get());
+    ASSERT_NE(index_ptr, nullptr);
+
+    const auto value = this->data_[0];
+    const auto native = index_ptr->TryGetValidIdEqual(value);
+    ASSERT_NE(native, nullptr);
+
+    const auto dense = index_ptr->In(1, &value);
+    std::vector<bool> selected(dense.size(), false);
+    for (const auto id : *native) {
+        ASSERT_GE(id, 0);
+        ASSERT_LT(static_cast<size_t>(id), selected.size());
+        selected[id] = true;
+    }
+    for (size_t id = 0; id < dense.size(); ++id) {
+        EXPECT_EQ(selected[id], dense[id]);
+    }
+}
+
 using BitmapType =
     testing::Types<int8_t, int16_t, int32_t, int64_t, std::string>;
 
@@ -639,7 +660,8 @@ REGISTER_TYPED_TEST_SUITE_P(BitmapIndexTest,
                             IsNullFuncTest,
                             IsNotNullFuncTest,
                             PatternMatchFuncTest,
-                            NativeRoaringLowCardinalitySidecarTest);
+                            NativeRoaringLowCardinalitySidecarTest,
+                            NativeValidIdEqualMatchesDenseTest);
 
 INSTANTIATE_TYPED_TEST_SUITE_P(BitmapE2ECheck, BitmapIndexTest, BitmapType);
 
@@ -699,6 +721,27 @@ TYPED_TEST_P(BitmapIndexTestV2, NativeRoaringEqualFuncTest) {
     }
 }
 
+TYPED_TEST_P(BitmapIndexTestV2, NativeValidIdEqualMatchesDenseTest) {
+    auto* index_ptr =
+        dynamic_cast<index::BitmapIndex<TypeParam>*>(this->index_.get());
+    ASSERT_NE(index_ptr, nullptr);
+
+    const auto value = this->data_[0];
+    const auto native = index_ptr->TryGetValidIdEqual(value);
+    ASSERT_NE(native, nullptr);
+
+    const auto dense = index_ptr->In(1, &value);
+    std::vector<bool> selected(dense.size(), false);
+    for (const auto id : *native) {
+        ASSERT_GE(id, 0);
+        ASSERT_LT(static_cast<size_t>(id), selected.size());
+        selected[id] = true;
+    }
+    for (size_t id = 0; id < dense.size(); ++id) {
+        EXPECT_EQ(selected[id], dense[id]);
+    }
+}
+
 TYPED_TEST_P(BitmapIndexTestV2, IsNullFuncTest) {
     this->TestIsNullFunc();
 }
@@ -721,6 +764,7 @@ REGISTER_TYPED_TEST_SUITE_P(BitmapIndexTestV2,
                             CompareValFuncTest,
                             TestRangeCompareFuncTest,
                             NativeRoaringEqualFuncTest,
+                            NativeValidIdEqualMatchesDenseTest,
                             IsNullFuncTest,
                             IsNotNullFuncTest,
                             PatternMatchFuncTest);

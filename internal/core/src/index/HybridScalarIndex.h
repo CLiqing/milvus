@@ -164,6 +164,11 @@ class HybridScalarIndex : public ScalarIndex<T> {
     }
 
     std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdEqual(const T& value) const override {
+        return internal_index_->TryGetValidIdEqual(value);
+    }
+
+    std::shared_ptr<const std::vector<int32_t>>
     TryGetValidIdRange(const T& value, OpType op) const override {
         return internal_index_->TryGetValidIdRange(value, op);
     }

@@ -64,6 +64,13 @@ class PhyConjunctFilterExpr : public Expr {
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
+    // Experimental Sparse AND path.  It is intentionally narrow: the first
+    // reordered child must produce accepted row IDs, and the second child is
+    // evaluated only at those offsets.  Unsupported shapes return nullptr so
+    // FilterBitsNode keeps the existing Dense executor.
+    std::shared_ptr<const std::vector<int32_t>>
+    TryGetNativeValidIds(EvalCtx& context) override;
+
     void
     MoveCursor() override {
         if (!has_offset_input_) {
