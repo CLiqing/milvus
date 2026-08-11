@@ -76,27 +76,6 @@ PhyMvccNode::GetOutput() {
     tracer::AddEvent(fmt::format("input_rows: {}", active_count_));
     WaitPrefetch();
 
-    // Native valid IDs are only the scalar predicate result. Respect the same
-    // global visibility switch as the Dense path before applying any MVCC
-    // overlay; when visibility filtering is disabled, VectorSearch consumes
-    // the candidate list directly.
-    if (!segcore::SegcoreConfig::default_config()
-             .get_visibility_filter_enabled()) {
-        if (query_context->get_valid_id_payload() != nullptr) {
-            is_finished_ = true;
-            return input_;
-        }
-        auto col_input = is_source_node_ ? std::make_shared<ColumnVector>(
-                                               TargetBitmap(active_count_),
-                                               TargetBitmap(active_count_))
-                                         : GetColumnVector(input_);
-        if (is_source_node_) {
-            query_context->set_all_rows_visible(true);
-        }
-        is_finished_ = true;
-        return std::make_shared<RowVector>(std::vector<VectorPtr>{col_input});
-    }
-
     // A native valid-ID list is the scalar predicate's candidate set, not an
     // assertion that every candidate is visible at this snapshot.  Preserve
     // the regular MVCC semantics by compacting it against the same invalid

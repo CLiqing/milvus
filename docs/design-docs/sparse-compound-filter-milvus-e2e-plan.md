@@ -285,3 +285,41 @@ compaction path, and Cardinal receives about 500 final IDs.  The result does
 not yet establish a production threshold or broader expression/type coverage,
 but it rejects the previous conclusion that compound Sparse filtering is
 intrinsically slower; the regression came from the per-ID generic evaluator.
+
+### Rebase validation against upstream master
+
+On 2026-08-11 the Direct Sparse branch was rebased onto Milvus upstream
+`master` commit `5097a4246b30646485fd5635f9fb3a94ce54662e` (the resulting
+branch head is recorded with the code change).  The rebase retained upstream
+query-view state-machine, null-rejection, storage-v2 bulk-offset, and
+chunk-access changes.  The obsolete experimental
+`visibility_filter_enabled` branch was removed because current master always
+applies the normal MVCC timestamp/delete/TTL mask; native IDs continue to be
+compacted against that mask.
+
+The associated Cardinal loading-overhead API had changed upstream.  The
+experiment dependency chain was advanced to Cardinal `10c3cf8b` through
+Knowhere `bc78bec9`, preserving the new loading-overhead group semantics.
+`libmilvus_core.so` rebuilt successfully in Release.  Refreshing generated
+protobuf C++ files was required because the updated schema includes
+`ArithOpType::Shl/Shr` and `BloomFilterExpr`.
+
+The isolated standalone server was then rebuilt and run with the same
+one-segment, controlled layout and endpoint protocol above.  The rebase-run
+result is independent of the earlier table:
+
+| Metric | Dense per-query BF | Direct Sparse valid-ID BF | Delta |
+|---|---:|---:|---:|
+| Mean endpoint latency | 3.889 ms | 3.164 ms | -18.65% |
+| Median endpoint latency | 3.865 ms | 2.743 ms | -29.04% |
+| P90 endpoint latency | 4.111 ms | 5.679 ms | +38.13% |
+| Timed requests / mode | 1,200 | 1,200 | - |
+| Paired windows won by Sparse | - | 12 / 12 | repeatable direction |
+
+The endpoint script completed its equality closure before timing, and reported
+the explicit BF route.  The absolute numbers differ from the earlier run after
+the master dependency/server refresh, but the direction remains stable.  A
+full monolithic `unittest/all_tests` rebuild was intentionally not used as the
+post-rebase gate: its protobuf refresh recompiles 184 unrelated sources.  The
+targeted E2E exercises the changed producer, sparse consumer, MVCC compaction,
+Knowhere/Cardinal bridge, and server binary together.
