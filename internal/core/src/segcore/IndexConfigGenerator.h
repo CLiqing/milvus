@@ -36,7 +36,16 @@ enum class IndexConfigLevel {
 // when the segment is sealed before the index is built.
 class VecIndexConfig {
     inline static const std::unordered_set<std::string> maintain_params = {
-        "radius", "range_filter", "drop_ratio_search", "dim_max_score_ratio"};
+        "radius",
+        "range_filter",
+        "drop_ratio_search",
+        "dim_max_score_ratio",
+        "experimental_numeric_filter_batch_mode",
+        "experimental_numeric_filter_batch_width",
+        "experimental_numeric_filter_batch_min_fill",
+        "experimental_numeric_filter_batch_tail_mode",
+        "experimental_numeric_filter_batch_prefetch",
+        "experimental_numeric_filter_batch_kernel"};
 
  public:
     VecIndexConfig(const int64_t max_index_row_count,
