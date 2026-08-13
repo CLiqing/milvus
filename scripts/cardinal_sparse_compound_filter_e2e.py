@@ -10,11 +10,17 @@ compared modes are explicit BF modes today: Cardinal's existing
 import argparse
 import json
 import os
+import shutil
 import statistics
 import time
 
 import numpy as np
 from pymilvus import DataType, MilvusClient
+
+try:
+    import pyarrow.parquet as pq
+except ImportError:  # synthetic mode does not require pyarrow
+    pq = None
 
 
 def percentile(values, fraction):
@@ -44,7 +50,15 @@ def main():
     parser.add_argument("--rows", type=int, default=1_000_000)
     parser.add_argument("--segment-rows", type=int, default=1_000_000)
     parser.add_argument("--dim", type=int, default=128)
+    parser.add_argument("--metric-type", choices=("L2", "COSINE"), default="L2")
+    parser.add_argument("--vector-source", choices=("synthetic", "cohere"), default="synthetic")
+    parser.add_argument("--cohere-dir", default="/home/ubuntu/workspace/datasets/vdbbench/cohere_large_10m",
+                        help="directory containing shuffle_train-XX-of-10.parquet and test.parquet")
+    parser.add_argument("--cohere-total-shards", type=int, default=10,
+                        help="total shard count encoded in Cohere filenames; permits a 1M smoke from shard 00")
     parser.add_argument("--batch-rows", type=int, default=10_000)
+    parser.add_argument("--min-free-gb", type=float, default=0.0,
+                        help="abort before a new logical segment when free space falls below this threshold")
     parser.add_argument("--queries", type=int, default=50)
     parser.add_argument("--windows", type=int, default=12)
     parser.add_argument("--warmups", type=int, default=10)
@@ -70,6 +84,22 @@ def main():
         raise ValueError(f"missing {args.token_env}")
     client = MilvusClient(uri=args.uri, token=token)
     rng = np.random.default_rng(1732)
+    if args.vector_source == "cohere":
+        if pq is None:
+            raise RuntimeError("Cohere mode requires pyarrow")
+        if args.dim != 768 or args.metric_type != "COSINE":
+            raise ValueError("Cohere mode requires --dim 768 and --metric-type COSINE")
+        expected_shards = args.rows // args.segment_rows
+        if args.rows % args.segment_rows or expected_shards < 1 or expected_shards > args.cohere_total_shards:
+            raise ValueError("Cohere mode requires rows divisible by segment-rows")
+        for shard in range(expected_shards):
+            path = os.path.join(args.cohere_dir,
+                                f"shuffle_train-{shard:02d}-of-{args.cohere_total_shards}.parquet")
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+        query_path = os.path.join(args.cohere_dir, "test.parquet")
+        if not os.path.exists(query_path):
+            raise FileNotFoundError(query_path)
     a_limit = 1_000
     b_limit = args.segment_rows // 2
     predicate = f"a < {a_limit} and b < {b_limit}"
@@ -84,31 +114,54 @@ def main():
         schema.add_field("vector", DataType.FLOAT_VECTOR, dim=args.dim)
         client.create_collection(collection_name=args.collection, schema=schema)
 
-        for segment_start in range(0, args.rows, args.segment_rows):
+        for segment_no, segment_start in enumerate(range(0, args.rows, args.segment_rows)):
+            free_gb = shutil.disk_usage("/").free / (1024 ** 3)
+            if free_gb < args.min_free_gb:
+                raise RuntimeError(
+                    f"free space {free_gb:.1f}GiB below --min-free-gb {args.min_free_gb:.1f} before segment {segment_no}")
             # Independent random ranks make A precisely 0.1% and B ~50% of A
             # inside every sealed segment while keeping their matching IDs
             # uncorrelated with vector values and each other.
             a = rng.permutation(args.segment_rows).astype(np.int64)
             b = rng.permutation(args.segment_rows).astype(np.int64)
-            for local_start in range(0, args.segment_rows, args.batch_rows):
+            if args.vector_source == "cohere":
+                train_path = os.path.join(args.cohere_dir,
+                    f"shuffle_train-{segment_no:02d}-of-{args.cohere_total_shards}.parquet")
+                batches = pq.ParquetFile(train_path).iter_batches(
+                    batch_size=args.batch_rows, columns=["emb"], use_threads=True)
+            else:
+                batches = None
+            local_start = 0
+            while local_start < args.segment_rows:
                 local_end = min(args.segment_rows, local_start + args.batch_rows)
-                vectors = rng.random((local_end - local_start, args.dim), dtype=np.float32)
+                if batches is None:
+                    vectors = rng.random((local_end - local_start, args.dim), dtype=np.float32)
+                else:
+                    try:
+                        batch = next(batches)
+                    except StopIteration as exc:
+                        raise RuntimeError(f"Cohere shard {segment_no} ended at {local_start} rows") from exc
+                    vectors = batch.column("emb").to_pylist()
+                    if len(vectors) != local_end - local_start:
+                        raise RuntimeError("unexpected Cohere batch size")
                 ids = np.arange(segment_start + local_start, segment_start + local_end)
                 client.insert(collection_name=args.collection, data=[
                     {"id": int(row_id), "a": int(a_value), "b": int(b_value),
-                     "vector": vector.tolist()}
+                     "vector": vector.tolist() if hasattr(vector, "tolist") else vector}
                     for row_id, a_value, b_value, vector in zip(
                         ids, a[local_start:local_end], b[local_start:local_end], vectors)
                 ])
+                local_start = local_end
             # Preserve the requested multi-segment topology before the vector
             # index is built; no scalar index is created for this experiment.
             client.flush(collection_name=args.collection)
-            print(json.dumps({"event": "segment_flushed", "rows": segment_start + args.segment_rows}),
+            print(json.dumps({"event": "segment_flushed", "rows": segment_start + args.segment_rows,
+                              "free_gib": round(shutil.disk_usage("/").free / (1024 ** 3), 2)}),
                   flush=True)
 
         params = client.prepare_index_params()
         params.add_index(field_name="vector", index_type="CARDINAL_TIERED",
-                         metric_type="L2", params={"M": 16, "efConstruction": 100})
+                         metric_type=args.metric_type, params={"M": 16, "efConstruction": 100})
         client.create_index(collection_name=args.collection, index_params=params)
         client.load_collection(collection_name=args.collection)
         wait_for_load(client, args.collection)
@@ -119,17 +172,25 @@ def main():
                           "predicate": predicate}), flush=True)
         return
 
-    query_rng = np.random.default_rng(1732 + 1)
-    queries = query_rng.random((args.queries, args.dim), dtype=np.float32)
+    if args.vector_source == "cohere":
+        query_table = pq.read_table(os.path.join(args.cohere_dir, "test.parquet"), columns=["emb"])
+        all_queries = query_table["emb"].to_pylist()
+        if args.queries > len(all_queries):
+            raise ValueError(f"requested {args.queries} queries, Cohere test set has {len(all_queries)}")
+        queries = all_queries[:args.queries]
+    else:
+        query_rng = np.random.default_rng(1732 + 1)
+        queries = query_rng.random((args.queries, args.dim), dtype=np.float32)
 
     def search(mode, query):
-        params = {"metric_type": "L2", "params": {
+        params = {"metric_type": args.metric_type, "params": {
             "ef": 64, "bf_filter_scan_mode": mode,
         }}
         if args.index_algo != "auto":
             params["params"]["index_algo"] = args.index_algo
         begin = time.perf_counter_ns()
-        result = client.search(collection_name=args.collection, data=[query.tolist()],
+        result = client.search(collection_name=args.collection,
+                               data=[query.tolist() if hasattr(query, "tolist") else query],
                                anns_field="vector", limit=10, filter=predicate,
                                search_params=params)
         return (time.perf_counter_ns() - begin) / 1_000_000, hits(result)
@@ -170,6 +231,7 @@ def main():
     report = {
         "event": "benchmark_complete", "collection": args.collection,
         "rows": args.rows, "segment_rows": args.segment_rows, "dim": args.dim,
+        "vector_source": args.vector_source, "metric_type": args.metric_type,
         "predicate": predicate, "a_valid_per_segment": a_limit,
         "b_selectivity": "about 50pct conditional on A", "final_valid_expected":
             args.rows // args.segment_rows * a_limit // 2,

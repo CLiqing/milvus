@@ -78,6 +78,84 @@ The initial all-visible performance point has no delete and TTL=0 so it is
 stable.  Separate correctness tests must cover delete, historical timestamp,
 and TTL compaction before claiming the Sparse payload preserves visibility.
 
+### Cohere 10M high-dimensional follow-up (scheduled)
+
+The synthetic 128D point establishes the direct Sparse compound-filter
+pipeline, but vector-distance work is artificially small.  The next E2E point
+uses vdbbench's standard **Large Cohere (768D, 10M)** corpus: ten
+`shuffle_train-XX-of-10.parquet` files and the corresponding `test.parquet`
+queries, with `COSINE` metric.  It replaces only the vector base/query data;
+the comparison, Cardinal index parameters, NQ=1/C1 ABBA protocol, and logical
+filter stay fixed.
+
+Each Cohere input file is an independently flushed 1M-row *logical ingestion
+unit*.  Milvus may still split it into multiple physical sealed segments by
+channel; it is not assumed that a Parquet file equals a physical segment.
+Within every ingestion unit, `a` and `b` are independent deterministic
+permutations of `[0, 1M)`: `a < 1000` gives exactly 1,000 A candidates, and
+`b < 500000` retains about half of them.  Therefore every physical segment
+receives an approximately uniform sample rather than a file-boundary or
+segment-boundary run of matching rows.  Expected final candidates are about
+500 per ingestion unit / 5,000 collection-wide.  The input is read as
+streaming Parquet batches; all 10M 768D vectors are never resident in the
+Python client at once.
+
+This point is reported separately from the 1M x 128D synthetic result because
+dataset, dimension, and metric differ.  Its purpose is to quantify how much
+the Sparse pipeline's filtering benefit remains once realistic high-dimensional
+COSINE distance work accounts for more of endpoint latency.
+
+#### Cohere ingestion and route smoke (2026-08-12)
+
+The official `test.parquet` was validated as 1,000 768D fp32 query vectors.
+The first official training Parquet shard was streamed into the isolated
+standalone as a 1M x 768D/COSINE collection; no synthetic vectors or queries
+were used.  The standard topK/distance equality closure passed before timing.
+A short one-window diagnostic (two 10-query slots per mode, NQ=1/C1,
+topK10/ef64, explicit BF payload modes) gave:
+
+| Metric | Dense per-query BF | Direct Sparse valid-ID BF | Sparse delta |
+|---|---:|---:|---:|
+| Mean endpoint latency | 3.427 ms | 2.914 ms | -14.95% |
+| Median endpoint latency | 3.259 ms | 2.748 ms | -15.70% |
+| P90 endpoint latency | 3.479 ms | 3.266 ms | -6.12% |
+
+This is an ingestion/COSINE/route smoke, not the 12-window acceptance result.
+All ten official training shards were subsequently downloaded and validated as
+1M-row, 768D Parquet files (about 44GB total).  A disk preflight then found
+the isolated standalone's accumulated historical experiment state occupied
+about 78GB while the root filesystem had about 144GB free.  Full 10M creation
+must start from reclaimed or fresh isolated storage; otherwise its raw binlogs
+and Cardinal index have a material risk of exhausting the remaining space.
+
+#### Full Cohere 10M acceptance run (2026-08-12)
+
+After reclaiming obsolete local experiment collections, traces, logs, and
+unrelated build trees, the complete official Cohere corpus was inserted in ten
+streaming 1M-row logical units.  The per-unit disk guard was 40GiB; its lowest
+observed post-flush free space was 107.96GiB, and the final completed run had
+about 98GiB free.  No guard, OOM, or ingestion error fired.  The script built
+and loaded `CARDINAL_TIERED` with COSINE, completed exact Dense/Sparse topK
+and distance closure for the first ten fixed Cohere queries, warmed each mode
+with ten requests, then completed the prescribed twelve
+`Dense -> Sparse -> Sparse -> Dense` windows (50 fixed NQ=1/C1 requests per
+slot, hence 1,200 timed requests per mode).
+
+| Metric | Dense per-query BF | Direct Sparse valid-ID BF | Sparse delta |
+|---|---:|---:|---:|
+| Mean endpoint latency | 9.294 ms | 8.258 ms | -11.15% |
+| Median endpoint latency | 8.980 ms | 7.402 ms | -17.57% |
+| P90 endpoint latency | 10.236 ms | 11.978 ms | +17.02% |
+| Paired ABBA windows faster | - | 12 / 12 | consistent direction |
+| Mean paired-window delta | - | - | -11.08% |
+
+This is the accepted high-dimensional product-path result: real Cohere vectors
+and queries, COSINE, scalar A/B production, visibility processing,
+Knowhere/Cardinal BF, RPC, and response are all included in the endpoint timer.
+The P90 trade-off remains visible even though the mean/median and every paired
+window favor Sparse.  It must be reported alongside the mean rather than
+presented as a uniform tail-latency improvement.
+
 ## Route policy
 
 The primary product question is whether normal route selection would choose BF
@@ -323,3 +401,64 @@ full monolithic `unittest/all_tests` rebuild was intentionally not used as the
 post-rebase gate: its protobuf refresh recompiles 184 unrelated sources.  The
 targeted E2E exercises the changed producer, sparse consumer, MVCC compaction,
 Knowhere/Cardinal bridge, and server binary together.
+
+### Stable CPU flamegraph attribution (2026-08-13)
+
+Earlier profiles that overlapped Cardinal index building/compaction were discarded.
+The retained profiles were collected only after the Cohere 10M collection had
+finished loading and compaction, with eight sealed serviceable segments and no
+active `knowhere_build*` CPU. Dense and Sparse were profiled separately using
+`sudo perf record -F 199 -g -p <milvus-pid>` for 30 seconds. Each mode first
+received 20 warmups, followed by 60 windows of the same 50 fixed Cohere queries
+(3,000 timed NQ=1/C1 requests per mode, topK=10, `ef=64`, explicit BF).
+Artifacts are in `/tmp/knowpr1732-cohere-perf-clean-20260812/`.
+
+The profile is a CPU-attribution experiment, not a replacement for the accepted
+ABBA endpoint table above. Its single-mode endpoint means were 8.0066 ms
+(Dense) and 6.9437 ms (Sparse); the corresponding median/P90 values were
+7.9425/8.3916 ms and 5.6311/14.4934 ms. The profile confirms the functional
+split below:
+
+| Functional module | Dense profile | Sparse profile | Interpretation |
+|---|---:|---:|---|
+| Scalar filtering and result production | `PhyFilterBitsNode::GetOutput` 26.43% inclusive; `PhyConjunctFilterExpr::Eval` 24.14%; `PhyUnaryRangeFilterExpr::Eval` 21.26% | `PhyFilterBitsNode::GetOutput` about 27.12% inclusive; `TryGetNativeValidIds` 25.73%/18.86% in the conjunction/unary frames; `TryFilterNativeValidIds` about 6.65% self | Dense builds/evaluates the full bitmap; Sparse runs A's producer scan and B only on A's candidate list |
+| Full-universe scalar scan / Dense materialization | `ProcessDataChunks*` about 18.5% and SVE `OpCompareValImpl` 14.72% self; `BitCompressBatch64` visible at about 2.11% | Not the primary B route; SVE compare 10.78% self is A's initial full scan | Sparse removes the final N-row bitmap materialization/enumeration, but A still has to inspect the column |
+| Cardinal BF distance search | `IndexImpl::Search` 16.22%; `BruteForceSearcher` 14.58%; `BruteForceSearchImpl` 14.43% | `IndexImpl::Search` 13.70%; `BruteForceSearcher` 11.31%; `BruteForceSearchImpl` 11.29%; `ScanRangeByValidIdsBatch4` 6.91% | The same BF search remains on both paths; Sparse additionally exposes the valid-ID scan consumer |
+| Execution/scheduling | Driver/task/segment scheduling frames | Same framework frames | Inclusive percentages overlap and are not additive |
+
+The often-quoted `0.46 ms` for B is only a naive conversion of the roughly
+6.65% `TryFilterNativeValidIds` CPU sample share multiplied by the 6.94 ms
+Sparse endpoint mean. It is not a measured B wall-time timer and must not be
+interpreted as a phase total: perf samples are nested/inclusive, the request is
+multi-threaded, and CPU time from parallel segment/search workers can exceed the
+critical-path endpoint time. The correct conclusion is therefore that the
+profile shows a measurable B consumer block, not that B necessarily costs
+0.46 ms of endpoint latency.
+
+For this workload `a < 1000` produces about 0.1% candidates (roughly 10,000 IDs
+over 10M); `b < 500000` examines those candidates and retains about half. The
+implementation in `FilterSortedNativeIdsByRawData` is already chunk-amortized:
+it validates that the input IDs are ascending/unique, groups them by raw-data
+chunk, performs one skip-index check and one `chunk_data` pin per touched chunk,
+then applies the scalar predicate and appends survivors to a reserved vector.
+It does not call `get_chunk_by_offset`/`PinCells` once per ID and does not build a
+second Dense bitmap. Consequently, the current code does not show the former
+per-ID pin/release defect.
+
+There are still bounded costs worth measuring before further optimization:
+
+* the input list is walked once for monotonicity validation and again for
+  chunk grouping/evaluation;
+* random A IDs touch many scalar chunks, so pins scale with touched chunks
+  rather than survivors; and
+* B uses a branchy scalar comparison and nullable-validity check for each
+  candidate, which is appropriate for an irregular sparse list but is not a
+  SIMD full-column pass.
+
+These effects can explain a nonzero B block, but the present profile alone does
+not justify a code change. The next causal check should add request/segment
+counters for input IDs, touched chunks, skip decisions, pins, output IDs, and
+timers around A, B, MVCC, and Cardinal search. If B scales with touched chunks
+rather than candidate count, a follow-up can cache chunk locations or combine
+validation with the grouping pass; if it scales linearly with candidates while
+remaining small in absolute time, the implementation is behaving as designed.
