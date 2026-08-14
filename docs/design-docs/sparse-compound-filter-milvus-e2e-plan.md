@@ -492,7 +492,7 @@ and +9.5%). Sparse won all 12 post-profile paired windows. The repeated P90
 separation is therefore not attributable to one isolated slow request, although
 the aggregate profile cannot identify the phase responsible for those tails.
 
-The module-level self-sample summary is:
+Selected representative self hotspots are:
 
 | Functional module | Dense self samples | Sparse self samples | Representative symbols |
 |---|---:|---:|---|
@@ -503,9 +503,35 @@ The module-level self-sample summary is:
 | Cardinal BF distance/search implementation | 1.07% | below 0.5% in the grouped report | `BruteForceSearchImpl`, `IndexImpl::Search` |
 | Milvus filter operator entry | 0.88% | included in the native-list call chain | `PhyFilterBitsNode::GetOutput` |
 
-The table uses symbol-grouped self samples, so values are not an endpoint phase
-breakdown and are not expected to sum to 100%. In particular, the inclusive
-`PhyFilterBitsNode`/driver percentages contain the child symbols shown above.
+This table is intentionally a selected-hotspot view, not a complete module
+breakdown: it uses symbol-grouped self samples and omits framework, allocator,
+kernel, and small template-specialized leaf symbols. Its rows therefore do not
+sum to 100%; the inclusive `PhyFilterBitsNode`/driver percentages also contain
+the child symbols shown above.
+
+As a completeness check, the folded stacks were assigned to one mutually
+exclusive *stack-label* category (specific filter/search symbols take priority;
+then Go service/framework, allocator, kernel, and other C++). This accounts for
+all sampled cycles, but is still CPU attribution rather than endpoint phase
+time:
+
+| Exclusive sampled-stack label | Dense | Sparse | Included work |
+|---|---:|---:|---|
+| Go service / framework | 44.39% | 51.68% | Proxy/QueryNode request processing, scheduling, Go runtime/GC, protobuf and metrics |
+| Scalar producer | 26.76% | - | Dense `ProcessDataChunks*` and SVE comparisons |
+| Native sparse producer (includes A SIMD scan) | - | 23.82% | `TryGetNativeValidIds`, including A's compare and list production |
+| Sparse B consumer | - | 7.89% | `TryFilterNativeValidIds`, chunk grouping/pin and B checks |
+| Cardinal vector search | 8.81% | 8.28% | BF dispatcher, scan and distance template leaves |
+| Dense/Cardinal bitmap materialization | 2.45% | - | bitmap operations and `BitCompressBatch64` |
+| Allocator / memory copy | 4.00% | 0.88% | malloc/free/jemalloc/memcpy and vector/bitmap storage work |
+| Kernel scheduling | 0.58% | 0.83% | futex, syscall and scheduler samples |
+| MVCC / visibility | 0.16% | 0.35% | MVCC/visibility call stacks |
+| Other C++ / library | 12.85% | 6.27% | small unclassified Core/Knowhere/library leaves |
+
+The large framework share is expected because `perf -p` samples the complete
+standalone process, including the request path above Core; it is not evidence
+that half of a request's endpoint wall time is spent in Go. The label table is
+useful only to show where the selected-hotspot table's omitted CPU samples went.
 The 128D profile supports a narrower statement than the earlier draft: Sparse
 removes the Dense-side bitmap compression work and replaces B's full-column
 execution with a measurable native-list consumer, while A still performs the
