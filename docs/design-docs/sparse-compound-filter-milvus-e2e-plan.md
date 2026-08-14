@@ -462,3 +462,57 @@ timers around A, B, MVCC, and Cardinal search. If B scales with touched chunks
 rather than candidate count, a follow-up can cache chunk locations or combine
 validation with the grouping pass; if it scales linearly with candidates while
 remaining small in absolute time, the implementation is behaving as designed.
+
+### 1M x 128D CPU attribution (2026-08-14)
+
+Because the preceding flamegraphs were collected on the 10M x 768D Cohere
+workload, they are not used as causal evidence for the 1M x 128D acceptance
+point. A separate clean pair was collected on the exact rebase-run workload:
+one sealed 1M-row segment, deterministic synthetic 128D vectors, L2/topK10,
+`ef=64`, `a < 1000 and b < 500000`, NQ=1/C1, expression cache disabled, and
+explicit BF. The collection was loaded before sampling and showed no
+`knowhere_build*` or compaction CPU during a six-sample, 60-second precheck.
+
+For each mode, 20 warmups were run outside the perf interval. Perf then sampled
+the same 50 fixed queries for 30 seconds (`sudo perf record -F 199 -g -p
+<milvus-pid>`), while the benchmark completed 150 windows (7,500 timed
+requests). A 12-window ABBA run was repeated immediately before and after the
+profile to check that the profile workload was not an anomalous latency regime:
+
+| Run | Dense mean | Sparse mean | Dense median | Sparse median | Dense P90 | Sparse P90 |
+|---|---:|---:|---:|---:|---:|---:|
+| ABBA before perf | 3.908 ms | 3.248 ms | 3.910 ms | 2.825 ms | 4.098 ms | 5.728 ms |
+| Dense perf workload | 4.119 ms | - | 4.096 ms | - | 4.336 ms | - |
+| Sparse perf workload | - | 3.332 ms | - | 2.901 ms | - | 5.934 ms |
+| ABBA after perf | 3.755 ms | 3.042 ms | 3.737 ms | 2.667 ms | 3.953 ms | 5.461 ms |
+
+The perf-window means are between the two surrounding ABBA runs (Dense is
+within +5.4% of the pre-run and +9.7% of the post-run; Sparse is within +2.6%
+and +9.5%). Sparse won all 12 post-profile paired windows. The repeated P90
+separation is therefore not attributable to one isolated slow request, although
+the aggregate profile cannot identify the phase responsible for those tails.
+
+The module-level self-sample summary is:
+
+| Functional module | Dense self samples | Sparse self samples | Representative symbols |
+|---|---:|---:|---|
+| A scalar producer / SIMD compare | 20.38% (`OpCompareValImpl` aggregate) | 12.41% (`OpCompareValImpl` aggregate) | `PhyUnaryRangeFilterExpr::TryGetNativeValidIds` on Sparse; `ProcessDataChunks*`/`OpCompareValImpl` on Dense |
+| Dense bitmap / Cardinal bitmap compression | 1.50% | not a primary path | `FilterCheckerView::BitCompressBatch64` |
+| Sparse B consumer | not present | 7.60% | `PhyUnaryRangeFilterExpr::TryFilterNativeValidIds` |
+| Cardinal BF valid-ID scan | 0.51% | 0.67% | `ScanRangeByValidIdsBatch4` |
+| Cardinal BF distance/search implementation | 1.07% | below 0.5% in the grouped report | `BruteForceSearchImpl`, `IndexImpl::Search` |
+| Milvus filter operator entry | 0.88% | included in the native-list call chain | `PhyFilterBitsNode::GetOutput` |
+
+The table uses symbol-grouped self samples, so values are not an endpoint phase
+breakdown and are not expected to sum to 100%. In particular, the inclusive
+`PhyFilterBitsNode`/driver percentages contain the child symbols shown above.
+The 128D profile supports a narrower statement than the earlier draft: Sparse
+removes the Dense-side bitmap compression work and replaces B's full-column
+execution with a measurable native-list consumer, while A still performs the
+full SIMD scan. It does not by itself prove the complete endpoint delta or
+explain the P90 tail; those require request-level phase timers or slow-request
+traces.
+
+Raw 128D artifacts: `/tmp/knowpr1732-sparse128-perf-20260814/`, including
+`dense.perf.data`, `sparse.perf.data`, `dense.flame.svg`, `sparse.flame.svg`,
+the folded stacks, and the 7,500-request workload logs.
