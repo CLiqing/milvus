@@ -197,6 +197,16 @@ std::map<std::string, std::string> randomSampleLatencyLabels{
     {"type", "random_sample_latency"}};
 std::map<std::string, std::string> optimizeExprLatencyLabels{
     {"type", "optimize_expr_latency"}};
+std::map<std::string, std::string> bValidateLatencyLabels{
+    {"type", "b_validate"}};
+std::map<std::string, std::string> bGroupLatencyLabels{
+    {"type", "b_group"}};
+std::map<std::string, std::string> bSkipLatencyLabels{
+    {"type", "b_skip"}};
+std::map<std::string, std::string> bPinLatencyLabels{
+    {"type", "b_pin"}};
+std::map<std::string, std::string> bReadLatencyLabels{
+    {"type", "b_read"}};
 std::map<std::string, std::string> filterRatioLabels{
     {"type", "expr_filter_ratio"}};
 std::map<std::string, std::string> gisCoarseRatioLabels{
@@ -238,6 +248,21 @@ DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_get_target_entry_latency,
 DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_random_sample,
                             internal_core_search_latency,
                             randomSampleLatencyLabels)
+DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_validate,
+                            internal_core_search_latency,
+                            bValidateLatencyLabels)
+DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_group,
+                            internal_core_search_latency,
+                            bGroupLatencyLabels)
+DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_skip,
+                            internal_core_search_latency,
+                            bSkipLatencyLabels)
+DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_pin,
+                            internal_core_search_latency,
+                            bPinLatencyLabels)
+DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_read,
+                            internal_core_search_latency,
+                            bReadLatencyLabels)
 DEFINE_PROMETHEUS_HISTOGRAM(internal_core_optimize_expr_latency,
                             internal_core_search_latency,
                             optimizeExprLatencyLabels)

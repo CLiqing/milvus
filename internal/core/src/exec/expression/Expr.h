@@ -40,6 +40,7 @@
 #include "index/Index.h"
 #include "index/JsonFlatIndex.h"
 #include "log/Log.h"
+#include "monitor/Monitor.h"
 #include "query/PlanProto.h"
 #include "segcore/SegmentSealed.h"
 #include "segcore/SegmentInterface.h"
@@ -510,6 +511,17 @@ class SegmentExpr : public Expr {
             return output;
         }
 
+        // Per-phase timing to attribute the Sparse B-consumer P90 tail.
+        // Observed in microseconds; the bucket boundaries of the shared
+        // internal_core_search_latency family (1,2,4,...,65536) give ~us
+        // resolution up to ~65ms.
+        using clock = std::chrono::steady_clock;
+        const auto elapsed_us = [](clock::time_point from,
+                                   clock::time_point to) {
+            return std::chrono::duration<double, std::micro>(to - from).count();
+        };
+
+        const auto t_validate_begin = clock::now();
         int32_t previous = -1;
         for (const auto id : *input) {
             if (id < 0 || id >= active_count_ || id <= previous) {
@@ -517,9 +529,18 @@ class SegmentExpr : public Expr {
             }
             previous = id;
         }
+        const auto t_validate_end = clock::now();
+        milvus::monitor::internal_core_search_latency_b_validate.Observe(
+            elapsed_us(t_validate_begin, t_validate_end));
+
+        double group_us = 0;
+        double skip_us = 0;
+        double pin_us = 0;
+        double read_us = 0;
 
         size_t begin = 0;
         while (begin < input->size()) {
+            const auto t_group_begin = clock::now();
             const int64_t first_id = (*input)[begin];
             int64_t chunk_id = 0;
             int64_t chunk_begin = 0;
@@ -538,14 +559,50 @@ class SegmentExpr : public Expr {
             while (end < input->size() && (*input)[end] < chunk_end) {
                 ++end;
             }
+            const auto t_group_end = clock::now();
+            group_us += elapsed_us(t_group_begin, t_group_end);
 
-            if (!can_skip(chunk_id)) {
+            const auto t_skip_begin = clock::now();
+            const bool skip = can_skip(chunk_id);
+            const auto t_skip_end = clock::now();
+            skip_us += elapsed_us(t_skip_begin, t_skip_end);
+
+            if (!skip) {
+                const auto t_pin_begin = clock::now();
                 auto pinned =
                     segment_->chunk_data<T>(op_ctx_, field_id_, chunk_id);
+                const auto t_pin_end = clock::now();
+                pin_us += elapsed_us(t_pin_begin, t_pin_end);
+
                 const auto chunk = pinned.get();
                 const T* data = chunk.data();
                 const bool* valid = chunk.valid_data();
+
+                const auto t_read_begin = clock::now();
+                // Software prefetch for the scattered scalar reads.  The
+                // candidate offsets within a chunk are ascending but sparse,
+                // so the data[local_offset] and valid[local_offset] loads are
+                // latency-bound DRAM/TLB misses.  Issue a non-blocking prefetch
+                // for the candidate kPrefetchAhead positions ahead to overlap
+                // those latencies.
+                constexpr size_t kPrefetchAhead = 16;
+                auto prefetch_for = [&](size_t idx) {
+                    const auto off = static_cast<int64_t>((*input)[idx]) -
+                                     chunk_begin;
+                    __builtin_prefetch(data + off, 0, 1);
+                    if (valid != nullptr) {
+                        __builtin_prefetch(valid + off, 0, 1);
+                    }
+                };
+                for (size_t i = begin; i < end && i < begin + kPrefetchAhead;
+                     ++i) {
+                    prefetch_for(i);
+                }
                 for (size_t i = begin; i < end; ++i) {
+                    const size_t pf = i + kPrefetchAhead;
+                    if (pf < end) {
+                        prefetch_for(pf);
+                    }
                     const auto local_offset =
                         static_cast<int64_t>((*input)[i]) - chunk_begin;
                     if ((valid == nullptr || valid[local_offset]) &&
@@ -553,9 +610,16 @@ class SegmentExpr : public Expr {
                         output->push_back((*input)[i]);
                     }
                 }
+                const auto t_read_end = clock::now();
+                read_us += elapsed_us(t_read_begin, t_read_end);
             }
             begin = end;
         }
+
+        milvus::monitor::internal_core_search_latency_b_group.Observe(group_us);
+        milvus::monitor::internal_core_search_latency_b_skip.Observe(skip_us);
+        milvus::monitor::internal_core_search_latency_b_pin.Observe(pin_us);
+        milvus::monitor::internal_core_search_latency_b_read.Observe(read_us);
         return output;
     }
 

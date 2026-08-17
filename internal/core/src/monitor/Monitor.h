@@ -67,6 +67,14 @@ DECLARE_PROMETHEUS_HISTOGRAM(internal_core_retrieve_get_target_entry_latency);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_get_target_entry_latency);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_random_sample);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_core_optimize_expr_latency);
+// Per-phase latency of the Sparse B consumer (FilterSortedNativeIdsByRawData),
+// in microseconds.  Used to attribute the Sparse P90 tail to a specific
+// sub-operation (validation / grouping / skip-index / chunk pin / read).
+DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_validate);
+DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_group);
+DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_skip);
+DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_pin);
+DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_read);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_core_expr_filter_ratio);
 // GIS split-fusion pruning ratios, emitted once per completed GIS group per
 // segment query when queryNode.segcore.enableGISSplitFusion is on (no split
