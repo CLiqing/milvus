@@ -80,10 +80,12 @@ PhyBinaryRangeFilterExpr::TryFilterNativeValidIds(
         return nullptr;
     }
 
-    EnsureExecPathDetermined();
-    if (exec_path_ != ExprExecPath::RawData) {
-        return nullptr;
-    }
+    // The Sparse consumer reads raw scalar data directly
+    // (FilterSortedNativeIdsByRawData -> chunk_data), so it works regardless
+    // of whether this expression would have chosen the RawData or ScalarIndex
+    // execution path as a producer.  The execution path is irrelevant here and
+    // must not gate the consumer; doing so breaks compound filters whose
+    // reordered second predicate happens to carry a scalar index.
 
     const auto lower = GetValueFromProto<int64_t>(expr_->lower_val_);
     const auto upper = GetValueFromProto<int64_t>(expr_->upper_val_);

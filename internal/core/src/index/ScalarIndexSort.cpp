@@ -743,6 +743,11 @@ ScalarIndexSort<T>::BuildValidIdsFromBounds(const IndexStructure<T>* lb,
         }
         ids->push_back(static_cast<int32_t>(it->idx_));
     }
+    // The sort index is ordered by value, so [lb, ub) yields row offsets in
+    // value order.  The sparse valid-ID consumer (FilterSortedNativeIdsByRawData)
+    // requires ascending, unique segment offsets to amortize chunk pinning and
+    // group candidates by chunk; sort the offsets into ascending order here.
+    std::sort(ids->begin(), ids->end());
     return ids;
 }
 
