@@ -55,9 +55,26 @@ Cardinal 路由（`switch_strategy.h:194`）：`filter_rate >= 0.985`（valid �
 | 步骤 | 内容 | 状态 |
 |---|---|---|
 | **Step 1** | 表示与调度解耦：引入 `filter_result_representation` 控制（dense/sparse），与 `bf_filter_scan_mode` 拆分，加决策点骨架 | **已完成** |
-| Step 2 | producer 覆盖补齐：bitmap 等值（已通）、sort range（修 value-order）、raw-data（已通）| 待办 |
+| **Step 2** | producer 覆盖补齐：bitmap 等值（已通）、sort range（修 value-order）、raw-data（已通）| **已完成** |
 | Step 3 | 决策策略 A/B：阈值 / cost model，跑完整收益矩阵 | 待办 |
 | Step 4 | （可选）Graph/IVF 消费端（Bloom+Flat）| 待办 |
+
+### Step 2 实现说明（已完成）
+
+**改动 1：sort range 的 value-order 修复。**
+
+`ScalarIndexSort::BuildValidIdsFromBounds`（`index/ScalarIndexSort.cpp`）：sort index 按 value 排序，`[lb, ub)` 迭代产出的是 value 序的 offset；sparse 消费者 `FilterSortedNativeIdsByRawData` 的"分 chunk 分组"优化要求 offset 升序（否则逐 ID pin，即之前的 225ms 尾巴）。加 `std::sort(ids->begin(), ids->end())` 把 offset 排序成升序（V 小时 O(V log V) 可接受）。
+
+**改动 2：去掉消费者 `exec_path_ != RawData` 的顺序门槛。**
+
+`UnaryExpr.cpp` / `BinaryRangeExpr.cpp` 的 `TryFilterNativeValidIds` 原先有 `EnsureExecPathDetermined(); if (exec_path_ != RawData) return nullptr;`。但消费者实际读的是 raw data（`FilterSortedNativeIdsByRawData` → `chunk_data`），根本不用索引；这个门槛导致"带索引的谓词被重排序成第二个谓词时，消费者拒绝消费 sparse"。删除后，消费者无条件读 raw data，谓词有没有索引、排什么位置都不影响（`FilterSortedNativeIdsByRawData` 内部有 `HasFieldData` 守卫兜底 fallback dense）。
+
+**验证（隔离实例）：**
+
+- sort 集合（`a` 有 STL_SORT 索引）：
+  - `a<1000 and b<500000`：20 查询 dense/sparse topK 完全一致（之前间歇 10–20% 报错，现已 0 失败）；mean 2.94 vs 3.53ms（-16.6%）。
+  - `a<1000` 单谓词：dense/sparse 一致；sparse mean 2.35 vs 2.52ms（-6.8%）、p90 2.70 vs 2.89ms——单谓词 sort range 有明确收益（省掉 dense 的 /64 枚举）。
+- raw-data 集合（无索引）：回归验证 15 查询 0 失败 0 不一致，未破坏原有行为。
 
 ### Step 1 实现说明（已完成）
 
