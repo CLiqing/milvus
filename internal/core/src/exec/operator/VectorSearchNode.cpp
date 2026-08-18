@@ -126,10 +126,8 @@ PhyVectorSearchNode::GetOutput() {
     // Normal path: build BitsetView from the bitmap produced upstream.
     milvus::BitsetView search_view;
     int64_t data_cnt = active_count_;
-    const auto bf_filter_scan_mode = search_info_.search_params_.value(
-        "bf_filter_scan_mode", std::string{"auto"});
     const bool valid_ids_per_query =
-        bf_filter_scan_mode == "valid_ids_per_query";
+        search_info_.UseSparseFilterRepresentation();
 
     if (!ph.element_level_ && query_context_->bitset_is_element_level()) {
         ThrowInfo(ExprInvalid,

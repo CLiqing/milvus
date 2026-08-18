@@ -158,12 +158,17 @@ PhyFilterBitsNode::GetOutput() {
                   "valid_ids_per_query");
     }
 
+    // The filter-result representation is decided once here and shared by the
+    // cache gate and the native valid-ID path below.
+    const bool use_sparse_representation =
+        search_info.UseSparseFilterRepresentation();
+
     // Cache read: Stage 2 of two-stage search reuses the bitset cached by Stage 1.
     // Cache lives in the process-level ExprResCacheManager keyed by
     // (segment_id, FilterBitsNode signature + dynamic filter context), so
     // cross-query reuse is automatic only when the effective predicate matches.
     auto* cache_segment = query_context_->get_segment();
-    const bool can_use_cache = scan_mode != "valid_ids_per_query" &&
+    const bool can_use_cache = !use_sparse_representation &&
                                enable_expr_cache_ && !expr_cache_key_.empty() &&
                                cache_segment != nullptr &&
                                cache_segment->type() == SegmentType::Sealed &&
@@ -192,7 +197,7 @@ PhyFilterBitsNode::GetOutput() {
     // retain that list across its second scalar predicate.  MvccNode
     // subsequently applies timestamp/delete visibility; every unsupported
     // expression keeps the dense path below.
-    const bool native_list_mode = scan_mode == "valid_ids_per_query";
+    const bool native_list_mode = use_sparse_representation;
     const bool native_list_eligible = native_list_mode &&
                                       exprs_->size() == 1 &&
                                       cache_segment != nullptr &&

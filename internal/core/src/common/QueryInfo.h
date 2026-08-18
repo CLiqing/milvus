@@ -91,6 +91,24 @@ struct SearchInfo {
     has_group_by() const {
         return !group_by_field_ids_.empty();
     }
+
+    // The filter-result representation the search wants the scalar filter to
+    // produce.  `sparse` means the filter emits a query-owned valid-ID list
+    // (consumed by the Cardinal BF valid-ID path) instead of the Dense
+    // filtered bitmap.  The legacy `bf_filter_scan_mode == "valid_ids_per_query"`
+    // experiment knob implies the same representation, kept for compatibility.
+    bool
+    UseSparseFilterRepresentation() const {
+        if (!search_params_.is_object()) {
+            return false;
+        }
+        if (search_params_.value("filter_result_representation",
+                                 std::string{"auto"}) == "sparse") {
+            return true;
+        }
+        return search_params_.value("bf_filter_scan_mode", std::string{"auto"}) ==
+               "valid_ids_per_query";
+    }
 };
 
 using SearchInfoPtr = std::shared_ptr<SearchInfo>;

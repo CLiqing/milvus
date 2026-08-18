@@ -77,15 +77,9 @@ ExecPlanNodeVisitor::ExecuteTask(
                 // Retrieve plans do not carry vector-search parameters.  Keep
                 // the normal bitmap result path usable for them instead of
                 // asking nlohmann::json::value() to read a null JSON value.
-                const auto& search_params =
-                    query_context->get_search_info().search_params_;
-                const auto bf_filter_scan_mode =
-                    search_params.is_object()
-                        ? search_params.value("bf_filter_scan_mode",
-                                              std::string{"auto"})
-                        : std::string{"auto"};
+                const auto& search_info = query_context->get_search_info();
                 const bool native_valid_ids =
-                    bf_filter_scan_mode == "valid_ids_per_query";
+                    search_info.UseSparseFilterRepresentation();
                 if (first_column->IsBitmap() && !native_valid_ids) {
                     if (query_context->bitset_is_element_level()) {
                         Assert(processed_num ==
