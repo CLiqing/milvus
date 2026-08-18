@@ -126,8 +126,29 @@ PhyVectorSearchNode::GetOutput() {
     // Normal path: build BitsetView from the bitmap produced upstream.
     milvus::BitsetView search_view;
     int64_t data_cnt = active_count_;
-    const bool valid_ids_per_query =
-        search_info_.UseSparseFilterRepresentation();
+
+    // The Sparse representation is a runtime preference: the filter may fall
+    // back to a Dense bitmap when the valid-ID list exceeds the cap or the
+    // producer is unsupported.  The actual representation is carried by the
+    // valid-ID payload, so decide from it (not from the search param) and align
+    // the Cardinal scan mode accordingly.  The legacy
+    // bf_filter_scan_mode == "valid_ids_per_query" remains a hard requirement
+    // and still throws when no payload was produced.
+    auto valid_id_payload = query_context_->get_valid_id_payload();
+    const bool hard_valid_ids =
+        search_info_.search_params_.value("bf_filter_scan_mode",
+                                          std::string{"auto"}) ==
+        "valid_ids_per_query";
+    if (hard_valid_ids && valid_id_payload == nullptr) {
+        ThrowInfo(ConfigInvalid,
+                  "native valid-ID BF mode requires a matching native "
+                  "scalar-index payload");
+    }
+    const bool valid_ids_per_query = valid_id_payload != nullptr;
+    if (valid_ids_per_query) {
+        search_info_.search_params_["bf_filter_scan_mode"] =
+            "valid_ids_per_query";
+    }
 
     if (!ph.element_level_ && query_context_->bitset_is_element_level()) {
         ThrowInfo(ExprInvalid,
@@ -148,17 +169,11 @@ PhyVectorSearchNode::GetOutput() {
         // be applied to every query in the grouped placeholder batch.  The
         // benchmark still disables grouping when it wants to exclude this
         // payload reuse from a representation-only measurement.
-        auto payload = query_context_->get_valid_id_payload();
-        if (payload == nullptr) {
-            ThrowInfo(ConfigInvalid,
-                      "native valid-ID BF mode requires a matching native "
-                      "scalar-index payload");
-        }
-        AssertInfo(payload->universe == active_count_,
+        AssertInfo(valid_id_payload->universe == active_count_,
                    "valid-ID payload universe {} does not match active row count {}",
-                   payload->universe,
+                   valid_id_payload->universe,
                    active_count_);
-        auto native_ids = std::move(payload->ids);
+        auto native_ids = std::move(valid_id_payload->ids);
         const auto valid_count = native_ids->size();
         AssertInfo(valid_count <= static_cast<uint64_t>(active_count_),
                    "native valid-ID payload cardinality {} exceeds active "

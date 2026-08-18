@@ -32,6 +32,7 @@
 #include "Meta.h"
 #include "bitset/bitset.h"
 #include "common/Array.h"
+#include "common/Consts.h"
 #include "common/EasyAssert.h"
 #include "common/FastMem.h"
 #include "common/FieldDataInterface.h"
@@ -733,6 +734,13 @@ ScalarIndexSort<T>::BuildValidIdsFromBounds(const IndexStructure<T>* lb,
         static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
     if (!is_built_ || is_nested_index_ ||
         static_cast<uint64_t>(total_num_rows_) > kMaxCardinalId) {
+        return nullptr;
+    }
+    // The exact valid count is known for free here (ub - lb).  If it exceeds
+    // the sparse-list cap, give up the Sparse representation so the caller
+    // keeps the Dense bitmap; building a huge valid-ID list would be worse
+    // than the Dense path.
+    if (static_cast<size_t>(ub - lb) > DEFAULT_SPARSE_LIST_CAP) {
         return nullptr;
     }
     auto ids = std::make_shared<std::vector<int32_t>>();

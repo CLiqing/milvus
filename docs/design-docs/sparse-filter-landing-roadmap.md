@@ -76,6 +76,82 @@ Cardinal 路由（`switch_strategy.h:194`）：`filter_rate >= 0.985`（valid �
   - `a<1000` 单谓词：dense/sparse 一致；sparse mean 2.35 vs 2.52ms（-6.8%）、p90 2.70 vs 2.89ms——单谓词 sort range 有明确收益（省掉 dense 的 /64 枚举）。
 - raw-data 集合（无索引）：回归验证 15 查询 0 失败 0 不一致，未破坏原有行为。
 
+### Step 3 决策策略（proposal）
+
+决策点：`ShouldUseSparse(producer_type, V, N) -> bool`，决定过滤结果用 sparse list 还是 dense bitmap。
+
+**第一层（机制）：producer 能否产出 sparse**
+
+| producer | V 是否精确已知 | 产出 sparse 的代价 |
+|---|---|---|
+| bitmap 等值 | ✅ `cardinality()` O(1) | borrow 现成 Roaring（升序），几乎免费 |
+| sort range | ✅ `ub - lb` O(1) | borrow + O(V log V) 排序（升序）|
+| raw-data 扫描 | ❌ 扫完才知道 | scan + ctz + push_back（比 dense 略贵）|
+
+**第二层（策略）：是否该走 sparse**
+
+- V 已知的 producer：`V/N <= threshold` → sparse，否则 dense。**精确阈值，无估计误差。**
+- V 未知的 producer（raw-data）：默认 dense；若要支持，用 cap+fallback（前 X 个 valid 建 list，超 X 回退 dense），但单趟双输出成本偏高，先不做。
+
+**threshold 的确定（两个约束 + cost model）**
+
+1. 上界约束：`threshold < 1.5%`（Cardinal `filter_rate >= 0.985` 的 BF 切换点），保证 sparse ⟹ BF，无 fallback。
+2. 收益交叉点（cost model）：sparse 的收益是省掉 dense 的 N/8 bitmap 物化 + N/64 枚举；sparse 的代价是 V log V 排序（sort）或 V 次散布读。对 borrow producer，交叉点约 `V/N ≈ c_enum / (64 · c_read) ≈ 0.1%`。
+3. 实测调优：默认 `threshold = 0.1%`（与当前实验 sweet spot V=1000/1M 一致），跑收益矩阵（producer × V × 谓词形态）微调。
+
+**cost model（单谓词 borrow producer 的粗略式）**
+
+- dense ≈ N·c_scan + (N/8) 物化 + (N/64)·c_enum
+- sparse ≈ borrow(≈0) + V·logV 排序 + V·c_read
+- 交叉点 ≈ c_enum / (64·c_read)，代入量级得 ~0.1%。
+
+**P90 备注**：决策只看 mean/QPS（既定口径），但 sparse 的 `b_read` 重尾（prefetch 后 ~1ms）会让 P90 劣化，尤其小 V 时更明显——落地时作为已知副作用记录，不作为决策项。
+
+### Step 3 统一 cap+fallback（选定方案）
+
+在"精确阈值（V 已知）/ 保守 dense（V 未知）"之外，采纳统一方案：**所有 producer 先走 sparse，list 一旦超过 cap（默认 1000）就回退 dense**。这样 raw-data（V 未知）也能统一参与，不必预先知道 V。
+
+**三种实现方式的开销对比**（决定实现形态）：
+
+| 方式 | 描述 | 问题 |
+|---|---|---|
+| (a) 天真双输出 | 同时建 list + dense，最后二选一 | low-V 场景也付 dense 成本，吃掉 sparse 收益 |
+| (b) 天真 lazy-switch | 先 ctz+push_back，超 cap 改 set_bit | ctz 是 O(V)，fallback 时 V 大则不可忽略 |
+| (c) **lazy-switch + early-break** | 到 cap 立即停止 ctz、改 direct-SIMD-store | 额外 ~1000 ctz/push_back/set，几 us，可忽略 |
+
+选 (c)。实现要点：
+
+- **sort/bitmap（V 已知）**：`if (V > cap) return nullptr`（O(1) 精确，无重扫）。
+- **raw-data（V 未知）**：scan + ctz + push_back，`ids->size() >= cap` 时立即 `return nullptr`（fallback dense，重扫）。
+
+注：raw-data 的 `return nullptr` 会触发 dense 重扫，代价 = sparse 扫到溢出点为止（early-break 使其只扫到第 cap 个 valid ID 处）+ 一次完整 dense 扫。对 V≫cap 溢出点在很前面，重扫代价≈完整 dense 扫（≈0）；对 V≈cap 溢出点在后面，重扫代价≈一次完整 scan（~0.3–0.5ms）。**这是当前 re-scan 版的固有代价，用 A/B 实测；若不可接受再升级为单趟 switch（不重扫）**。
+
+**cap 参数**：默认 1000，先做成常量 `kSparseListCap`（`common/Consts.h`），后续接 querynode config 可调。
+
+### Step 3 实现结果（已完成，cap+fallback + soft 语义）
+
+**改动：**
+
+- `common/Consts.h`：`DEFAULT_SPARSE_LIST_CAP = 1000`。
+- `ScalarIndexSort::BuildValidIdsFromBounds` / `BitmapIndex::MaterializeValidIds`：`if (V > cap) return nullptr`（V 免费已知，O(1) 精确）。
+- `UnaryExpr` RawData 生产者：ctz+push_back 循环里 `ids->size() > cap` 时立即 `return nullptr`（early-break）。
+- **soft 语义**：`filter_result_representation=sparse` 从"硬性强制"改为"偏好"——`PlanProto.cpp` 不再把它翻译成 `bf_filter_scan_mode=valid_ids_per_query`；`VectorSearchNode` 改为**看实际 payload**（有 payload → sparse + 把 Cardinal scan mode 设成 `valid_ids_per_query`；无 payload → dense + `auto`）。legacy `bf_filter_scan_mode=valid_ids_per_query` 仍是硬性要求，无 payload 时抛错。
+
+**A/B 结果（隔离实例，cap=1000）：**
+
+| 场景 | 正确性 | overhead（vs 对应 baseline）|
+|---|---|---|
+| sort V=100（sparse）| dense==sparse ✓ | +7.3% mean |
+| sort V=1000（sparse）| dense==sparse ✓ | +6.2% mean |
+| sort V=5000（fallback dense）| ==auto ✓ | **-0.0%** |
+| sort V=10000（fallback dense）| ==auto ✓ | **+2.6%** |
+| raw V=100/1000（sparse）| dense==sparse ✓ | +12~15% mean |
+| raw V=5000/10000（fallback dense）| ==auto ✓ | **-1.7~-3.5%** |
+
+**结论**：cap+fallback 的**回退开销实测 ≈ 0**（fallback 场景 delta 在 -3.5% ~ +2.6%，即噪声范围），印证了"early-break 使 wasted work 被 cap 限制在 1000 量级"的判断。raw-data 也因此能统一走"先 sparse、超 cap 回退"，不必预先知道 V。
+
+**附带发现（独立于本改动）**：`bf_filter_scan_mode=auto`（dense，Cardinal `ScanRangeFilter` 全扫+bitset 判定）与 `dense_per_query`/sparse（按 valid-ID 枚举）在 V=1000 时 topK 不一致（auto 漏了 `a=949` 的 `id=163650`，其 dist 15.54 本应 rank2）。即 `auto` 的 BF scan-filter 与 valid-ID 枚举结果不同，疑似 Cardinal 既有 bug 或扫描模式差异，需单独排查，与 cap+fallback 无关。
+
 ### Step 1 实现说明（已完成）
 
 改动文件：

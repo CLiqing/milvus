@@ -98,15 +98,13 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
     search_info.round_decimal_ = query_info_proto.round_decimal();
     search_info.search_params_ =
         nlohmann::json::parse(query_info_proto.search_params());
-    // `filter_result_representation=sparse` is the filter-level representation
-    // knob; Cardinal only knows the per-query BF scan mode, so translate it to
-    // the existing valid-id BF mode.  This keeps the representation decision
-    // (Milvus) separate from the scan-mode dispatch (Cardinal).
-    if (search_info.search_params_.value("filter_result_representation",
-                                         std::string{"auto"}) == "sparse") {
-        search_info.search_params_["bf_filter_scan_mode"] =
-            "valid_ids_per_query";
-    }
+    // `filter_result_representation=sparse` is a runtime *preference*: the
+    // filter tries to emit a Sparse valid-ID list and falls back to Dense when
+    // the list would exceed the cap or the producer is unsupported.  The
+    // actual representation is decided by the filter and carried by the
+    // valid-ID payload, and VectorSearchNode aligns the Cardinal scan mode
+    // (valid_ids_per_query vs auto) to it at runtime, so it is NOT translated
+    // into a hard bf_filter_scan_mode here.
     search_info.materialized_view_involved =
         query_info_proto.materialized_view_involved();
     // currently, iterative filter does not support range search

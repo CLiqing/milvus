@@ -432,6 +432,12 @@ BitmapIndex<T>::MaterializeValidIds(const roaring_bitmap_t* values) const {
         return nullptr;
     }
 
+    // The exact posting cardinality is known for free.  If it exceeds the
+    // sparse-list cap, keep the Dense path instead of decoding a large list.
+    if (roaring_bitmap_get_cardinality(values) > DEFAULT_SPARSE_LIST_CAP) {
+        return nullptr;
+    }
+
     auto ids = std::make_shared<std::vector<int32_t>>();
     ids->reserve(roaring_bitmap_get_cardinality(values));
 

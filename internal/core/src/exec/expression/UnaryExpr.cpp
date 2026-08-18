@@ -499,6 +499,13 @@ PhyUnaryRangeFilterExpr::TryGetNativeValidIds() {
                         (valid == nullptr || valid[local_id])) {
                         ids->push_back(
                             static_cast<int32_t>(global_offset + local_id));
+                        // Early-break the Sparse representation once the list
+                        // exceeds the cap.  Returning nullptr asks the caller
+                        // to keep the Dense filtered bitmap; the scan stops
+                        // here so the wasted work is bounded by the cap.
+                        if (ids->size() > DEFAULT_SPARSE_LIST_CAP) {
+                            return nullptr;
+                        }
                     }
                     matches &= matches - 1;
                 }
