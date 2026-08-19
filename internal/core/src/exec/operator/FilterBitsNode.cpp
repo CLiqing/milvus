@@ -658,6 +658,21 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(
         return;
     }
 
+    // A LIKE predicate requires raw varchar values.  A sealed segment backed
+    // by STL_SORT can expose dictionary IDs for equality, inequality and term
+    // predicates while not exposing the raw string chunk view needed by LIKE.
+    // Do not defer that availability check until VectorSearchNode: FilterBits
+    // has already skipped materializing the normal bitmap by then, so failure
+    // there would turn an optional hint into a request error.  Phase 1 must
+    // always preserve correctness by falling back to the ordinary filter.
+    if (predicate->op_ == CardinalDownpushPredicateOp::StringLikeMatch) {
+        LOG_DEBUG(
+            "downpush fallback: LIKE needs a raw varchar value source that "
+            "is unavailable for some sealed scalar-index layouts");
+        fallback("unsupported_predicate");
+        return;
+    }
+
     std::vector<expr::TypedExprPtr> filters{filter.filter()};
     ExprSet sample_exprs(filters, exec_context);
     auto estimated_filtered_out_count = EstimateFilteredOutCountBySample(
