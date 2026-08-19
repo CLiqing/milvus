@@ -138,13 +138,16 @@ std::vector<ExprPtr>
 CompileExpressions(const std::vector<expr::TypedExprPtr>& sources,
                    ExecContext* context,
                    const std::unordered_set<std::string>& flatten_candidate,
-                   bool enable_constant_folding) {
+                   bool enable_constant_folding,
+                   bool inject_entity_ttl) {
     std::vector<std::shared_ptr<Expr>> exprs;
     exprs.reserve(sources.size());
 
     // Create TTL filter expression if schema has TTL field
-    auto ttl_expr =
-        CreateTTLFieldFilterExpression(context->get_query_context());
+    auto ttl_expr = inject_entity_ttl
+                        ? CreateTTLFieldFilterExpression(
+                              context->get_query_context())
+                        : nullptr;
 
     // Merge TTL expression with the first source expression if TTL exists
     for (size_t i = 0; i < sources.size(); ++i) {

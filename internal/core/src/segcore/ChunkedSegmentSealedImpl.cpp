@@ -61,6 +61,7 @@
 #include "common/ChunkWriter.h"
 #include "common/Common.h"
 #include "common/Consts.h"
+#include "common/Downpush.h"
 #include "common/EasyAssert.h"
 #include "common/FieldMeta.h"
 #include "common/GeometryCache.h"
@@ -3985,6 +3986,20 @@ ChunkedSegmentSealedImpl::HasIndex(FieldId field_id) const {
     std::shared_lock lck(mutex_);
     return get_bit(index_ready_bitset_, field_id) ||
            get_bit(binlog_index_bitset_, field_id);
+}
+
+bool
+ChunkedSegmentSealedImpl::SupportsDownpush(FieldId field_id) const {
+    // Fusion only applies to a real, loaded graph index; brute-force and
+    // binlog temp-index searches have no graph to fuse into.
+    if (!vector_indexings_.is_ready(field_id)) {
+        return false;
+    }
+    if (col_index_meta_ == nullptr || !col_index_meta_->HasField(field_id)) {
+        return false;
+    }
+    auto index_type = col_index_meta_->GetFieldIndexMeta(field_id).GetIndexType();
+    return IsDownpushSupportedIndexType(index_type);
 }
 
 bool

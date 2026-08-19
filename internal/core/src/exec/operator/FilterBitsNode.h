@@ -57,6 +57,9 @@ class PhyFilterBitsNode : public Operator {
     Close() override {
         Operator::Close();
         exprs_->Clear();
+        if (ttl_exprs_ != nullptr) {
+            ttl_exprs_->Clear();
+        }
     }
 
     BlockingReason
@@ -73,7 +76,15 @@ class PhyFilterBitsNode : public Operator {
     }
 
  private:
+    void
+    TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
+                              ExecContext* exec_context);
+
     std::unique_ptr<ExprSet> exprs_;
+    // entity TTL predicate, compiled separately from exprs_ so the downpush
+    // path can keep TTL as a normal logical-space bitset while deferring only
+    // the user predicate into the vector index.
+    std::unique_ptr<ExprSet> ttl_exprs_;
     QueryContext* query_context_;
     int64_t num_processed_rows_;
     int64_t need_process_rows_;

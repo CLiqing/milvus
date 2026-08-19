@@ -33,6 +33,7 @@
 #include "exec/expression/ExprCache.h"
 #include "expr/ITypeExpr.h"
 #include "fmt/core.h"
+#include "log/Log.h"
 #include "monitor/Monitor.h"
 #include "plan/PlanNode.h"
 #include "prometheus/histogram.h"
@@ -532,17 +533,6 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
     return std::nullopt;
 }
 
-bool
-HasEntityTTL(QueryContext* query_context) {
-    if (query_context == nullptr || query_context->get_segment() == nullptr) {
-        return false;
-    }
-    return query_context->get_segment()
-        ->get_schema()
-        .get_ttl_field_id()
-        .has_value();
-}
-
 std::optional<int64_t>
 EstimateFilteredOutCountBySample(QueryContext* query_context,
                                  ExprSet* exprs,
@@ -604,54 +594,98 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     num_processed_rows_ = 0;
 
     if (query_context_->get_search_info().cardinal_downpush_execution) {
-        // Downpush v1 intentionally moves only the user scalar predicate into
-        // Cardinal. Entity TTL is injected by ExprSet compilation, so skipping
-        // normal ExprSet materialization would bypass TTL. Treat it as an
-        // unsupported v1 shape instead of silently returning wrong results.
-        if (HasEntityTTL(query_context_)) {
-            ThrowInfo(Unsupported, "downpush hint does not support entity TTL");
-        }
-
-        auto predicate = TryCompileCardinalDownpushPredicate(filter->filter(),
-                                                             query_context_);
-        if (!predicate.has_value()) {
-            ThrowInfo(Unsupported,
-                      "downpush hint only supports sealed scalar "
-                      "int/float/varchar range, term, varchar match, "
-                      "arithmetic less-than, and int mod predicates in v1");
-        }
-
-        std::optional<int64_t> estimated_filtered_out_count;
-        ExprSet sample_exprs(filters, exec_context);
-        estimated_filtered_out_count = EstimateFilteredOutCountBySample(
-            query_context_, &sample_exprs, exec_context);
-        if (!estimated_filtered_out_count.has_value()) {
-            ThrowInfo(Unsupported,
-                      "downpush hint failed to estimate filter ratio");
-        }
-
-        if (estimated_filtered_out_count.has_value()) {
-            auto ratio = need_process_rows_ > 0
-                             ? static_cast<double>(
-                                   estimated_filtered_out_count.value()) /
-                                   static_cast<double>(need_process_rows_)
-                             : 0.0;
-            if (ratio < kDownpushFallbackFilterOutRatio) {
-                predicate->estimated_filtered_out_count_ =
-                    need_process_rows_ > 0
-                        ? std::max<int64_t>(
-                              1, estimated_filtered_out_count.value())
-                        : 0;
-                cardinal_downpush_predicate_ = predicate;
-                cardinal_downpush_enabled_ = true;
-            }
-        }
+        // downpush hint (ann filter fusing): attempt to fuse the scalar
+        // predicate into the vector index. The hint is advisory — if any
+        // precondition is unmet we silently fall back to the normal ExprSet
+        // path below and never break correctness.
+        TryEnableCardinalDownpush(*filter, exec_context);
     }
 
     enable_expr_cache_ = query_context_->get_enable_expr_cache();
     if (enable_expr_cache_ && !cardinal_downpush_enabled_) {
         expr_cache_key_ = BuildExprCacheKey(*filter, query_context_);
     }
+}
+
+void
+PhyFilterBitsNode::TryEnableCardinalDownpush(
+    const plan::FilterBitsNode& filter,
+    ExecContext* exec_context) {
+    const auto& search_info = query_context_->get_search_info();
+
+    auto fallback = [](const char* reason) {
+        milvus::monitor::internal_core_downpush_fallback_count_family.Add(
+            {{"reason", reason}})
+            .Increment();
+    };
+
+    // Fusion is not implemented for element-level (array-of-vectors) search.
+    if (search_info.element_level()) {
+        LOG_DEBUG("downpush fallback: element-level vector search unsupported");
+        fallback("element_level");
+        return;
+    }
+
+    // The vector index must support predicate fusion. Backend-agnostic
+    // capability query so this node never reads the raw index type.
+    if (!query_context_->get_segment()->SupportsDownpush(
+            search_info.field_id_)) {
+        LOG_DEBUG("downpush fallback: vector index does not support fusion");
+        fallback("unsupported_index");
+        return;
+    }
+
+    // entity TTL: ExprSet compilation injects the TTL predicate into exprs_.
+    // Because only the *user* predicate is deferred into the vector index, the
+    // TTL predicate is compiled separately and kept as a normal logical-space
+    // bitset (evaluated in GetOutput).
+    auto ttl_expr = CreateTTLFieldFilterExpression(query_context_);
+    if (ttl_expr != nullptr) {
+        // ExprSet normally injects entity TTL into its first source. This
+        // source is already the TTL expression itself, so disable injection
+        // here to avoid compiling TTL AND TTL.
+        ttl_exprs_ = std::make_unique<ExprSet>(
+            std::vector<expr::TypedExprPtr>{ttl_expr}, exec_context, false);
+    }
+
+    auto predicate =
+        TryCompileCardinalDownpushPredicate(filter.filter(), query_context_);
+    if (!predicate.has_value()) {
+        LOG_DEBUG(
+            "downpush fallback: unsupported predicate shape (only sealed "
+            "scalar int/float/varchar range/term/match/arith/mod are fused)");
+        fallback("unsupported_predicate");
+        return;
+    }
+
+    std::vector<expr::TypedExprPtr> filters{filter.filter()};
+    ExprSet sample_exprs(filters, exec_context);
+    auto estimated_filtered_out_count = EstimateFilteredOutCountBySample(
+        query_context_, &sample_exprs, exec_context);
+    if (!estimated_filtered_out_count.has_value()) {
+        LOG_DEBUG("downpush fallback: failed to estimate filter ratio");
+        fallback("estimate_failed");
+        return;
+    }
+
+    auto ratio = need_process_rows_ > 0
+                     ? static_cast<double>(estimated_filtered_out_count.value()) /
+                           static_cast<double>(need_process_rows_)
+                     : 0.0;
+    if (ratio >= kDownpushFallbackFilterOutRatio) {
+        LOG_DEBUG("downpush fallback: filter-out ratio {} >= threshold {}",
+                  ratio,
+                  kDownpushFallbackFilterOutRatio);
+        fallback("ratio_threshold");
+        return;
+    }
+
+    predicate->estimated_filtered_out_count_ =
+        need_process_rows_ > 0
+            ? std::max<int64_t>(1, estimated_filtered_out_count.value())
+            : 0;
+    cardinal_downpush_predicate_ = predicate;
+    cardinal_downpush_enabled_ = true;
 }
 
 void
@@ -717,9 +751,32 @@ PhyFilterBitsNode::GetOutput() {
             cardinal_downpush_predicate_.value());
         num_processed_rows_ = need_process_rows_;
         std::vector<VectorPtr> col_res;
-        col_res.push_back(std::make_shared<ColumnVector>(
-            TargetBitmap(need_process_rows_, false),
-            TargetBitmap(need_process_rows_, true)));
+        if (ttl_exprs_ != nullptr) {
+            // entity TTL stays a normal logical-space bitset (`1` = exclude),
+            // while the user predicate is deferred into the vector index.
+            EvalCtx ttl_eval_ctx(operator_context_->get_exec_context());
+            std::vector<VectorPtr> ttl_results;
+            ttl_exprs_->Eval(0, 1, true, ttl_eval_ctx, ttl_results);
+            AssertInfo(ttl_results.size() == 1 && ttl_results[0] != nullptr,
+                       "TTL filter should produce a single bitmap result");
+            auto ttl_col = std::dynamic_pointer_cast<ColumnVector>(ttl_results[0]);
+            AssertInfo(ttl_col && ttl_col->IsBitmap(),
+                       "TTL filter result should be a bitmap ColumnVector");
+            AssertInfo(static_cast<int64_t>(ttl_col->size()) ==
+                           need_process_rows_,
+                       "TTL filter result size {} != need_process_rows_ {}",
+                       ttl_col->size(),
+                       need_process_rows_);
+            // Eval yields `1` = keep (TTL not expired); flip to `1` = exclude
+            // to match the exclude-bitset convention consumed downstream.
+            TargetBitmapView ttl_view(ttl_col->GetRawData(), ttl_col->size());
+            ttl_view.flip();
+            col_res.push_back(std::move(ttl_results[0]));
+        } else {
+            col_res.push_back(std::make_shared<ColumnVector>(
+                TargetBitmap(need_process_rows_, false),
+                TargetBitmap(need_process_rows_, true)));
+        }
         return std::make_shared<RowVector>(col_res);
     }
 

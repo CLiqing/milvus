@@ -711,11 +711,12 @@ PhyVectorSearchNode::GetOutput() {
     if (const auto& predicate =
             query_context_->get_cardinal_downpush_predicate();
         predicate.has_value()) {
-        if (ph.element_level_) {
-            ThrowInfo(
-                UnexpectedError,
-                "downpush hint does not support element-level vector search");
-        }
+        // element-level (array-of-vectors) search is rejected by the
+        // FilterBitsNode gate before the predicate is ever set; this assert is
+        // purely defensive against future regressions.
+        AssertInfo(!ph.element_level_,
+                   "downpush hint does not support element-level vector "
+                   "search");
         auto op = ToKnowherePredicateOp(predicate->op_);
         downpush_ctx = BuildCardinalDownpushSearchContext(
             segment_, op_context, predicate.value());

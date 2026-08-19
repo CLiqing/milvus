@@ -136,6 +136,8 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     HasJsonIndex(FieldId field_id) const override;
     bool
     HasFieldData(FieldId field_id) const override;
+    bool
+    SupportsDownpush(FieldId field_id) const override;
 
     std::pair<std::shared_ptr<ChunkedColumnInterface>, bool>
     GetFieldDataIfExist(FieldId field_id) const;

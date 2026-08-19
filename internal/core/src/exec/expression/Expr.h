@@ -2472,7 +2472,8 @@ CompileExpressions(const std::vector<expr::TypedExprPtr>& logical_exprs,
                    ExecContext* context,
                    const std::unordered_set<std::string>& flatten_cadidates =
                        std::unordered_set<std::string>(),
-                   bool enable_constant_folding = false);
+                   bool enable_constant_folding = false,
+                   bool inject_entity_ttl = true);
 
 std::vector<ExprPtr>
 CompileInputs(const expr::TypedExprPtr& expr,
@@ -2488,9 +2489,11 @@ CompileExpression(const expr::TypedExprPtr& expr,
 class ExprSet {
  public:
     explicit ExprSet(const std::vector<expr::TypedExprPtr>& logical_exprs,
-                     ExecContext* exec_ctx)
+                     ExecContext* exec_ctx,
+                     bool inject_entity_ttl = true)
         : exec_ctx_(exec_ctx) {
-        exprs_ = CompileExpressions(logical_exprs, exec_ctx);
+        exprs_ = CompileExpressions(
+            logical_exprs, exec_ctx, {}, false, inject_entity_ttl);
     }
 
     virtual ~ExprSet() = default;

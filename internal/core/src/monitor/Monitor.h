@@ -68,6 +68,9 @@ DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_get_target_entry_latency);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_random_sample);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_core_optimize_expr_latency);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_core_expr_filter_ratio);
+// NOTE: DECLARE_*_FAMILY expands to the literal argument, while
+// DEFINE_*_FAMILY appends `_family`, so declare the `_family` symbol to match.
+DECLARE_PROMETHEUS_COUNTER_FAMILY(internal_core_downpush_fallback_count_family);
 
 // async cgo metrics
 DECLARE_PROMETHEUS_HISTOGRAM_FAMILY(internal_cgo_queue_duration_seconds);

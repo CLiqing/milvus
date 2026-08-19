@@ -525,6 +525,16 @@ class SegmentInternalInterface : public SegmentInterface {
     virtual bool
     HasIndex(FieldId field_id) const = 0;
 
+    // Whether the vector field's index supports scalar-predicate fusion
+    // (downpush, a.k.a. "ann filter fusing"). Backend-agnostic capability query
+    // so callers (e.g. FilterBitsNode) never need to read the raw index type.
+    // Default returns false for segment types that never build vector indexes
+    // (e.g. growing segments); sealed segments override.
+    virtual bool
+    SupportsDownpush(FieldId field_id) const {
+        return false;
+    }
+
     bool
     FieldAccessible(FieldId field_id) const {
         return HasFieldData(field_id) || HasIndex(field_id);
