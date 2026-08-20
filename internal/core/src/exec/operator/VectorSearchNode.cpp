@@ -19,15 +19,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <numeric>
 #include <optional>
 #include <ratio>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -41,6 +38,7 @@
 #include "exec/QueryContext.h"
 #include "exec/expression/Utils.h"
 #include "exec/operator/Utils.h"
+#include "exec/operator/DownpushSearchContext.h"
 #include "index/ScalarIndex.h"
 #include "index/StringIndex.h"
 #include "log/Log.h"
@@ -54,17 +52,12 @@
 namespace milvus {
 namespace exec {
 
-namespace {
-
-constexpr size_t kDownpushRowValuesCacheMaxEntries = 16;
-
 struct CardinalDownpushSearchContext {
     std::vector<milvus::cachinglayer::PinWrapper<Span<int64_t>>> int64_pins_;
     std::vector<milvus::cachinglayer::PinWrapper<Span<float>>> float_pins_;
     std::vector<milvus::cachinglayer::PinWrapper<RawStringChunkView>>
         string_pins_;
-    std::vector<
-        milvus::cachinglayer::PinWrapper<const index::IndexBase*>>
+    std::vector<milvus::cachinglayer::PinWrapper<const index::IndexBase*>>
         scalar_index_pins_;
     std::shared_ptr<std::vector<int64_t>> int64_row_values_;
     std::shared_ptr<std::vector<float>> float_row_values_;
@@ -84,36 +77,7 @@ struct CardinalDownpushSearchContext {
     bool target_dictionary_id_found_{false};
 };
 
-struct DownpushRowValuesCacheKey {
-    int64_t segment_id;
-    int64_t field_id;
-    int64_t row_count;
-
-    bool
-    operator==(const DownpushRowValuesCacheKey& other) const {
-        return segment_id == other.segment_id && field_id == other.field_id &&
-               row_count == other.row_count;
-    }
-};
-
-struct DownpushRowValuesCacheKeyHash {
-    size_t
-    operator()(const DownpushRowValuesCacheKey& key) const {
-        size_t seed = std::hash<int64_t>{}(key.segment_id);
-        seed ^= std::hash<int64_t>{}(key.field_id) + 0x9e3779b97f4a7c15ULL +
-                (seed << 6) + (seed >> 2);
-        seed ^= std::hash<int64_t>{}(key.row_count) + 0x9e3779b97f4a7c15ULL +
-                (seed << 6) + (seed >> 2);
-        return seed;
-    }
-};
-
-std::mutex g_downpush_row_values_cache_mutex;
-std::deque<DownpushRowValuesCacheKey> g_downpush_row_values_cache_order;
-std::unordered_map<DownpushRowValuesCacheKey,
-                   std::shared_ptr<std::vector<int64_t>>,
-                   DownpushRowValuesCacheKeyHash>
-    g_downpush_row_values_cache;
+namespace {
 
 std::optional<knowhere::BitsetView::ExtraScalarInt64PredicateOp>
 ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
@@ -223,45 +187,6 @@ BuildInt64RowValuesFromBulkSubscript(
     return nullptr;
 }
 
-std::shared_ptr<std::vector<int64_t>>
-GetCachedInt64RowValuesFromBulkSubscript(
-    const segcore::SegmentInternalInterface* segment,
-    milvus::OpContext* op_context,
-    FieldId field_id) {
-    auto row_count = segment->get_row_count();
-    DownpushRowValuesCacheKey key{
-        segment->get_segment_id(), field_id.get(), row_count};
-
-    {
-        std::lock_guard<std::mutex> lock(g_downpush_row_values_cache_mutex);
-        auto it = g_downpush_row_values_cache.find(key);
-        if (it != g_downpush_row_values_cache.end()) {
-            return it->second;
-        }
-    }
-
-    auto row_values = BuildInt64RowValuesFromBulkSubscript(
-        segment, op_context, field_id, row_count);
-    if (row_values == nullptr) {
-        return nullptr;
-    }
-
-    std::lock_guard<std::mutex> lock(g_downpush_row_values_cache_mutex);
-    auto it = g_downpush_row_values_cache.find(key);
-    if (it != g_downpush_row_values_cache.end()) {
-        return it->second;
-    }
-    g_downpush_row_values_cache.emplace(key, row_values);
-    g_downpush_row_values_cache_order.push_back(key);
-    while (g_downpush_row_values_cache_order.size() >
-           kDownpushRowValuesCacheMaxEntries) {
-        g_downpush_row_values_cache.erase(
-            g_downpush_row_values_cache_order.front());
-        g_downpush_row_values_cache_order.pop_front();
-    }
-    return row_values;
-}
-
 std::shared_ptr<std::vector<float>>
 BuildFloatRowValuesFromBulkSubscript(
     const segcore::SegmentInternalInterface* segment,
@@ -347,8 +272,8 @@ BuildCardinalDownpushSearchContext(
     auto row_count = segment->get_row_count();
     if (predicate.value_type_ == CardinalDownpushPredicateValueType::Int64 &&
         IsDownpushIntField(field_data_type)) {
-        ctx->int64_row_values_ = GetCachedInt64RowValuesFromBulkSubscript(
-            segment, op_context, predicate.field_id_);
+        ctx->int64_row_values_ = BuildInt64RowValuesFromBulkSubscript(
+            segment, op_context, predicate.field_id_, row_count);
         if (ctx->int64_row_values_ == nullptr) {
             return nullptr;
         }
@@ -436,8 +361,8 @@ BuildCardinalDownpushSearchContext(
         if (string_index == nullptr) {
             return nullptr;
         }
-        auto view = string_index->GetDictionaryIdColumnView(
-            predicate.string_arg0_);
+        auto view =
+            string_index->GetDictionaryIdColumnView(predicate.string_arg0_);
         if (!view.has_value() || view->row_value_ids == nullptr ||
             view->row_count != static_cast<size_t>(row_count)) {
             return nullptr;
@@ -445,11 +370,12 @@ BuildCardinalDownpushSearchContext(
         ctx->row_dictionary_ids_ = view->row_value_ids;
         ctx->dictionary_row_count_ = view->row_count;
         ctx->target_dictionary_id_ = view->target_dictionary_id;
-        ctx->target_dictionary_id_found_ =
-            view->target_dictionary_id_found;
+        ctx->target_dictionary_id_found_ = view->target_dictionary_id_found;
         ctx->scalar_index_pins_ = std::move(pins);
         LOG_INFO(
-            "Cardinal downpush scalar source selected: source=stl_sort_dictionary_id, field_id={}, rows={}, target_found={}",
+            "Cardinal downpush scalar source selected: "
+            "source=stl_sort_dictionary_id, field_id={}, rows={}, "
+            "target_found={}",
             predicate.field_id_.get(),
             ctx->dictionary_row_count_,
             ctx->target_dictionary_id_found_);
@@ -564,7 +490,8 @@ IsDownpushPredicateSourceReady(const CardinalDownpushSearchContext& ctx,
                    !ctx.float_chunk_values_.empty();
         case CardinalDownpushPredicateValueType::String:
             return (!ctx.string_pins_.empty() &&
-                    ctx.string_chunk_bases_.size() == ctx.string_pins_.size()) ||
+                    ctx.string_chunk_bases_.size() ==
+                        ctx.string_pins_.size()) ||
                    (ctx.row_dictionary_ids_ != nullptr &&
                     ctx.dictionary_row_count_ > 0 &&
                     !ctx.scalar_index_pins_.empty());
@@ -573,6 +500,39 @@ IsDownpushPredicateSourceReady(const CardinalDownpushSearchContext& ctx,
 }
 
 }  // namespace
+
+std::shared_ptr<CardinalDownpushSearchContext>
+PrepareCardinalDownpushSearchContext(
+    const segcore::SegmentInternalInterface* segment,
+    OpContext* op_context,
+    const CardinalDownpushPredicate& predicate) {
+    auto context =
+        BuildCardinalDownpushSearchContext(segment, op_context, predicate);
+    if (context == nullptr ||
+        !IsDownpushPredicateSourceReady(*context, predicate.value_type_)) {
+        return nullptr;
+    }
+    return context;
+}
+
+const char*
+CardinalDownpushSourceName(const CardinalDownpushSearchContext& context) {
+    if (context.row_dictionary_ids_ != nullptr) {
+        return "stl_sort_dictionary_id";
+    }
+    if (!context.string_pins_.empty()) {
+        return "raw_string_chunks";
+    }
+    if (!context.int64_chunk_values_.empty() ||
+        !context.float_chunk_values_.empty()) {
+        return "raw_numeric_chunks";
+    }
+    if (context.int64_row_values_ != nullptr ||
+        context.float_row_values_ != nullptr) {
+        return "bulk_subscript";
+    }
+    return "unknown";
+}
 
 static milvus::SearchResult
 empty_search_result(int64_t num_queries, bool element_level = false) {
@@ -718,8 +678,7 @@ PhyVectorSearchNode::GetOutput() {
                    "downpush hint does not support element-level vector "
                    "search");
         auto op = ToKnowherePredicateOp(predicate->op_);
-        downpush_ctx = BuildCardinalDownpushSearchContext(
-            segment_, op_context, predicate.value());
+        downpush_ctx = query_context_->get_cardinal_downpush_search_context();
         std::optional<knowhere::BitsetView::ExtraScalarPredicateValueType>
             value_type;
         if (downpush_ctx != nullptr) {
@@ -742,6 +701,20 @@ PhyVectorSearchNode::GetOutput() {
         search_view.set_extra_scalar_int64_predicate_filter(
             filter,
             static_cast<size_t>(predicate->estimated_filtered_out_count_));
+        const char* value_type_name =
+            predicate->value_type_ == CardinalDownpushPredicateValueType::Int64
+                ? "int64"
+            : predicate->value_type_ ==
+                    CardinalDownpushPredicateValueType::Float
+                ? "float"
+                : "string";
+        milvus::monitor::internal_core_downpush_execution_count_family
+            .Add({{"source", CardinalDownpushSourceName(*downpush_ctx)},
+                  {"value_type", value_type_name},
+                  {"iterator",
+                   search_info_.iterator_v2_info_.has_value() ? "true"
+                                                              : "false"}})
+            .Increment();
     }
 
     // Single search + metrics path

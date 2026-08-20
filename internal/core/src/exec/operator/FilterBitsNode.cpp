@@ -18,19 +18,19 @@
 
 #include <algorithm>
 #include <chrono>
-#include <limits>
 #include <optional>
 #include <ratio>
 #include <utility>
 #include <vector>
 
 #include "common/EasyAssert.h"
-#include "common/RegexQuery.h"
 #include "common/Tracer.h"
 #include "common/Types.h"
 #include "exec/QueryContext.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/ExprCache.h"
+#include "exec/expression/DownpushPredicateProvider.h"
+#include "exec/operator/DownpushSearchContext.h"
 #include "expr/ITypeExpr.h"
 #include "fmt/core.h"
 #include "log/Log.h"
@@ -84,34 +84,6 @@ BuildSampleOffsets(int64_t active_count,
     return offsets;
 }
 
-std::optional<int64_t>
-GetInt64Value(const proto::plan::GenericValue& value) {
-    if (value.val_case() != proto::plan::GenericValue::kInt64Val) {
-        return std::nullopt;
-    }
-    return value.int64_val();
-}
-
-std::optional<double>
-GetDoubleValue(const proto::plan::GenericValue& value) {
-    switch (value.val_case()) {
-        case proto::plan::GenericValue::kInt64Val:
-            return static_cast<double>(value.int64_val());
-        case proto::plan::GenericValue::kFloatVal:
-            return value.float_val();
-        default:
-            return std::nullopt;
-    }
-}
-
-std::optional<std::string>
-GetStringValue(const proto::plan::GenericValue& value) {
-    if (value.val_case() != proto::plan::GenericValue::kStringVal) {
-        return std::nullopt;
-    }
-    return value.string_val();
-}
-
 std::optional<CardinalDownpushPredicateOp>
 ToDownpushRangeOp(proto::plan::OpType op_type) {
     switch (op_type) {
@@ -149,198 +121,6 @@ IsStringMatchOp(CardinalDownpushPredicateOp op) {
 }
 
 bool
-IsDownpushIntField(DataType data_type) {
-    return data_type == DataType::INT8 || data_type == DataType::INT16 ||
-           data_type == DataType::INT32 || data_type == DataType::INT64 ||
-           data_type == DataType::TIMESTAMPTZ;
-}
-
-bool
-IsDownpushFloatField(DataType data_type) {
-    return data_type == DataType::FLOAT;
-}
-
-bool
-IsDownpushStringField(DataType data_type) {
-    return data_type == DataType::VARCHAR || data_type == DataType::STRING;
-}
-
-std::optional<CardinalDownpushPredicateValueType>
-GetDownpushValueType(DataType data_type) {
-    if (IsDownpushIntField(data_type)) {
-        return CardinalDownpushPredicateValueType::Int64;
-    }
-    if (IsDownpushFloatField(data_type)) {
-        return CardinalDownpushPredicateValueType::Float;
-    }
-    if (IsDownpushStringField(data_type)) {
-        return CardinalDownpushPredicateValueType::String;
-    }
-    return std::nullopt;
-}
-
-bool
-FillPredicateArg(CardinalDownpushPredicate& predicate,
-                 const proto::plan::GenericValue& value,
-                 bool second_arg = false) {
-    switch (predicate.value_type_) {
-        case CardinalDownpushPredicateValueType::Int64: {
-            auto arg = GetInt64Value(value);
-            if (!arg.has_value()) {
-                return false;
-            }
-            if (second_arg) {
-                predicate.arg1_ = arg.value();
-            } else {
-                predicate.arg0_ = arg.value();
-            }
-            return true;
-        }
-        case CardinalDownpushPredicateValueType::Float: {
-            auto arg = GetDoubleValue(value);
-            if (!arg.has_value()) {
-                return false;
-            }
-            if (second_arg) {
-                predicate.double_arg1_ = arg.value();
-            } else {
-                predicate.double_arg0_ = arg.value();
-            }
-            return true;
-        }
-        case CardinalDownpushPredicateValueType::String: {
-            auto arg = GetStringValue(value);
-            if (!arg.has_value()) {
-                return false;
-            }
-            if (second_arg) {
-                predicate.string_arg1_ = arg.value();
-            } else {
-                predicate.string_arg0_ = arg.value();
-            }
-            return true;
-        }
-    }
-    return false;
-}
-
-bool
-FillPredicateTermArgs(CardinalDownpushPredicate& predicate,
-                      const std::vector<proto::plan::GenericValue>& values) {
-    if (values.empty()) {
-        return false;
-    }
-
-    switch (predicate.value_type_) {
-        case CardinalDownpushPredicateValueType::Int64:
-            predicate.int64_terms_.reserve(values.size());
-            for (const auto& value : values) {
-                auto arg = GetInt64Value(value);
-                if (!arg.has_value()) {
-                    return false;
-                }
-                predicate.int64_terms_.push_back(arg.value());
-            }
-            std::sort(predicate.int64_terms_.begin(),
-                      predicate.int64_terms_.end());
-            predicate.int64_terms_.erase(
-                std::unique(predicate.int64_terms_.begin(),
-                            predicate.int64_terms_.end()),
-                predicate.int64_terms_.end());
-            return true;
-        case CardinalDownpushPredicateValueType::Float:
-            predicate.double_terms_.reserve(values.size());
-            for (const auto& value : values) {
-                auto arg = GetDoubleValue(value);
-                if (!arg.has_value()) {
-                    return false;
-                }
-                predicate.double_terms_.push_back(arg.value());
-            }
-            std::sort(predicate.double_terms_.begin(),
-                      predicate.double_terms_.end());
-            predicate.double_terms_.erase(
-                std::unique(predicate.double_terms_.begin(),
-                            predicate.double_terms_.end()),
-                predicate.double_terms_.end());
-            return true;
-        case CardinalDownpushPredicateValueType::String:
-            predicate.string_terms_.reserve(values.size());
-            for (const auto& value : values) {
-                auto arg = GetStringValue(value);
-                if (!arg.has_value()) {
-                    return false;
-                }
-                predicate.string_terms_.push_back(arg.value());
-            }
-            std::sort(predicate.string_terms_.begin(),
-                      predicate.string_terms_.end());
-            predicate.string_terms_.erase(
-                std::unique(predicate.string_terms_.begin(),
-                            predicate.string_terms_.end()),
-                predicate.string_terms_.end());
-            return true;
-    }
-    return false;
-}
-
-enum class DownpushLikeTokenType : uint8_t {
-    Literal = 0,
-    AnyOne = 1,
-    AnyMany = 2,
-};
-
-bool
-CompileLikePattern(CardinalDownpushPredicate& predicate) {
-    const auto& pattern = predicate.string_arg0_;
-    if (pattern.size() > std::numeric_limits<uint32_t>::max()) {
-        return false;
-    }
-
-    auto add_token = [&](DownpushLikeTokenType type,
-                         size_t offset,
-                         size_t size) {
-        predicate.like_token_offsets_.push_back(static_cast<uint32_t>(offset));
-        predicate.like_token_sizes_.push_back(static_cast<uint32_t>(size));
-        predicate.like_token_types_.push_back(static_cast<uint8_t>(type));
-    };
-
-    for (size_t i = 0; i < pattern.size();) {
-        const auto c = pattern[i];
-        if (c == '\\') {
-            ++i;
-            if (i == pattern.size()) {
-                return false;
-            }
-            const auto char_len = Utf8ValidatedCharByteLen(pattern.data() + i,
-                                                           pattern.size() - i);
-            add_token(DownpushLikeTokenType::Literal, i, char_len);
-            i += char_len;
-            continue;
-        }
-        if (c == '%') {
-            if (predicate.like_token_types_.empty() ||
-                predicate.like_token_types_.back() !=
-                    static_cast<uint8_t>(DownpushLikeTokenType::AnyMany)) {
-                add_token(DownpushLikeTokenType::AnyMany, i, 1);
-            }
-            ++i;
-            continue;
-        }
-        if (c == '_') {
-            add_token(DownpushLikeTokenType::AnyOne, i, 1);
-            ++i;
-            continue;
-        }
-        const auto char_len =
-            Utf8ValidatedCharByteLen(pattern.data() + i, pattern.size() - i);
-        add_token(DownpushLikeTokenType::Literal, i, char_len);
-        i += char_len;
-    }
-    return true;
-}
-
-bool
 TryFoldInt64TermsToRange(CardinalDownpushPredicate& predicate) {
     if (predicate.value_type_ != CardinalDownpushPredicateValueType::Int64 ||
         predicate.int64_terms_.empty()) {
@@ -369,22 +149,6 @@ TryFoldInt64TermsToRange(CardinalDownpushPredicate& predicate) {
     return true;
 }
 
-std::optional<CardinalDownpushPredicateOp>
-ToDownpushArithLessThanOp(proto::plan::ArithOpType arith_op) {
-    switch (arith_op) {
-        case proto::plan::ArithOpType::Add:
-            return CardinalDownpushPredicateOp::ScalarAddLessThan;
-        case proto::plan::ArithOpType::Sub:
-            return CardinalDownpushPredicateOp::ScalarSubLessThan;
-        case proto::plan::ArithOpType::Mul:
-            return CardinalDownpushPredicateOp::ScalarMulLessThan;
-        case proto::plan::ArithOpType::Div:
-            return CardinalDownpushPredicateOp::ScalarDivLessThan;
-        default:
-            return std::nullopt;
-    }
-}
-
 std::optional<CardinalDownpushPredicate>
 TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
                                     QueryContext* query_context) {
@@ -396,28 +160,21 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
         return std::nullopt;
     }
 
+    struct ProviderPredicate {
+        CardinalDownpushPredicate predicate;
+        const DownpushPredicateProvider* provider;
+    };
     auto try_field = [&](const expr::ColumnInfo& column)
-        -> std::optional<CardinalDownpushPredicate> {
-        if (column.element_level_ || !column.nested_path_.empty()) {
-            return std::nullopt;
-        }
+        -> std::optional<ProviderPredicate> {
         auto field_id = column.field_id_;
-        auto value_type = GetDownpushValueType(column.data_type_);
-        if (!value_type.has_value()) {
-            return std::nullopt;
-        }
-        if (column.nullable_ &&
-            value_type.value() != CardinalDownpushPredicateValueType::String) {
+        const auto* provider = FindDownpushPredicateProvider(column);
+        if (provider == nullptr) {
             return std::nullopt;
         }
         if (!segment->HasFieldData(field_id) && !segment->HasIndex(field_id)) {
             return std::nullopt;
         }
-        CardinalDownpushPredicate predicate;
-        predicate.field_id_ = field_id;
-        predicate.field_data_type_ = column.data_type_;
-        predicate.value_type_ = value_type.value();
-        return predicate;
+        return ProviderPredicate{provider->NewPredicate(column), provider};
     };
 
     if (auto unary =
@@ -426,20 +183,16 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
         auto predicate = try_field(unary->column_);
         auto op = ToDownpushRangeOp(unary->op_type_);
         if (!predicate.has_value() || !op.has_value() ||
-            !FillPredicateArg(predicate.value(), unary->val_)) {
+            !predicate->provider->SupportsRangeOp(*op) ||
+            !predicate->provider->FillArg(
+                predicate->predicate, unary->val_, false)) {
             return std::nullopt;
         }
-        if (IsStringMatchOp(op.value()) &&
-            predicate->value_type_ !=
-                CardinalDownpushPredicateValueType::String) {
+        predicate->predicate.op_ = op.value();
+        if (!predicate->provider->FinalizeUnary(predicate->predicate)) {
             return std::nullopt;
         }
-        predicate->op_ = op.value();
-        if (predicate->op_ == CardinalDownpushPredicateOp::StringLikeMatch &&
-            !CompileLikePattern(predicate.value())) {
-            return std::nullopt;
-        }
-        return predicate;
+        return std::move(predicate->predicate);
     }
 
     if (auto binary =
@@ -447,87 +200,41 @@ TryCompileCardinalDownpushPredicate(const expr::TypedExprPtr& filter,
                 filter)) {
         auto predicate = try_field(binary->column_);
         if (!predicate.has_value() ||
-            !FillPredicateArg(predicate.value(), binary->lower_val_) ||
-            !FillPredicateArg(predicate.value(), binary->upper_val_, true)) {
+            !predicate->provider->FillArg(
+                predicate->predicate, binary->lower_val_, false) ||
+            !predicate->provider->FillArg(
+                predicate->predicate, binary->upper_val_, true)) {
             return std::nullopt;
         }
-        predicate->op_ = CardinalDownpushPredicateOp::ScalarRange;
-        predicate->lower_inclusive_ = binary->lower_inclusive_;
-        predicate->upper_inclusive_ = binary->upper_inclusive_;
-        return predicate;
+        predicate->predicate.op_ = CardinalDownpushPredicateOp::ScalarRange;
+        predicate->predicate.lower_inclusive_ = binary->lower_inclusive_;
+        predicate->predicate.upper_inclusive_ = binary->upper_inclusive_;
+        return std::move(predicate->predicate);
     }
 
     if (auto term =
             std::dynamic_pointer_cast<const expr::TermFilterExpr>(filter)) {
         auto predicate = try_field(term->column_);
-        if (!predicate.has_value() ||
-            !FillPredicateTermArgs(predicate.value(), term->vals_)) {
+        if (!predicate.has_value() || !predicate->provider->FillTerms(
+                                          predicate->predicate, term->vals_)) {
             return std::nullopt;
         }
-        if (TryFoldInt64TermsToRange(predicate.value())) {
-            return predicate;
+        if (TryFoldInt64TermsToRange(predicate->predicate)) {
+            return std::move(predicate->predicate);
         }
-        predicate->op_ = CardinalDownpushPredicateOp::ScalarTerm;
-        return predicate;
+        predicate->predicate.op_ = CardinalDownpushPredicateOp::ScalarTerm;
+        return std::move(predicate->predicate);
     }
 
     if (auto arith =
             std::dynamic_pointer_cast<const expr::BinaryArithOpEvalRangeExpr>(
                 filter)) {
         auto predicate = try_field(arith->column_);
-        if (!predicate.has_value() ||
-            arith->op_type_ != proto::plan::OpType::LessThan) {
+        if (!predicate.has_value() || !predicate->provider->FillArithmetic(
+                                          predicate->predicate, *arith)) {
             return std::nullopt;
         }
-
-        if (arith->arith_op_type_ == proto::plan::ArithOpType::Mod) {
-            auto modulus = GetInt64Value(arith->right_operand_);
-            auto threshold = GetInt64Value(arith->value_);
-            if (predicate->value_type_ !=
-                    CardinalDownpushPredicateValueType::Int64 ||
-                !modulus.has_value() || !threshold.has_value() ||
-                modulus.value() <= 0 || threshold.value() < 0 ||
-                threshold.value() > modulus.value()) {
-                return std::nullopt;
-            }
-            predicate->op_ = CardinalDownpushPredicateOp::Int64ModLessThan;
-            predicate->arg0_ = modulus.value();
-            predicate->arg1_ = threshold.value();
-            return predicate;
-        }
-
-        auto arith_less_than_op =
-            ToDownpushArithLessThanOp(arith->arith_op_type_);
-        if (arith_less_than_op.has_value()) {
-            if (predicate->value_type_ ==
-                CardinalDownpushPredicateValueType::Int64) {
-                auto right_operand = GetInt64Value(arith->right_operand_);
-                auto threshold = GetInt64Value(arith->value_);
-                if (!right_operand.has_value() || !threshold.has_value() ||
-                    (arith->arith_op_type_ == proto::plan::ArithOpType::Div &&
-                     right_operand.value() == 0)) {
-                    return std::nullopt;
-                }
-                predicate->op_ = arith_less_than_op.value();
-                predicate->arg0_ = right_operand.value();
-                predicate->arg1_ = threshold.value();
-                return predicate;
-            }
-            if (predicate->value_type_ ==
-                CardinalDownpushPredicateValueType::Float) {
-                auto right_operand = GetDoubleValue(arith->right_operand_);
-                auto threshold = GetDoubleValue(arith->value_);
-                if (!right_operand.has_value() || !threshold.has_value() ||
-                    (arith->arith_op_type_ == proto::plan::ArithOpType::Div &&
-                     right_operand.value() == 0.0)) {
-                    return std::nullopt;
-                }
-                predicate->op_ = arith_less_than_op.value();
-                predicate->double_arg0_ = right_operand.value();
-                predicate->double_arg1_ = threshold.value();
-                return predicate;
-            }
-        }
+        return std::move(predicate->predicate);
     }
 
     return std::nullopt;
@@ -608,14 +315,13 @@ PhyFilterBitsNode::PhyFilterBitsNode(
 }
 
 void
-PhyFilterBitsNode::TryEnableCardinalDownpush(
-    const plan::FilterBitsNode& filter,
-    ExecContext* exec_context) {
+PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
+                                             ExecContext* exec_context) {
     const auto& search_info = query_context_->get_search_info();
 
     auto fallback = [](const char* reason) {
-        milvus::monitor::internal_core_downpush_fallback_count_family.Add(
-            {{"reason", reason}})
+        milvus::monitor::internal_core_downpush_fallback_count_family
+            .Add({{"reason", reason}})
             .Increment();
     };
 
@@ -683,10 +389,11 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(
         return;
     }
 
-    auto ratio = need_process_rows_ > 0
-                     ? static_cast<double>(estimated_filtered_out_count.value()) /
-                           static_cast<double>(need_process_rows_)
-                     : 0.0;
+    auto ratio =
+        need_process_rows_ > 0
+            ? static_cast<double>(estimated_filtered_out_count.value()) /
+                  static_cast<double>(need_process_rows_)
+            : 0.0;
     if (ratio >= kDownpushFallbackFilterOutRatio) {
         LOG_DEBUG("downpush fallback: filter-out ratio {} >= threshold {}",
                   ratio,
@@ -695,11 +402,22 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(
         return;
     }
 
+    auto downpush_search_context =
+        PrepareCardinalDownpushSearchContext(query_context_->get_segment(),
+                                             query_context_->get_op_context(),
+                                             predicate.value());
+    if (downpush_search_context == nullptr) {
+        LOG_DEBUG("downpush fallback: scalar value source unavailable");
+        fallback("source_unavailable");
+        return;
+    }
+
     predicate->estimated_filtered_out_count_ =
         need_process_rows_ > 0
             ? std::max<int64_t>(1, estimated_filtered_out_count.value())
             : 0;
     cardinal_downpush_predicate_ = predicate;
+    cardinal_downpush_search_context_ = std::move(downpush_search_context);
     cardinal_downpush_enabled_ = true;
 }
 
@@ -764,6 +482,8 @@ PhyFilterBitsNode::GetOutput() {
     if (cardinal_downpush_enabled_) {
         query_context_->set_cardinal_downpush_predicate(
             cardinal_downpush_predicate_.value());
+        query_context_->set_cardinal_downpush_search_context(
+            cardinal_downpush_search_context_);
         num_processed_rows_ = need_process_rows_;
         std::vector<VectorPtr> col_res;
         if (ttl_exprs_ != nullptr) {
@@ -774,14 +494,15 @@ PhyFilterBitsNode::GetOutput() {
             ttl_exprs_->Eval(0, 1, true, ttl_eval_ctx, ttl_results);
             AssertInfo(ttl_results.size() == 1 && ttl_results[0] != nullptr,
                        "TTL filter should produce a single bitmap result");
-            auto ttl_col = std::dynamic_pointer_cast<ColumnVector>(ttl_results[0]);
+            auto ttl_col =
+                std::dynamic_pointer_cast<ColumnVector>(ttl_results[0]);
             AssertInfo(ttl_col && ttl_col->IsBitmap(),
                        "TTL filter result should be a bitmap ColumnVector");
-            AssertInfo(static_cast<int64_t>(ttl_col->size()) ==
-                           need_process_rows_,
-                       "TTL filter result size {} != need_process_rows_ {}",
-                       ttl_col->size(),
-                       need_process_rows_);
+            AssertInfo(
+                static_cast<int64_t>(ttl_col->size()) == need_process_rows_,
+                "TTL filter result size {} != need_process_rows_ {}",
+                ttl_col->size(),
+                need_process_rows_);
             // Eval yields `1` = keep (TTL not expired); flip to `1` = exclude
             // to match the exclude-bitset convention consumed downstream.
             TargetBitmapView ttl_view(ttl_col->GetRawData(), ttl_col->size());

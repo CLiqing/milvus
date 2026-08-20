@@ -243,6 +243,9 @@ DEFINE_PROMETHEUS_HISTOGRAM_WITH_BUCKETS(internal_core_expr_filter_ratio,
                                          ratioBuckets)
 DEFINE_PROMETHEUS_COUNTER_FAMILY(internal_core_downpush_fallback_count,
                                  "[cpp]downpush fallback count by reason")
+DEFINE_PROMETHEUS_COUNTER_FAMILY(
+    internal_core_downpush_execution_count,
+    "[cpp]downpush execution count by source, value type and iterator mode")
 // mmap metrics
 std::map<std::string, std::string> mmapAllocatedSpaceAnonLabel = {
     {"type", "anon"}};

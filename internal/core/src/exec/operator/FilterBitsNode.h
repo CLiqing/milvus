@@ -27,6 +27,7 @@
 
 namespace milvus {
 namespace exec {
+struct CardinalDownpushSearchContext;
 class PhyFilterBitsNode : public Operator {
  public:
     PhyFilterBitsNode(
@@ -94,6 +95,8 @@ class PhyFilterBitsNode : public Operator {
     std::string expr_cache_key_;
     bool cardinal_downpush_enabled_ = false;
     std::optional<CardinalDownpushPredicate> cardinal_downpush_predicate_;
+    std::shared_ptr<CardinalDownpushSearchContext>
+        cardinal_downpush_search_context_;
 };
 }  // namespace exec
 }  // namespace milvus

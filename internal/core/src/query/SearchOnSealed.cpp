@@ -52,231 +52,13 @@ namespace milvus::query {
 
 namespace {
 
-// Buffers holding the physical-order downpush value source gathered from the
-// logical-order source. Must outlive the vector search call below.
-struct DownpushGatheredValueSource {
-    std::vector<int64_t> int64_values;
-    std::vector<float> float_values;
-    std::vector<int32_t> dictionary_ids;
-    std::vector<char> string_bytes;
-    std::vector<uint32_t> string_offsets;
-    // RawStringColumnView requires bool storage, not a byte buffer cast to
-    // bool*. Keep the actual bool objects alive through VectorIndex::Query.
-    std::unique_ptr<bool[]> string_valid;
-    std::vector<const char*> string_chunk_bases;
-    std::vector<const uint32_t*> string_chunk_value_offsets;
-    std::vector<const bool*> string_chunk_valid_data;
-    std::vector<size_t> string_chunk_row_counts;
-    std::vector<int64_t> string_chunk_row_offsets;
-};
-
-// Gather the downpush scalar value source from logical to physical order using
-// the vector index's offset mapping (p2l). The vector index stores only valid
-// rows (physical order), so the fused predicate must read scalar values in that
-// same order. Returns a new filter whose value-source pointers reference
-// `gathered` and whose row_count is the physical valid count. Returns false on
-// an unexpected source layout (defensive).
-bool
-GatherDownpushValueSource(
-    const knowhere::BitsetView::ExtraScalarInt64PredicateFilter& in,
-    const milvus::OffsetMapping& offset_mapping,
-    knowhere::BitsetView::ExtraScalarInt64PredicateFilter& out,
-    DownpushGatheredValueSource& gathered) {
-    using ValueType = knowhere::BitsetView::ExtraScalarPredicateValueType;
-    const int64_t valid_count = offset_mapping.GetValidCount();
-    if (valid_count <= 0) {
-        return false;
+int64_t
+MapDownpushScalarRowId(const void* context, int64_t physical_offset) {
+    if (context == nullptr) {
+        return -1;
     }
-    out = in;
-    out.row_count = static_cast<size_t>(valid_count);
-
-    // p2l is monotonically increasing, so a running chunk cursor is sufficient.
-    auto logical_at = [&](int64_t physical) -> int64_t {
-        return offset_mapping.GetLogicalOffset(physical);
-    };
-
-    switch (in.value_type) {
-        case ValueType::kInt64: {
-            if (in.row_values == nullptr && in.chunk_values == nullptr) {
-                return false;
-            }
-            gathered.int64_values.resize(valid_count);
-            size_t chunk_idx = 0;
-            for (int64_t p = 0; p < valid_count; ++p) {
-                const int64_t l = logical_at(p);
-                if (l < 0) {
-                    return false;
-                }
-                if (in.row_values != nullptr) {
-                    gathered.int64_values[p] = in.row_values[l];
-                } else {
-                    while (chunk_idx + 1 < in.num_chunks &&
-                           in.chunk_offsets[chunk_idx + 1] <= l) {
-                        ++chunk_idx;
-                    }
-                    gathered.int64_values[p] =
-                        in.chunk_values[chunk_idx][l -
-                                                   in.chunk_offsets[chunk_idx]];
-                }
-            }
-            out.row_values = gathered.int64_values.data();
-            out.chunk_values = nullptr;
-            out.chunk_offsets = nullptr;
-            out.num_chunks = 0;
-            return true;
-        }
-        case ValueType::kFloat: {
-            if (in.row_float_values == nullptr &&
-                in.chunk_float_values == nullptr) {
-                return false;
-            }
-            gathered.float_values.resize(valid_count);
-            size_t chunk_idx = 0;
-            for (int64_t p = 0; p < valid_count; ++p) {
-                const int64_t l = logical_at(p);
-                if (l < 0) {
-                    return false;
-                }
-                if (in.row_float_values != nullptr) {
-                    gathered.float_values[p] = in.row_float_values[l];
-                } else {
-                    while (chunk_idx + 1 < in.num_chunks &&
-                           in.chunk_offsets[chunk_idx + 1] <= l) {
-                        ++chunk_idx;
-                    }
-                    gathered.float_values[p] =
-                        in.chunk_float_values[chunk_idx][l -
-                                                         in.chunk_offsets[chunk_idx]];
-                }
-            }
-            out.row_float_values = gathered.float_values.data();
-            out.chunk_float_values = nullptr;
-            out.chunk_offsets = nullptr;
-            out.num_chunks = 0;
-            return true;
-        }
-        case ValueType::kDictionaryId: {
-            if (in.row_dictionary_ids == nullptr) {
-                return false;
-            }
-            gathered.dictionary_ids.resize(valid_count);
-            for (int64_t p = 0; p < valid_count; ++p) {
-                const int64_t l = logical_at(p);
-                if (l < 0) {
-                    return false;
-                }
-                gathered.dictionary_ids[p] = in.row_dictionary_ids[l];
-            }
-            out.row_dictionary_ids = gathered.dictionary_ids.data();
-            return true;
-        }
-        case ValueType::kString: {
-            const auto& col = in.string_column;
-            if (col.chunk_bases == nullptr ||
-                col.chunk_value_offsets == nullptr ||
-                col.chunk_row_counts == nullptr ||
-                col.chunk_row_offsets == nullptr || col.num_chunks == 0) {
-                return false;
-            }
-            gathered.string_offsets.assign(valid_count + 1, 0);
-            if (col.chunk_valid_data != nullptr) {
-                gathered.string_valid = std::make_unique<bool[]>(valid_count);
-                std::fill_n(gathered.string_valid.get(), valid_count, false);
-            }
-            size_t chunk_idx = 0;
-            size_t total_bytes = 0;
-            for (int64_t p = 0; p < valid_count; ++p) {
-                const int64_t l = logical_at(p);
-                if (l < 0) {
-                    return false;
-                }
-                while (chunk_idx + 1 < col.num_chunks &&
-                       col.chunk_row_offsets[chunk_idx + 1] <= l) {
-                    ++chunk_idx;
-                }
-                const int64_t local = l - col.chunk_row_offsets[chunk_idx];
-                if (local < 0 ||
-                    static_cast<size_t>(local) >=
-                        col.chunk_row_counts[chunk_idx]) {
-                    return false;
-                }
-                const auto* offsets = col.chunk_value_offsets[chunk_idx];
-                const auto* valid_data =
-                    col.chunk_valid_data == nullptr
-                        ? nullptr
-                        : col.chunk_valid_data[chunk_idx];
-                if (valid_data != nullptr && !valid_data[local]) {
-                    gathered.string_valid[p] = 0;
-                    gathered.string_offsets[p + 1] = total_bytes;
-                    continue;
-                }
-                if (valid_data != nullptr) {
-                    gathered.string_valid[p] = 1;
-                }
-                total_bytes += offsets[local + 1] - offsets[local];
-                gathered.string_offsets[p + 1] = total_bytes;
-            }
-
-            // Knowhere treats a null chunk base as an invalid value source.
-            // Preserve a non-null base even when every gathered value is the
-            // valid empty string (whose concatenated byte buffer is empty).
-            gathered.string_bytes.resize(std::max<size_t>(total_bytes, 1));
-            chunk_idx = 0;
-            for (int64_t p = 0; p < valid_count; ++p) {
-                const int64_t l = logical_at(p);
-                while (chunk_idx + 1 < col.num_chunks &&
-                       col.chunk_row_offsets[chunk_idx + 1] <= l) {
-                    ++chunk_idx;
-                }
-                const int64_t local = l - col.chunk_row_offsets[chunk_idx];
-                const auto* offsets = col.chunk_value_offsets[chunk_idx];
-                const auto* valid_data =
-                    col.chunk_valid_data == nullptr
-                        ? nullptr
-                        : col.chunk_valid_data[chunk_idx];
-                if (valid_data != nullptr && !valid_data[local]) {
-                    continue;
-                }
-                const auto* base = col.chunk_bases[chunk_idx];
-                const auto begin = offsets[local];
-                const auto end = offsets[local + 1];
-                std::copy(base + begin,
-                          base + end,
-                          gathered.string_bytes.data() +
-                              gathered.string_offsets[p]);
-            }
-
-            // Rebuild as a single gathered chunk in physical order.
-            gathered.string_chunk_bases = {gathered.string_bytes.data()};
-            gathered.string_chunk_value_offsets = {
-                gathered.string_offsets.data()};
-            gathered.string_chunk_row_counts = {
-                static_cast<size_t>(valid_count)};
-            gathered.string_chunk_row_offsets = {0};
-            out.string_column.chunk_bases =
-                gathered.string_chunk_bases.data();
-            out.string_column.chunk_value_offsets =
-                gathered.string_chunk_value_offsets.data();
-            out.string_column.chunk_row_counts =
-                gathered.string_chunk_row_counts.data();
-            out.string_column.chunk_row_offsets =
-                gathered.string_chunk_row_offsets.data();
-            if (col.chunk_valid_data != nullptr) {
-                gathered.string_chunk_valid_data = {
-                    gathered.string_valid.get()};
-                out.string_column.chunk_valid_data =
-                    gathered.string_chunk_valid_data.data();
-            } else {
-                out.string_column.chunk_valid_data = nullptr;
-            }
-            out.string_column.num_chunks = 1;
-            out.string_column.row_count = static_cast<size_t>(valid_count);
-            out.string_column.uniform_chunk_rows =
-                static_cast<size_t>(valid_count);
-            return true;
-        }
-    }
-    return false;
+    return static_cast<const milvus::OffsetMapping*>(context)->GetLogicalOffset(
+        physical_offset);
 }
 
 }  // namespace
@@ -345,7 +127,6 @@ SearchOnSealedIndex(const Schema& schema,
         offset_mapping.IsEnabled() && !is_element_level_search;
     const bool has_downpush = bitset.has_extra_scalar_int64_predicate_filter();
 
-    DownpushGatheredValueSource downpush_gathered;
     if (has_offset_mapping) {
         if (offset_mapping.GetValidCount() == 0) {
             FillEmptySearchResult(search_result, num_queries, topK);
@@ -366,21 +147,14 @@ SearchOnSealedIndex(const Schema& schema,
     }
 
     if (has_downpush && has_offset_mapping) {
-        // The vector index stores only valid rows (physical order), so the
-        // fused predicate must read scalar values in that same order. Gather
-        // the value source from logical to physical using the p2l mapping.
-        knowhere::BitsetView::ExtraScalarInt64PredicateFilter gathered_filter;
-        if (!GatherDownpushValueSource(
-                bitset.extra_scalar_int64_predicate_filter(),
-                offset_mapping,
-                gathered_filter,
-                downpush_gathered)) {
-            ThrowInfo(UnexpectedError,
-                      "downpush failed to gather value source to physical "
-                      "order");
-        }
+        // Keep scalar values in logical row order. Cardinal maps only the
+        // candidates it actually visits from physical vector offsets back to
+        // logical scalar offsets, avoiding an O(N) gathered copy per query.
+        auto mapped_filter = bitset.extra_scalar_int64_predicate_filter();
+        mapped_filter.scalar_row_id_mapper_context = &offset_mapping;
+        mapped_filter.scalar_row_id_mapper = &MapDownpushScalarRowId;
         search_bitset.set_extra_scalar_int64_predicate_filter(
-            gathered_filter, bitset.extra_filtered_out_count());
+            mapped_filter, bitset.extra_filtered_out_count());
     }
 
     if (search_info.iterator_v2_info_.has_value()) {

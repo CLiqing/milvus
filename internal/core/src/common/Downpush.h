@@ -16,11 +16,64 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
+#include "common/Types.h"
 #include "knowhere/comp/index_param.h"
 
 namespace milvus {
+
+enum class CardinalDownpushPredicateOp {
+    Int64GreaterEqual = 0,
+    Int64ModLessThan = 1,
+    Int64GreaterThan = 2,
+    Int64LessEqual = 3,
+    Int64LessThan = 4,
+    Int64Equal = 5,
+    Int64NotEqual = 6,
+    ScalarRange = 7,
+    ScalarAddLessThan = 8,
+    ScalarTerm = 9,
+    ScalarSubLessThan = 10,
+    ScalarMulLessThan = 11,
+    ScalarDivLessThan = 12,
+    StringPrefixMatch = 13,
+    StringPostfixMatch = 14,
+    StringInnerMatch = 15,
+    StringLikeMatch = 16,
+};
+
+enum class CardinalDownpushPredicateValueType {
+    Int64 = 0,
+    Float = 1,
+    String = 2,
+};
+
+struct CardinalDownpushPredicate {
+    FieldId field_id_;
+    DataType field_data_type_{DataType::NONE};
+    CardinalDownpushPredicateValueType value_type_{
+        CardinalDownpushPredicateValueType::Int64};
+    CardinalDownpushPredicateOp op_{
+        CardinalDownpushPredicateOp::Int64GreaterEqual};
+    int64_t arg0_{0};
+    int64_t arg1_{0};
+    double double_arg0_{0.0};
+    double double_arg1_{0.0};
+    std::string string_arg0_;
+    std::string string_arg1_;
+    std::vector<int64_t> int64_terms_;
+    std::vector<double> double_terms_;
+    std::vector<std::string> string_terms_;
+    std::vector<uint32_t> like_token_offsets_;
+    std::vector<uint32_t> like_token_sizes_;
+    std::vector<uint8_t> like_token_types_;
+    bool lower_inclusive_{true};
+    bool upper_inclusive_{true};
+    int64_t estimated_filtered_out_count_{0};
+};
 
 // Whether a vector index type supports scalar-predicate fusion (downpush, a.k.a.
 // "ann filter fusing"). Backend-agnostic: today the graph family (Cardinal +

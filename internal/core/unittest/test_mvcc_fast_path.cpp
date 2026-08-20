@@ -231,8 +231,9 @@ TEST_F(MvccFastPathTest, Level3_GrowingSegment_DefaultPath) {
         num_rows += output->size();
     }
     EXPECT_EQ(num_rows, N_);
-    EXPECT_FALSE(query_context->get_all_rows_visible())
-        << "Growing segment should NOT trigger fast path";
+    EXPECT_TRUE(query_context->get_all_rows_visible())
+        << "the growing default path materialized the visibility masks and "
+           "proved that the final bitmap is empty";
 }
 
 // ---------------------------------------------------------------------------
