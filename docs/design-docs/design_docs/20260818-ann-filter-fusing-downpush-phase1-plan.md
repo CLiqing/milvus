@@ -25,9 +25,9 @@ filter-fusing。当前实现（本分支）已打通 hint → Cardinal 的基础
 ### Out of scope（Phase 2 / 后续）
 - 自动决策 / 白名单（autoindex 式 `tuning.*` 配置或 hook 注入）。
 - 正式改名 ann filter fusing（wire 值 + 标识符 + 注释 + 设计文档）。
-- 依赖原始 varchar 值源的 `LIKE`。当 sealed + STL_SORT 布局只暴露字典
-  ID 而不暴露 raw-string chunk view 时，Phase 1 必须回退；等值、不等值和
-  term 仍可使用字典 ID 下推。
+- 依赖原始 varchar 值源的 match（prefix/postfix/inner/`LIKE`）。当 sealed
+  + STL_SORT 布局只暴露字典 ID 而不暴露 raw-string chunk view 时，Phase 1
+  必须回退；等值、不等值和 term 仍可使用字典 ID 下推。
 - Cardinal 之外的其它 backend。
 
 ## 3. 命名约定

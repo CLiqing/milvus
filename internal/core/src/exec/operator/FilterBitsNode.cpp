@@ -665,9 +665,9 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(
     // has already skipped materializing the normal bitmap by then, so failure
     // there would turn an optional hint into a request error.  Phase 1 must
     // always preserve correctness by falling back to the ordinary filter.
-    if (predicate->op_ == CardinalDownpushPredicateOp::StringLikeMatch) {
+    if (IsStringMatchOp(predicate->op_)) {
         LOG_DEBUG(
-            "downpush fallback: LIKE needs a raw varchar value source that "
+            "downpush fallback: varchar match needs a raw value source that "
             "is unavailable for some sealed scalar-index layouts");
         fallback("unsupported_predicate");
         return;
