@@ -300,7 +300,13 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
 
-    if (query_context_->get_search_info().cardinal_downpush_execution) {
+    const auto& search_info = query_context_->get_search_info();
+    if (search_info.cardinal_downpush_fallback_reason.has_value()) {
+        milvus::monitor::internal_core_downpush_fallback_count_family
+            .Add({{"reason",
+                   search_info.cardinal_downpush_fallback_reason.value()}})
+            .Increment();
+    } else if (search_info.cardinal_downpush_execution) {
         // downpush hint (ann filter fusing): attempt to fuse the scalar
         // predicate into the vector index. The hint is advisory — if any
         // precondition is unmet we silently fall back to the normal ExprSet

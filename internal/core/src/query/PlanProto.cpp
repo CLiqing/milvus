@@ -98,8 +98,18 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
         nlohmann::json::parse(query_info_proto.search_params());
     search_info.materialized_view_involved =
         query_info_proto.materialized_view_involved();
-    // currently, iterative filter does not support range search
-    if (!search_info.search_params_.contains(RADIUS)) {
+    // Range search does not currently support iterative filter or downpush.
+    // Preserve baseline behavior, but do not silently discard an explicit
+    // downpush request: FilterBitsNode records this pre-plan fallback.
+    if (search_info.search_params_.contains(RADIUS)) {
+        const bool downpush_requested =
+            query_info_proto.hints() == DOWNPUSH ||
+            (search_info.search_params_.contains(HINTS) &&
+             search_info.search_params_[HINTS] == DOWNPUSH);
+        if (downpush_requested) {
+            search_info.cardinal_downpush_fallback_reason = "range_search";
+        }
+    } else {
         if (query_info_proto.hints() != "") {
             if (query_info_proto.hints() == "disable") {
                 search_info.iterative_filter_execution = false;

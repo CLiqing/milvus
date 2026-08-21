@@ -73,6 +73,22 @@ TEST(PlanProto, RejectsGlobalRefineRatiosBelowOne) {
     EXPECT_ANY_THROW(parser.PlanNodeFromProto(BuildSearchPlanNode(1.5f, 0.5f)));
 }
 
+TEST(PlanProto, DownpushRangeSearchCarriesObservableFallback) {
+    using namespace milvus::query;
+
+    auto plan_node = BuildSearchPlanNode(1.0f, 1.0f);
+    auto* query_info = plan_node.mutable_vector_anns()->mutable_query_info();
+    query_info->set_hints("downpush");
+    query_info->set_search_params(R"({"radius": 10.0, "range_filter": 0.0})");
+
+    auto plan = CreateSearchPlanFromPlanNode(BuildSchema(), plan_node);
+    const auto& search_info = plan->plan_node_->search_info_;
+    EXPECT_FALSE(search_info.cardinal_downpush_execution);
+    ASSERT_TRUE(search_info.cardinal_downpush_fallback_reason.has_value());
+    EXPECT_EQ(search_info.cardinal_downpush_fallback_reason.value(),
+              "range_search");
+}
+
 TEST(PlanProto, VectorArrayFieldIdGapInStructArray) {
     namespace planpb = milvus::proto::plan;
     namespace schemapb = milvus::proto::schema;
