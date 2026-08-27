@@ -17,6 +17,7 @@
 #include "VectorSearchNode.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -75,9 +76,99 @@ struct CardinalDownpushSearchContext {
     size_t dictionary_row_count_{0};
     int32_t target_dictionary_id_{-1};
     bool target_dictionary_id_found_{false};
+    int64_t mod_divisor_{0};
+    int64_t mod_upper_bound_{0};
 };
 
 namespace {
+
+constexpr uint32_t kCandidateEvaluatorAbiMajor = 1;
+constexpr uint64_t kCandidateEvaluatorFeatureMod = uint64_t{1} << 0;
+
+const int64_t*
+ResolveInt64Value(const CardinalDownpushSearchContext& context,
+                  int64_t row_id) noexcept {
+    if (row_id < 0) {
+        return nullptr;
+    }
+    if (context.int64_row_values_ != nullptr) {
+        return static_cast<size_t>(row_id) < context.int64_row_values_->size()
+                   ? context.int64_row_values_->data() + row_id
+                   : nullptr;
+    }
+    if (context.int64_chunk_values_.empty() ||
+        context.chunk_offsets_.size() !=
+            context.int64_chunk_values_.size() + 1 ||
+        static_cast<size_t>(row_id) >=
+            static_cast<size_t>(context.chunk_offsets_.back())) {
+        return nullptr;
+    }
+    if (context.int64_chunk_values_.size() == 1) {
+        return context.int64_chunk_values_.front() + row_id;
+    }
+    const auto upper =
+        std::upper_bound(context.chunk_offsets_.begin(),
+                         context.chunk_offsets_.end(),
+                         row_id);
+    if (upper == context.chunk_offsets_.begin()) {
+        return nullptr;
+    }
+    const size_t chunk_id =
+        static_cast<size_t>((upper - context.chunk_offsets_.begin()) - 1);
+    if (chunk_id >= context.int64_chunk_values_.size() ||
+        context.int64_chunk_values_[chunk_id] == nullptr) {
+        return nullptr;
+    }
+    return context.int64_chunk_values_[chunk_id] +
+           (row_id - context.chunk_offsets_[chunk_id]);
+}
+
+int32_t
+EvaluateModCandidates(const void* opaque,
+                      const int64_t* row_ids,
+                      uint32_t count,
+                      uint64_t active_mask,
+                      uint64_t* pass_mask,
+                      uint64_t* evaluated_mask) noexcept {
+    if (opaque == nullptr || row_ids == nullptr || pass_mask == nullptr ||
+        evaluated_mask == nullptr || count > 64) {
+        return -1;
+    }
+    const auto& context =
+        *static_cast<const CardinalDownpushSearchContext*>(opaque);
+    const uint64_t lane_mask =
+        count == 64 ? UINT64_MAX
+                    : (count == 0 ? uint64_t{0}
+                                  : ((uint64_t{1} << count) - 1));
+    const uint64_t active = active_mask & lane_mask;
+    *pass_mask = 0;
+    *evaluated_mask = active;
+    if (context.mod_divisor_ <= 0) {
+        return 0;
+    }
+
+    std::array<const int64_t*, 64> values{};
+    for (uint32_t lane = 0; lane < count; ++lane) {
+        if ((active & (uint64_t{1} << lane)) == 0) {
+            continue;
+        }
+        values[lane] = ResolveInt64Value(context, row_ids[lane]);
+        if (values[lane] != nullptr) {
+            __builtin_prefetch(values[lane], 0, 1);
+        }
+    }
+
+    uint64_t accepted = 0;
+    for (uint32_t lane = 0; lane < count; ++lane) {
+        if (values[lane] != nullptr &&
+            *values[lane] % context.mod_divisor_ <
+                context.mod_upper_bound_) {
+            accepted |= uint64_t{1} << lane;
+        }
+    }
+    *pass_mask = accepted;
+    return 0;
+}
 
 std::optional<knowhere::BitsetView::ExtraScalarInt64PredicateOp>
 ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
@@ -222,6 +313,8 @@ BuildCardinalDownpushSearchContext(
     }
 
     auto ctx = std::make_shared<CardinalDownpushSearchContext>();
+    ctx->mod_divisor_ = predicate.arg0_;
+    ctx->mod_upper_bound_ = predicate.arg1_;
     if (predicate.value_type_ == CardinalDownpushPredicateValueType::Int64 &&
         segment->HasFieldData(predicate.field_id_) &&
         (field_data_type == DataType::INT64 ||
@@ -698,6 +791,16 @@ PhyVectorSearchNode::GetOutput() {
         filter.row_count = static_cast<size_t>(segment_->get_row_count());
         filter.op = op.value();
         FillKnowhereDownpushArgs(filter, predicate.value(), *downpush_ctx);
+        if (predicate->op_ == CardinalDownpushPredicateOp::Int64ModLessThan &&
+            predicate->value_type_ ==
+                CardinalDownpushPredicateValueType::Int64) {
+            filter.candidate_evaluator_abi_major =
+                kCandidateEvaluatorAbiMajor;
+            filter.candidate_evaluator_feature_bits =
+                kCandidateEvaluatorFeatureMod;
+            filter.candidate_evaluator_context = downpush_ctx.get();
+            filter.candidate_evaluator_batch = &EvaluateModCandidates;
+        }
         search_view.set_extra_scalar_int64_predicate_filter(
             filter,
             static_cast<size_t>(predicate->estimated_filtered_out_count_));
