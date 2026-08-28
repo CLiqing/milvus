@@ -19,9 +19,11 @@
 #include <folly/FBVector.h>
 #include <stddef.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -46,6 +48,7 @@
 #include "exec/QueryContext.h"
 #include "exec/Task.h"
 #include "exec/expression/EvalCtx.h"
+#include "exec/expression/CandidateEvaluator.h"
 #include "expr/ITypeExpr.h"
 #include "gtest/gtest.h"
 #include "index/BitmapIndex.h"
@@ -72,6 +75,367 @@
 #include "test_utils/storage_test_utils.h"
 
 EXPR_TEST_INSTANTIATE();
+
+TEST(CandidateEvaluatorTest, Int64ModSupportsContiguousChunkedAndPartialBatches) {
+    static constexpr std::array<int64_t, 10> values =
+        {-9, -1, 0, 1, 2, 3, 4, 5, 8, 13};
+    static constexpr std::array<const int64_t*, 3> chunks = {
+        values.data(), values.data() + 3, values.data() + 7};
+    static constexpr std::array<int64_t, 4> chunk_offsets = {0, 3, 7, 10};
+    static constexpr std::array<int64_t, 8> row_ids = {0, 1, 2, 3, 6, 7, 8, 9};
+
+    auto check = [&](const exec::Int64CandidateSourceView& source) {
+        auto prepared = exec::PrepareInt64ModCandidateEvaluator(source, 5, 2);
+        ASSERT_TRUE(prepared.has_value());
+        ASSERT_TRUE(static_cast<bool>(prepared.value()));
+        uint64_t valid_mask = 0;
+        const auto status = prepared->view.eval_batch(
+            prepared->view.context,
+            row_ids.data(),
+            row_ids.size(),
+            0b11101111,
+            &valid_mask);
+        EXPECT_EQ(status, 0);
+
+        uint64_t expected = 0;
+        for (size_t lane = 0; lane < row_ids.size(); ++lane) {
+            if ((0b11101111 & (uint64_t{1} << lane)) != 0 &&
+                values[row_ids[lane]] % 5 < 2) {
+                expected |= uint64_t{1} << lane;
+            }
+        }
+        EXPECT_EQ(valid_mask, expected);
+
+        ASSERT_NE(prepared->view.eval_contiguous, nullptr);
+        valid_mask = 0;
+        constexpr int64_t first_row_id = 1;
+        constexpr uint32_t contiguous_count = 7;
+        constexpr uint64_t contiguous_active = 0b1101111;
+        EXPECT_EQ(prepared->view.eval_contiguous(prepared->view.context,
+                                                 first_row_id,
+                                                 contiguous_count,
+                                                 contiguous_active,
+                                                 &valid_mask),
+                  0);
+        expected = 0;
+        for (uint32_t lane = 0; lane < contiguous_count; ++lane) {
+            if ((contiguous_active & (uint64_t{1} << lane)) != 0 &&
+                values[first_row_id + lane] % 5 < 2) {
+                expected |= uint64_t{1} << lane;
+            }
+        }
+        EXPECT_EQ(valid_mask, expected);
+    };
+
+    exec::Int64CandidateSourceView contiguous;
+    contiguous.row_values = values.data();
+    contiguous.row_count = values.size();
+    check(contiguous);
+
+    exec::Int64CandidateSourceView chunked;
+    chunked.row_count = values.size();
+    chunked.chunk_values = chunks.data();
+    chunked.chunk_offsets = chunk_offsets.data();
+    chunked.num_chunks = chunks.size();
+    check(chunked);
+
+    EXPECT_FALSE(exec::PrepareInt64ModCandidateEvaluator(contiguous, 0, 1)
+                     .has_value());
+    EXPECT_FALSE(exec::PrepareInt64ModCandidateEvaluator(contiguous, 5, 6)
+                     .has_value());
+}
+
+TEST(CandidateEvaluatorTest, Int64ComparisonRangeAndTermStayMilvusOwned) {
+    static constexpr std::array<int64_t, 9> values =
+        {-8, -1, 0, 1, 2, 3, 4, 8, 13};
+    static constexpr std::array<const int64_t*, 3> chunks = {
+        values.data(), values.data() + 2, values.data() + 6};
+    static constexpr std::array<int64_t, 4> chunk_offsets = {0, 2, 6, 9};
+    static constexpr std::array<int64_t, 9> row_ids = {8, 0, 7, 1, 6,
+                                                       2, 5, 3, 4};
+
+    exec::Int64CandidateSourceView contiguous;
+    contiguous.row_values = values.data();
+    contiguous.row_count = values.size();
+    exec::Int64CandidateSourceView chunked;
+    chunked.row_count = values.size();
+    chunked.chunk_values = chunks.data();
+    chunked.chunk_offsets = chunk_offsets.data();
+    chunked.num_chunks = chunks.size();
+
+    struct TestCase {
+        CardinalDownpushPredicateOp op;
+        int64_t arg0;
+        int64_t arg1;
+        bool lower_inclusive;
+        bool upper_inclusive;
+        std::function<bool(int64_t)> expected;
+    };
+    const std::vector<TestCase> cases = {
+        {CardinalDownpushPredicateOp::Int64GreaterEqual,
+         3,
+         0,
+         true,
+         true,
+         [](int64_t v) { return v >= 3; }},
+        {CardinalDownpushPredicateOp::Int64GreaterThan,
+         3,
+         0,
+         true,
+         true,
+         [](int64_t v) { return v > 3; }},
+        {CardinalDownpushPredicateOp::Int64LessEqual,
+         3,
+         0,
+         true,
+         true,
+         [](int64_t v) { return v <= 3; }},
+        {CardinalDownpushPredicateOp::Int64LessThan,
+         3,
+         0,
+         true,
+         true,
+         [](int64_t v) { return v < 3; }},
+        {CardinalDownpushPredicateOp::Int64Equal,
+         3,
+         0,
+         true,
+         true,
+         [](int64_t v) { return v == 3; }},
+        {CardinalDownpushPredicateOp::Int64NotEqual,
+         3,
+         0,
+         true,
+         true,
+         [](int64_t v) { return v != 3; }},
+        {CardinalDownpushPredicateOp::ScalarRange,
+         -1,
+         4,
+         false,
+         true,
+         [](int64_t v) { return v > -1 && v <= 4; }},
+    };
+
+    for (const auto& test_case : cases) {
+        CardinalDownpushPredicate predicate;
+        predicate.value_type_ = CardinalDownpushPredicateValueType::Int64;
+        predicate.op_ = test_case.op;
+        predicate.arg0_ = test_case.arg0;
+        predicate.arg1_ = test_case.arg1;
+        predicate.lower_inclusive_ = test_case.lower_inclusive;
+        predicate.upper_inclusive_ = test_case.upper_inclusive;
+
+        uint64_t reference_mask = 0;
+        for (size_t lane = 0; lane < row_ids.size(); ++lane) {
+            // Leave lane 3 inactive to exercise active-mask propagation.
+            if (lane != 3 && test_case.expected(values[row_ids[lane]])) {
+                reference_mask |= uint64_t{1} << lane;
+            }
+        }
+        for (const auto& source : {contiguous, chunked}) {
+            auto prepared =
+                exec::PrepareInt64CandidateEvaluator(source, predicate);
+            ASSERT_TRUE(prepared.has_value());
+            uint64_t valid_mask = 0;
+            EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
+                                                row_ids.data(),
+                                                row_ids.size(),
+                                                ~(uint64_t{1} << 3),
+                                                &valid_mask),
+                      0);
+            EXPECT_EQ(valid_mask, reference_mask);
+        }
+    }
+
+    CardinalDownpushPredicate term;
+    term.value_type_ = CardinalDownpushPredicateValueType::Int64;
+    term.op_ = CardinalDownpushPredicateOp::ScalarTerm;
+    term.int64_terms_ = {-8, 1, 4, 13};
+    auto prepared =
+        exec::PrepareInt64CandidateEvaluator(contiguous, term);
+    ASSERT_TRUE(prepared.has_value());
+    uint64_t valid_mask = 0;
+    EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
+                                        row_ids.data(),
+                                        row_ids.size(),
+                                        UINT64_MAX,
+                                        &valid_mask),
+              0);
+    uint64_t expected_mask = 0;
+    for (size_t lane = 0; lane < row_ids.size(); ++lane) {
+        if (std::binary_search(term.int64_terms_.begin(),
+                               term.int64_terms_.end(),
+                               values[row_ids[lane]])) {
+            expected_mask |= uint64_t{1} << lane;
+        }
+    }
+    EXPECT_EQ(valid_mask, expected_mask);
+
+    term.int64_terms_.clear();
+    EXPECT_FALSE(
+        exec::PrepareInt64CandidateEvaluator(contiguous, term).has_value());
+}
+
+TEST(CandidateEvaluatorTest, Int64ArithmeticUsesWideIntermediate) {
+    static constexpr std::array<int64_t, 8> values = {
+        INT64_MIN, -100, -7, 0, 7, 100, INT64_MAX - 1, INT64_MAX};
+    static constexpr std::array<int64_t, 8> row_ids = {0, 1, 2, 3,
+                                                       4, 5, 6, 7};
+    exec::Int64CandidateSourceView source;
+    source.row_values = values.data();
+    source.row_count = values.size();
+
+    struct TestCase {
+        CardinalDownpushPredicateOp op;
+        int64_t operand;
+        int64_t threshold;
+        std::function<bool(int64_t)> expected;
+    };
+    const std::vector<TestCase> cases = {
+        {CardinalDownpushPredicateOp::ScalarAddLessThan,
+         9,
+         50,
+         [](int64_t v) {
+             return static_cast<__int128>(v) + 9 < 50;
+         }},
+        {CardinalDownpushPredicateOp::ScalarSubLessThan,
+         -9,
+         50,
+         [](int64_t v) {
+             return static_cast<__int128>(v) - (-9) < 50;
+         }},
+        {CardinalDownpushPredicateOp::ScalarMulLessThan,
+         3,
+         50,
+         [](int64_t v) {
+             return static_cast<__int128>(v) * 3 < 50;
+         }},
+        {CardinalDownpushPredicateOp::ScalarDivLessThan,
+         -1,
+         50,
+         [](int64_t v) {
+             return static_cast<__int128>(v) / (-1) < 50;
+         }},
+    };
+
+    for (const auto& test_case : cases) {
+        CardinalDownpushPredicate predicate;
+        predicate.value_type_ = CardinalDownpushPredicateValueType::Int64;
+        predicate.op_ = test_case.op;
+        predicate.arg0_ = test_case.operand;
+        predicate.arg1_ = test_case.threshold;
+        auto prepared =
+            exec::PrepareInt64CandidateEvaluator(source, predicate);
+        ASSERT_TRUE(prepared.has_value());
+        uint64_t valid_mask = 0;
+        EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
+                                            row_ids.data(),
+                                            row_ids.size(),
+                                            UINT64_MAX,
+                                            &valid_mask),
+                  0);
+        uint64_t expected_mask = 0;
+        for (size_t lane = 0; lane < values.size(); ++lane) {
+            if (test_case.expected(values[lane])) {
+                expected_mask |= uint64_t{1} << lane;
+            }
+        }
+        EXPECT_EQ(valid_mask, expected_mask);
+    }
+
+    CardinalDownpushPredicate divide_by_zero;
+    divide_by_zero.value_type_ = CardinalDownpushPredicateValueType::Int64;
+    divide_by_zero.op_ =
+        CardinalDownpushPredicateOp::ScalarDivLessThan;
+    divide_by_zero.arg0_ = 0;
+    EXPECT_FALSE(exec::PrepareInt64CandidateEvaluator(source, divide_by_zero)
+                     .has_value());
+}
+
+TEST(CandidateEvaluatorTest, FloatLeavesPreserveIeeeSemantics) {
+    const std::array<float, 9> values = {
+        -std::numeric_limits<float>::infinity(),
+        -3.5F,
+        -0.0F,
+        0.0F,
+        1.25F,
+        3.5F,
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::quiet_NaN(),
+        8.0F};
+    const std::array<const float*, 2> chunks = {values.data(),
+                                                values.data() + 4};
+    const std::array<int64_t, 3> chunk_offsets = {0, 4, 9};
+    const std::array<int64_t, 9> row_ids = {8, 7, 6, 5, 4, 3, 2, 1, 0};
+    exec::FloatCandidateSourceView contiguous;
+    contiguous.row_values = values.data();
+    contiguous.row_count = values.size();
+    exec::FloatCandidateSourceView chunked;
+    chunked.row_count = values.size();
+    chunked.chunk_values = chunks.data();
+    chunked.chunk_offsets = chunk_offsets.data();
+    chunked.num_chunks = chunks.size();
+
+    auto check = [&](CardinalDownpushPredicate predicate,
+                     const std::function<bool(float)>& expected) {
+        for (const auto& source : {contiguous, chunked}) {
+            auto prepared =
+                exec::PrepareFloatCandidateEvaluator(source, predicate);
+            ASSERT_TRUE(prepared.has_value());
+            uint64_t valid_mask = 0;
+            EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
+                                                row_ids.data(),
+                                                row_ids.size(),
+                                                UINT64_MAX,
+                                                &valid_mask),
+                      0);
+            uint64_t expected_mask = 0;
+            for (size_t lane = 0; lane < row_ids.size(); ++lane) {
+                if (expected(values[row_ids[lane]])) {
+                    expected_mask |= uint64_t{1} << lane;
+                }
+            }
+            EXPECT_EQ(valid_mask, expected_mask);
+        }
+    };
+
+    CardinalDownpushPredicate predicate;
+    predicate.value_type_ = CardinalDownpushPredicateValueType::Float;
+    predicate.op_ = CardinalDownpushPredicateOp::Int64NotEqual;
+    predicate.double_arg0_ = 3.5;
+    check(predicate, [](float value) { return value != 3.5; });
+
+    predicate.op_ = CardinalDownpushPredicateOp::ScalarRange;
+    predicate.double_arg0_ = -3.5;
+    predicate.double_arg1_ = 3.5;
+    predicate.lower_inclusive_ = false;
+    predicate.upper_inclusive_ = true;
+    check(predicate,
+          [](float value) { return value > -3.5 && value <= 3.5; });
+
+    predicate.op_ = CardinalDownpushPredicateOp::ScalarTerm;
+    predicate.double_terms_ = {
+        std::numeric_limits<double>::quiet_NaN(), -3.5, 0.0, 8.0};
+    check(predicate,
+          [](float value) {
+              return value == -3.5F || value == 0.0F || value == 8.0F;
+          });
+
+    predicate.double_terms_.clear();
+    predicate.op_ = CardinalDownpushPredicateOp::ScalarAddLessThan;
+    predicate.double_arg0_ = 2.0;
+    predicate.double_arg1_ = 5.0;
+    check(predicate, [](float value) { return value + 2.0F < 5.0F; });
+
+    predicate.op_ = CardinalDownpushPredicateOp::ScalarDivLessThan;
+    predicate.double_arg0_ = -2.0;
+    predicate.double_arg1_ = 1.0;
+    check(predicate, [](float value) { return value / -2.0F < 1.0F; });
+
+    predicate.double_arg0_ = -0.0;
+    EXPECT_FALSE(exec::PrepareFloatCandidateEvaluator(contiguous, predicate)
+                     .has_value());
+}
 
 TEST_P(ExprTest, TestBinaryArithOpEvalRangeExpr_forbigint_mod) {
     // test (bigint mod 10 == 0)

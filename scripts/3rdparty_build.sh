@@ -149,6 +149,14 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     export CFLAGS="${CFLAGS} -DTARGET_OS_OSX=1${arm_crypto_flags}"
     export CXXFLAGS="${CXXFLAGS} -DTARGET_OS_OSX=1${arm_crypto_flags}"
 fi
+# On Linux aarch64, GCC only enables ARM CRC/Crypto intrinsics with an explicit
+# -march flag. aws-c-common's AWS_HAVE_ARM32_CRC configure test aborts (rather
+# than treating it as a missing feature) without it, and folly F14 needs +crc to
+# match milvus core's SimdAndCrc mode. Mirror the macOS arm64 flags here.
+if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" ]]; then
+    export CFLAGS="${CFLAGS} -march=armv8-a+crc+crypto"
+    export CXXFLAGS="${CXXFLAGS} -march=armv8-a+crc+crypto"
+fi
 # Allow CMake 4.x to build packages with old cmake_minimum_required versions (< 3.5)
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 

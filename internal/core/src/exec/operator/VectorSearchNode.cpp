@@ -17,7 +17,6 @@
 #include "VectorSearchNode.h"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -37,6 +36,7 @@
 #include "common/Tracer.h"
 #include "common/Utils.h"
 #include "exec/QueryContext.h"
+#include "exec/expression/CandidateEvaluator.h"
 #include "exec/expression/Utils.h"
 #include "exec/operator/Utils.h"
 #include "exec/operator/DownpushSearchContext.h"
@@ -76,99 +76,10 @@ struct CardinalDownpushSearchContext {
     size_t dictionary_row_count_{0};
     int32_t target_dictionary_id_{-1};
     bool target_dictionary_id_found_{false};
-    int64_t mod_divisor_{0};
-    int64_t mod_upper_bound_{0};
+    std::optional<PreparedCandidateEvaluator> candidate_evaluator_;
 };
 
 namespace {
-
-constexpr uint32_t kCandidateEvaluatorAbiMajor = 1;
-constexpr uint64_t kCandidateEvaluatorFeatureMod = uint64_t{1} << 0;
-
-const int64_t*
-ResolveInt64Value(const CardinalDownpushSearchContext& context,
-                  int64_t row_id) noexcept {
-    if (row_id < 0) {
-        return nullptr;
-    }
-    if (context.int64_row_values_ != nullptr) {
-        return static_cast<size_t>(row_id) < context.int64_row_values_->size()
-                   ? context.int64_row_values_->data() + row_id
-                   : nullptr;
-    }
-    if (context.int64_chunk_values_.empty() ||
-        context.chunk_offsets_.size() !=
-            context.int64_chunk_values_.size() + 1 ||
-        static_cast<size_t>(row_id) >=
-            static_cast<size_t>(context.chunk_offsets_.back())) {
-        return nullptr;
-    }
-    if (context.int64_chunk_values_.size() == 1) {
-        return context.int64_chunk_values_.front() + row_id;
-    }
-    const auto upper =
-        std::upper_bound(context.chunk_offsets_.begin(),
-                         context.chunk_offsets_.end(),
-                         row_id);
-    if (upper == context.chunk_offsets_.begin()) {
-        return nullptr;
-    }
-    const size_t chunk_id =
-        static_cast<size_t>((upper - context.chunk_offsets_.begin()) - 1);
-    if (chunk_id >= context.int64_chunk_values_.size() ||
-        context.int64_chunk_values_[chunk_id] == nullptr) {
-        return nullptr;
-    }
-    return context.int64_chunk_values_[chunk_id] +
-           (row_id - context.chunk_offsets_[chunk_id]);
-}
-
-int32_t
-EvaluateModCandidates(const void* opaque,
-                      const int64_t* row_ids,
-                      uint32_t count,
-                      uint64_t active_mask,
-                      uint64_t* pass_mask,
-                      uint64_t* evaluated_mask) noexcept {
-    if (opaque == nullptr || row_ids == nullptr || pass_mask == nullptr ||
-        evaluated_mask == nullptr || count > 64) {
-        return -1;
-    }
-    const auto& context =
-        *static_cast<const CardinalDownpushSearchContext*>(opaque);
-    const uint64_t lane_mask =
-        count == 64 ? UINT64_MAX
-                    : (count == 0 ? uint64_t{0}
-                                  : ((uint64_t{1} << count) - 1));
-    const uint64_t active = active_mask & lane_mask;
-    *pass_mask = 0;
-    *evaluated_mask = active;
-    if (context.mod_divisor_ <= 0) {
-        return 0;
-    }
-
-    std::array<const int64_t*, 64> values{};
-    for (uint32_t lane = 0; lane < count; ++lane) {
-        if ((active & (uint64_t{1} << lane)) == 0) {
-            continue;
-        }
-        values[lane] = ResolveInt64Value(context, row_ids[lane]);
-        if (values[lane] != nullptr) {
-            __builtin_prefetch(values[lane], 0, 1);
-        }
-    }
-
-    uint64_t accepted = 0;
-    for (uint32_t lane = 0; lane < count; ++lane) {
-        if (values[lane] != nullptr &&
-            *values[lane] % context.mod_divisor_ <
-                context.mod_upper_bound_) {
-            accepted |= uint64_t{1} << lane;
-        }
-    }
-    *pass_mask = accepted;
-    return 0;
-}
 
 std::optional<knowhere::BitsetView::ExtraScalarInt64PredicateOp>
 ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
@@ -313,8 +224,6 @@ BuildCardinalDownpushSearchContext(
     }
 
     auto ctx = std::make_shared<CardinalDownpushSearchContext>();
-    ctx->mod_divisor_ = predicate.arg0_;
-    ctx->mod_upper_bound_ = predicate.arg1_;
     if (predicate.value_type_ == CardinalDownpushPredicateValueType::Int64 &&
         segment->HasFieldData(predicate.field_id_) &&
         (field_data_type == DataType::INT64 ||
@@ -605,6 +514,43 @@ PrepareCardinalDownpushSearchContext(
         !IsDownpushPredicateSourceReady(*context, predicate.value_type_)) {
         return nullptr;
     }
+    if (predicate.value_type_ ==
+        CardinalDownpushPredicateValueType::Int64) {
+        Int64CandidateSourceView source;
+        source.row_values = context->int64_row_values_ == nullptr
+                                ? nullptr
+                                : context->int64_row_values_->data();
+        source.row_count = static_cast<size_t>(segment->get_row_count());
+        source.chunk_values = context->int64_chunk_values_.empty()
+                                  ? nullptr
+                                  : context->int64_chunk_values_.data();
+        source.chunk_offsets = context->chunk_offsets_.empty()
+                                   ? nullptr
+                                   : context->chunk_offsets_.data();
+        source.num_chunks = context->int64_chunk_values_.size();
+        auto evaluator = PrepareInt64CandidateEvaluator(source, predicate);
+        if (evaluator.has_value()) {
+            context->candidate_evaluator_ = std::move(evaluator.value());
+        }
+    } else if (predicate.value_type_ ==
+               CardinalDownpushPredicateValueType::Float) {
+        FloatCandidateSourceView source;
+        source.row_values = context->float_row_values_ == nullptr
+                                ? nullptr
+                                : context->float_row_values_->data();
+        source.row_count = static_cast<size_t>(segment->get_row_count());
+        source.chunk_values = context->float_chunk_values_.empty()
+                                  ? nullptr
+                                  : context->float_chunk_values_.data();
+        source.chunk_offsets = context->chunk_offsets_.empty()
+                                   ? nullptr
+                                   : context->chunk_offsets_.data();
+        source.num_chunks = context->float_chunk_values_.size();
+        auto evaluator = PrepareFloatCandidateEvaluator(source, predicate);
+        if (evaluator.has_value()) {
+            context->candidate_evaluator_ = std::move(evaluator.value());
+        }
+    }
     return context;
 }
 
@@ -770,40 +716,62 @@ PhyVectorSearchNode::GetOutput() {
         AssertInfo(!ph.element_level_,
                    "downpush hint does not support element-level vector "
                    "search");
-        auto op = ToKnowherePredicateOp(predicate->op_);
         downpush_ctx = query_context_->get_cardinal_downpush_search_context();
-        std::optional<knowhere::BitsetView::ExtraScalarPredicateValueType>
-            value_type;
-        if (downpush_ctx != nullptr) {
-            value_type = ToKnowherePredicateValueType(predicate->value_type_,
-                                                      *downpush_ctx);
-        }
-        if (!op.has_value() || !value_type.has_value() ||
-            downpush_ctx == nullptr ||
+        if (downpush_ctx == nullptr ||
             !IsDownpushPredicateSourceReady(*downpush_ctx,
                                             predicate->value_type_)) {
             ThrowInfo(UnexpectedError,
                       "failed to build Cardinal downpush search context");
         }
-        knowhere::BitsetView::ExtraScalarInt64PredicateFilter filter;
-        filter.value_type = value_type.value();
-        FillKnowhereDownpushValueSource(filter, *downpush_ctx);
-        filter.row_count = static_cast<size_t>(segment_->get_row_count());
-        filter.op = op.value();
-        FillKnowhereDownpushArgs(filter, predicate.value(), *downpush_ctx);
-        if (predicate->op_ == CardinalDownpushPredicateOp::Int64ModLessThan &&
+        const bool has_candidate_evaluator =
+            downpush_ctx->candidate_evaluator_.has_value() &&
+            static_cast<bool>(downpush_ctx->candidate_evaluator_.value());
+        const bool is_numeric_predicate =
             predicate->value_type_ ==
-                CardinalDownpushPredicateValueType::Int64) {
-            filter.candidate_evaluator_abi_major =
-                kCandidateEvaluatorAbiMajor;
-            filter.candidate_evaluator_feature_bits =
-                kCandidateEvaluatorFeatureMod;
-            filter.candidate_evaluator_context = downpush_ctx.get();
-            filter.candidate_evaluator_batch = &EvaluateModCandidates;
+                CardinalDownpushPredicateValueType::Int64 ||
+            predicate->value_type_ ==
+                CardinalDownpushPredicateValueType::Float;
+        AssertInfo(!is_numeric_predicate || has_candidate_evaluator,
+                   "numeric candidate evaluator was not prepared before "
+                   "downpush commit");
+        if (has_candidate_evaluator) {
+            AssertInfo(downpush_ctx->candidate_evaluator_.has_value() &&
+                           static_cast<bool>(
+                               downpush_ctx->candidate_evaluator_.value()),
+                       "candidate evaluator was not prepared before "
+                       "downpush commit");
+            const auto& prepared = downpush_ctx->candidate_evaluator_.value();
+            knowhere::BitsetView::CandidateEvaluatorV1 evaluator;
+            evaluator.abi_major = prepared.view.abi_major;
+            evaluator.struct_size = sizeof(evaluator);
+            evaluator.abi_capabilities = prepared.view.abi_capabilities;
+            evaluator.context = prepared.view.context;
+            evaluator.eval_batch = prepared.view.eval_batch;
+            evaluator.eval_contiguous = prepared.view.eval_contiguous;
+            search_view.set_candidate_evaluator(
+                evaluator,
+                static_cast<size_t>(segment_->get_row_count()),
+                static_cast<size_t>(
+                    predicate->estimated_filtered_out_count_));
+        } else {
+            auto op = ToKnowherePredicateOp(predicate->op_);
+            auto value_type = ToKnowherePredicateValueType(
+                predicate->value_type_, *downpush_ctx);
+            if (!op.has_value() || !value_type.has_value()) {
+                ThrowInfo(UnexpectedError,
+                          "failed to translate Cardinal downpush predicate");
+            }
+            knowhere::BitsetView::ExtraScalarInt64PredicateFilter filter;
+            filter.value_type = value_type.value();
+            FillKnowhereDownpushValueSource(filter, *downpush_ctx);
+            filter.row_count = static_cast<size_t>(segment_->get_row_count());
+            filter.op = op.value();
+            FillKnowhereDownpushArgs(filter, predicate.value(), *downpush_ctx);
+            search_view.set_extra_scalar_int64_predicate_filter(
+                filter,
+                static_cast<size_t>(
+                    predicate->estimated_filtered_out_count_));
         }
-        search_view.set_extra_scalar_int64_predicate_filter(
-            filter,
-            static_cast<size_t>(predicate->estimated_filtered_out_count_));
         const char* value_type_name =
             predicate->value_type_ == CardinalDownpushPredicateValueType::Int64
                 ? "int64"

@@ -45,7 +45,10 @@ class VecIndexConfig {
         "experimental_numeric_filter_batch_min_fill",
         "experimental_numeric_filter_batch_tail_mode",
         "experimental_numeric_filter_batch_prefetch",
-        "experimental_numeric_filter_batch_kernel"};
+        "experimental_numeric_filter_batch_kernel",
+        "downpush_debug_counter",
+        "downpush_debug_wall_timer",
+        "experimental_numeric_filter_batch_trace"};
 
  public:
     VecIndexConfig(const int64_t max_index_row_count,

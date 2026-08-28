@@ -53,7 +53,8 @@ namespace milvus::query {
 namespace {
 
 int64_t
-MapDownpushScalarRowId(const void* context, int64_t physical_offset) {
+MapDownpushScalarRowId(const void* context,
+                       int64_t physical_offset) noexcept {
     if (context == nullptr) {
         return -1;
     }
@@ -110,7 +111,8 @@ SearchOnSealedIndex(const Schema& schema,
     auto vec_index =
         dynamic_cast<index::VectorIndex*>(accessor->get_cell_of(0));
     AssertInfo(vec_index != nullptr, "invalid vector index");
-    if (bitset.has_extra_scalar_int64_predicate_filter()) {
+    if (bitset.has_extra_scalar_int64_predicate_filter() ||
+        bitset.has_candidate_evaluator()) {
         auto index_type = vec_index->GetIndexType();
         AssertInfo(IsDownpushSupportedIndexType(index_type),
                    "downpush hint is only supported by Cardinal index/backend "
@@ -125,7 +127,11 @@ SearchOnSealedIndex(const Schema& schema,
     BitsetView search_bitset = bitset;
     const auto has_offset_mapping =
         offset_mapping.IsEnabled() && !is_element_level_search;
-    const bool has_downpush = bitset.has_extra_scalar_int64_predicate_filter();
+    const bool has_legacy_downpush =
+        bitset.has_extra_scalar_int64_predicate_filter();
+    const bool has_candidate_evaluator = bitset.has_candidate_evaluator();
+    const bool has_downpush =
+        has_legacy_downpush || has_candidate_evaluator;
 
     if (has_offset_mapping) {
         if (offset_mapping.GetValidCount() == 0) {
@@ -133,8 +139,12 @@ SearchOnSealedIndex(const Schema& schema,
             return;
         }
         if (!bitset.empty()) {
-            auto status =
-                offset_mapping.TransformBitset(bitset, transformed_bitset);
+            // Only the mandatory/base bitmap is transformed. A deferred user
+            // predicate remains candidate-driven and must never be evaluated
+            // by this O(N) physical-offset conversion.
+            const milvus::BitsetView base_bitset(bitset.data(), bitset.size());
+            auto status = offset_mapping.TransformBitset(base_bitset,
+                                                         transformed_bitset);
             if (status == OffsetMapping::BitsetTransformStatus::AllFiltered) {
                 FillEmptySearchResult(search_result, num_queries, topK);
                 return;
@@ -146,7 +156,7 @@ SearchOnSealedIndex(const Schema& schema,
         }
     }
 
-    if (has_downpush && has_offset_mapping) {
+    if (has_legacy_downpush && has_offset_mapping) {
         // Keep scalar values in logical row order. Cardinal maps only the
         // candidates it actually visits from physical vector offsets back to
         // logical scalar offsets, avoiding an O(N) gathered copy per query.
@@ -155,6 +165,18 @@ SearchOnSealedIndex(const Schema& schema,
         mapped_filter.scalar_row_id_mapper = &MapDownpushScalarRowId;
         search_bitset.set_extra_scalar_int64_predicate_filter(
             mapped_filter, bitset.extra_filtered_out_count());
+    }
+    if (has_candidate_evaluator) {
+        auto evaluator = bitset.candidate_evaluator();
+        if (has_offset_mapping) {
+            evaluator.row_id_mapper_context = &offset_mapping;
+            evaluator.row_id_mapper = &MapDownpushScalarRowId;
+        }
+        search_bitset.set_candidate_evaluator(
+            evaluator,
+            has_offset_mapping ? offset_mapping.GetValidCount()
+                               : bitset.size(),
+            bitset.extra_filtered_out_count());
     }
 
     if (search_info.iterator_v2_info_.has_value()) {
