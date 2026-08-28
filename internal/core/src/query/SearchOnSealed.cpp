@@ -138,7 +138,7 @@ SearchOnSealedIndex(const Schema& schema,
             FillEmptySearchResult(search_result, num_queries, topK);
             return;
         }
-        if (!bitset.empty()) {
+        if (bitset.data() != nullptr) {
             // Only the mandatory/base bitmap is transformed. A deferred user
             // predicate remains candidate-driven and must never be evaluated
             // by this O(N) physical-offset conversion.
@@ -153,6 +153,11 @@ SearchOnSealedIndex(const Schema& schema,
                 status == OffsetMapping::BitsetTransformStatus::NoFilter
                     ? BitsetView{}
                     : search_result.PinBitset(std::move(transformed_bitset));
+        } else {
+            // A deferred evaluator carries the logical row count even when
+            // all mandatory rows are visible. Do not interpret that size as
+            // a materialized bitmap with a null backing pointer.
+            search_bitset = BitsetView{};
         }
     }
 

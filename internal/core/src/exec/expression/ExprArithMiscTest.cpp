@@ -276,6 +276,92 @@ TEST(CandidateEvaluatorTest, Int64ComparisonRangeAndTermStayMilvusOwned) {
         exec::PrepareInt64CandidateEvaluator(contiguous, term).has_value());
 }
 
+TEST(CandidateEvaluatorTest, StringComparisonRangeAndTermStayMilvusOwned) {
+    static constexpr char chunk0[] = "antbeecat";
+    static constexpr char chunk1[] = "dogeelfox";
+    static constexpr std::array<const char*, 2> bases = {chunk0, chunk1};
+    static constexpr std::array<uint32_t, 4> offsets0 = {0, 3, 6, 9};
+    static constexpr std::array<uint32_t, 4> offsets1 = {0, 3, 6, 9};
+    static constexpr std::array<const uint32_t*, 2> offsets = {
+        offsets0.data(), offsets1.data()};
+    static constexpr std::array<bool, 3> valid0 = {true, false, true};
+    static constexpr std::array<bool, 3> valid1 = {true, true, true};
+    static constexpr std::array<const bool*, 2> validity = {
+        valid0.data(), valid1.data()};
+    static constexpr std::array<size_t, 2> row_counts = {3, 3};
+    static constexpr std::array<int64_t, 3> row_offsets = {0, 3, 6};
+    static constexpr std::array<int64_t, 6> row_ids = {5, 0, 3, 1, 4, 2};
+
+    exec::StringCandidateSourceView source;
+    source.chunk_bases = bases.data();
+    source.chunk_value_offsets = offsets.data();
+    source.chunk_valid_data = validity.data();
+    source.chunk_row_counts = row_counts.data();
+    source.chunk_row_offsets = row_offsets.data();
+    source.num_chunks = bases.size();
+    source.row_count = 6;
+    source.uniform_chunk_rows = 3;
+
+    auto evaluate = [&](CardinalDownpushPredicate predicate) {
+        predicate.value_type_ = CardinalDownpushPredicateValueType::String;
+        auto prepared = exec::PrepareStringCandidateEvaluator(source, predicate);
+        EXPECT_TRUE(prepared.has_value());
+        uint64_t valid_mask = 0;
+        EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
+                                            row_ids.data(),
+                                            row_ids.size(),
+                                            (uint64_t{1} << row_ids.size()) - 1,
+                                            &valid_mask),
+                  0);
+        return valid_mask;
+    };
+
+    CardinalDownpushPredicate equal;
+    equal.op_ = CardinalDownpushPredicateOp::Int64Equal;
+    equal.string_arg0_ = "dog";
+    EXPECT_EQ(evaluate(equal), uint64_t{1} << 2);
+
+    CardinalDownpushPredicate range;
+    range.op_ = CardinalDownpushPredicateOp::ScalarRange;
+    range.string_arg0_ = "cat";
+    range.string_arg1_ = "fox";
+    range.lower_inclusive_ = true;
+    range.upper_inclusive_ = false;
+    EXPECT_EQ(evaluate(range), (uint64_t{1} << 2) | (uint64_t{1} << 4) |
+                                   (uint64_t{1} << 5));
+
+    CardinalDownpushPredicate term;
+    term.op_ = CardinalDownpushPredicateOp::ScalarTerm;
+    term.string_terms_ = {"fox", "ant"};
+    EXPECT_EQ(evaluate(term), (uint64_t{1} << 0) | (uint64_t{1} << 1));
+
+    static constexpr std::array<int32_t, 4> dictionary_ids = {1, -1, 2, 1};
+    exec::StringCandidateSourceView dictionary;
+    dictionary.row_count = dictionary_ids.size();
+    dictionary.row_dictionary_ids = dictionary_ids.data();
+    dictionary.target_dictionary_id = 1;
+    dictionary.target_dictionary_id_found = true;
+    static constexpr std::array<int64_t, 4> dictionary_rows = {0, 1, 2, 3};
+    equal.value_type_ = CardinalDownpushPredicateValueType::String;
+    auto prepared = exec::PrepareStringCandidateEvaluator(dictionary, equal);
+    ASSERT_TRUE(prepared.has_value());
+    uint64_t valid_mask = 0;
+    EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
+                                        dictionary_rows.data(),
+                                        dictionary_rows.size(),
+                                        (uint64_t{1} << dictionary_rows.size()) -
+                                            1,
+                                        &valid_mask),
+              0);
+    EXPECT_EQ(valid_mask, (uint64_t{1} << 0) | (uint64_t{1} << 3));
+
+    CardinalDownpushPredicate like;
+    like.value_type_ = CardinalDownpushPredicateValueType::String;
+    like.op_ = CardinalDownpushPredicateOp::StringLikeMatch;
+    EXPECT_FALSE(exec::PrepareStringCandidateEvaluator(source, like)
+                     .has_value());
+}
+
 TEST(CandidateEvaluatorTest, Int64ArithmeticUsesWideIntermediate) {
     static constexpr std::array<int64_t, 8> values = {
         INT64_MIN, -100, -7, 0, 7, 100, INT64_MAX - 1, INT64_MAX};

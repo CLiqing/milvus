@@ -550,6 +550,37 @@ PrepareCardinalDownpushSearchContext(
         if (evaluator.has_value()) {
             context->candidate_evaluator_ = std::move(evaluator.value());
         }
+    } else if (predicate.value_type_ ==
+               CardinalDownpushPredicateValueType::String) {
+        StringCandidateSourceView source;
+        source.chunk_bases = context->string_chunk_bases_.empty()
+                                 ? nullptr
+                                 : context->string_chunk_bases_.data();
+        source.chunk_value_offsets =
+            context->string_chunk_value_offsets_.empty()
+                ? nullptr
+                : context->string_chunk_value_offsets_.data();
+        source.chunk_valid_data =
+            context->string_chunk_valid_data_.empty()
+                ? nullptr
+                : context->string_chunk_valid_data_.data();
+        source.chunk_row_counts = context->string_chunk_row_counts_.empty()
+                                      ? nullptr
+                                      : context->string_chunk_row_counts_.data();
+        source.chunk_row_offsets = context->chunk_offsets_.empty()
+                                       ? nullptr
+                                       : context->chunk_offsets_.data();
+        source.num_chunks = context->string_pins_.size();
+        source.row_count = static_cast<size_t>(segment->get_row_count());
+        source.uniform_chunk_rows = context->string_uniform_chunk_rows_;
+        source.row_dictionary_ids = context->row_dictionary_ids_;
+        source.target_dictionary_id = context->target_dictionary_id_;
+        source.target_dictionary_id_found =
+            context->target_dictionary_id_found_;
+        auto evaluator = PrepareStringCandidateEvaluator(source, predicate);
+        if (evaluator.has_value()) {
+            context->candidate_evaluator_ = std::move(evaluator.value());
+        }
     }
     return context;
 }

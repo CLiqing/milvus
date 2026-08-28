@@ -64,6 +64,23 @@ struct FloatCandidateSourceView {
     size_t num_chunks = 0;
 };
 
+// String-module source contract. Raw chunks preserve zero-copy access to the
+// sealed string column. Dictionary IDs are an optional EQ/NE specialization;
+// neither representation crosses the generic Knowhere/Cardinal ABI.
+struct StringCandidateSourceView {
+    const char* const* chunk_bases = nullptr;
+    const uint32_t* const* chunk_value_offsets = nullptr;
+    const bool* const* chunk_valid_data = nullptr;
+    const size_t* chunk_row_counts = nullptr;
+    const int64_t* chunk_row_offsets = nullptr;
+    size_t num_chunks = 0;
+    size_t row_count = 0;
+    size_t uniform_chunk_rows = 0;
+    const int32_t* row_dictionary_ids = nullptr;
+    int32_t target_dictionary_id = -1;
+    bool target_dictionary_id_found = false;
+};
+
 std::optional<PreparedCandidateEvaluator>
 PrepareInt64ModCandidateEvaluator(const Int64CandidateSourceView& source,
                                   int64_t divisor,
@@ -79,5 +96,9 @@ PrepareInt64CandidateEvaluator(const Int64CandidateSourceView& source,
 std::optional<PreparedCandidateEvaluator>
 PrepareFloatCandidateEvaluator(const FloatCandidateSourceView& source,
                                const CardinalDownpushPredicate& predicate);
+
+std::optional<PreparedCandidateEvaluator>
+PrepareStringCandidateEvaluator(const StringCandidateSourceView& source,
+                                const CardinalDownpushPredicate& predicate);
 
 }  // namespace milvus::exec
