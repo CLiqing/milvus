@@ -118,51 +118,49 @@ ResolveFloatCandidateValue(const FloatCandidateSourceView& source,
            (row_id - source.chunk_offsets[chunk_id]);
 }
 
+template <Int64EvaluatorOp Op>
 bool
-EvaluateInt64Value(const Int64EvaluatorState& state, int64_t value) noexcept {
-    switch (state.op) {
-        case Int64EvaluatorOp::GreaterEqual:
-            return value >= state.arg0;
-        case Int64EvaluatorOp::ModLessThan:
-            return value % state.arg0 < state.arg1;
-        case Int64EvaluatorOp::GreaterThan:
-            return value > state.arg0;
-        case Int64EvaluatorOp::LessEqual:
-            return value <= state.arg0;
-        case Int64EvaluatorOp::LessThan:
-            return value < state.arg0;
-        case Int64EvaluatorOp::Equal:
-            return value == state.arg0;
-        case Int64EvaluatorOp::NotEqual:
-            return value != state.arg0;
-        case Int64EvaluatorOp::Range: {
-            const bool lower_ok = state.lower_inclusive
-                                      ? value >= state.arg0
-                                      : value > state.arg0;
-            const bool upper_ok = state.upper_inclusive
-                                      ? value <= state.arg1
-                                      : value < state.arg1;
-            return lower_ok && upper_ok;
-        }
-        case Int64EvaluatorOp::Term:
-            return std::binary_search(
-                state.terms.begin(), state.terms.end(), value);
-        case Int64EvaluatorOp::AddLessThan:
-            return static_cast<__int128>(value) +
-                       static_cast<__int128>(state.arg0) <
-                   static_cast<__int128>(state.arg1);
-        case Int64EvaluatorOp::SubLessThan:
-            return static_cast<__int128>(value) -
-                       static_cast<__int128>(state.arg0) <
-                   static_cast<__int128>(state.arg1);
-        case Int64EvaluatorOp::MulLessThan:
-            return static_cast<__int128>(value) *
-                       static_cast<__int128>(state.arg0) <
-                   static_cast<__int128>(state.arg1);
-        case Int64EvaluatorOp::DivLessThan:
-            return static_cast<__int128>(value) /
-                       static_cast<__int128>(state.arg0) <
-                   static_cast<__int128>(state.arg1);
+EvaluateInt64ValueSpecialized(const Int64EvaluatorState& state,
+                              int64_t value) noexcept {
+    if constexpr (Op == Int64EvaluatorOp::GreaterEqual) {
+        return value >= state.arg0;
+    } else if constexpr (Op == Int64EvaluatorOp::ModLessThan) {
+        return value % state.arg0 < state.arg1;
+    } else if constexpr (Op == Int64EvaluatorOp::GreaterThan) {
+        return value > state.arg0;
+    } else if constexpr (Op == Int64EvaluatorOp::LessEqual) {
+        return value <= state.arg0;
+    } else if constexpr (Op == Int64EvaluatorOp::LessThan) {
+        return value < state.arg0;
+    } else if constexpr (Op == Int64EvaluatorOp::Equal) {
+        return value == state.arg0;
+    } else if constexpr (Op == Int64EvaluatorOp::NotEqual) {
+        return value != state.arg0;
+    } else if constexpr (Op == Int64EvaluatorOp::Range) {
+        const bool lower_ok = state.lower_inclusive ? value >= state.arg0
+                                                    : value > state.arg0;
+        const bool upper_ok = state.upper_inclusive ? value <= state.arg1
+                                                    : value < state.arg1;
+        return lower_ok && upper_ok;
+    } else if constexpr (Op == Int64EvaluatorOp::Term) {
+        return std::binary_search(
+            state.terms.begin(), state.terms.end(), value);
+    } else if constexpr (Op == Int64EvaluatorOp::AddLessThan) {
+        return static_cast<__int128>(value) +
+                   static_cast<__int128>(state.arg0) <
+               static_cast<__int128>(state.arg1);
+    } else if constexpr (Op == Int64EvaluatorOp::SubLessThan) {
+        return static_cast<__int128>(value) -
+                   static_cast<__int128>(state.arg0) <
+               static_cast<__int128>(state.arg1);
+    } else if constexpr (Op == Int64EvaluatorOp::MulLessThan) {
+        return static_cast<__int128>(value) *
+                   static_cast<__int128>(state.arg0) <
+               static_cast<__int128>(state.arg1);
+    } else if constexpr (Op == Int64EvaluatorOp::DivLessThan) {
+        return static_cast<__int128>(value) /
+                   static_cast<__int128>(state.arg0) <
+               static_cast<__int128>(state.arg1);
     }
     return false;
 }
@@ -210,6 +208,7 @@ EvaluateFloatValue(const FloatEvaluatorState& state, float raw_value) noexcept {
     return false;
 }
 
+template <Int64EvaluatorOp Op>
 int32_t
 EvaluateInt64Candidates(const void* opaque,
                         const int64_t* row_ids,
@@ -229,20 +228,43 @@ EvaluateInt64Candidates(const void* opaque,
     const uint64_t active = active_mask & lane_mask;
 
     std::array<const int64_t*, 64> values{};
-    for (uint32_t lane = 0; lane < count; ++lane) {
-        if ((active & (uint64_t{1} << lane)) == 0) {
-            continue;
+    const auto& source = state.source;
+    if (source.row_values != nullptr) {
+        for (uint32_t lane = 0; lane < count; ++lane) {
+            const auto row_id = row_ids[lane];
+            if ((active & (uint64_t{1} << lane)) != 0 && row_id >= 0 &&
+                static_cast<size_t>(row_id) < source.row_count) {
+                values[lane] = source.row_values + row_id;
+                __builtin_prefetch(values[lane], 0, 1);
+            }
         }
-        values[lane] = ResolveInt64CandidateValue(state.source, row_ids[lane]);
-        if (values[lane] != nullptr) {
-            __builtin_prefetch(values[lane], 0, 1);
+    } else if (source.num_chunks == 1 && source.chunk_values != nullptr &&
+               source.chunk_values[0] != nullptr) {
+        const auto* chunk = source.chunk_values[0];
+        for (uint32_t lane = 0; lane < count; ++lane) {
+            const auto row_id = row_ids[lane];
+            if ((active & (uint64_t{1} << lane)) != 0 && row_id >= 0 &&
+                static_cast<size_t>(row_id) < source.row_count) {
+                values[lane] = chunk + row_id;
+                __builtin_prefetch(values[lane], 0, 1);
+            }
+        }
+    } else {
+        for (uint32_t lane = 0; lane < count; ++lane) {
+            if ((active & (uint64_t{1} << lane)) == 0) {
+                continue;
+            }
+            values[lane] = ResolveInt64CandidateValue(source, row_ids[lane]);
+            if (values[lane] != nullptr) {
+                __builtin_prefetch(values[lane], 0, 1);
+            }
         }
     }
 
     uint64_t accepted = 0;
     for (uint32_t lane = 0; lane < count; ++lane) {
         if (values[lane] != nullptr &&
-            EvaluateInt64Value(state, *values[lane])) {
+            EvaluateInt64ValueSpecialized<Op>(state, *values[lane])) {
             accepted |= uint64_t{1} << lane;
         }
     }
@@ -250,6 +272,7 @@ EvaluateInt64Candidates(const void* opaque,
     return 0;
 }
 
+template <Int64EvaluatorOp Op>
 int32_t
 EvaluateInt64ContiguousCandidates(const void* opaque,
                                   int64_t first_row_id,
@@ -277,7 +300,7 @@ EvaluateInt64ContiguousCandidates(const void* opaque,
         for (uint32_t lane = 0; lane < count; ++lane) {
             const uint64_t lane_bit = uint64_t{1} << lane;
             if ((active & lane_bit) != 0 &&
-                EvaluateInt64Value(state, values[lane])) {
+                EvaluateInt64ValueSpecialized<Op>(state, values[lane])) {
                 accepted |= lane_bit;
             }
         }
@@ -289,13 +312,43 @@ EvaluateInt64ContiguousCandidates(const void* opaque,
             }
             const auto* value = ResolveInt64CandidateValue(
                 state.source, first_row_id + static_cast<int64_t>(lane));
-            if (value != nullptr && EvaluateInt64Value(state, *value)) {
+            if (value != nullptr &&
+                EvaluateInt64ValueSpecialized<Op>(state, *value)) {
                 accepted |= lane_bit;
             }
         }
     }
     *valid_mask = accepted;
     return 0;
+}
+
+void
+ConfigureInt64EvaluatorCallbacks(Int64EvaluatorOp op,
+                                 CandidateEvaluatorV1& view) {
+#define SET_INT64_EVALUATOR_CALLBACKS(op_name)                            \
+    case Int64EvaluatorOp::op_name:                                      \
+        view.eval_batch = &EvaluateInt64Candidates<                      \
+            Int64EvaluatorOp::op_name>;                                  \
+        view.eval_contiguous = &EvaluateInt64ContiguousCandidates<       \
+            Int64EvaluatorOp::op_name>;                                  \
+        return
+
+    switch (op) {
+        SET_INT64_EVALUATOR_CALLBACKS(GreaterEqual);
+        SET_INT64_EVALUATOR_CALLBACKS(ModLessThan);
+        SET_INT64_EVALUATOR_CALLBACKS(GreaterThan);
+        SET_INT64_EVALUATOR_CALLBACKS(LessEqual);
+        SET_INT64_EVALUATOR_CALLBACKS(LessThan);
+        SET_INT64_EVALUATOR_CALLBACKS(Equal);
+        SET_INT64_EVALUATOR_CALLBACKS(NotEqual);
+        SET_INT64_EVALUATOR_CALLBACKS(Range);
+        SET_INT64_EVALUATOR_CALLBACKS(Term);
+        SET_INT64_EVALUATOR_CALLBACKS(AddLessThan);
+        SET_INT64_EVALUATOR_CALLBACKS(SubLessThan);
+        SET_INT64_EVALUATOR_CALLBACKS(MulLessThan);
+        SET_INT64_EVALUATOR_CALLBACKS(DivLessThan);
+    }
+#undef SET_INT64_EVALUATOR_CALLBACKS
 }
 
 int32_t
@@ -316,13 +369,36 @@ EvaluateFloatCandidates(const void* opaque,
     const uint64_t active = active_mask & lane_mask;
 
     std::array<const float*, 64> values{};
-    for (uint32_t lane = 0; lane < count; ++lane) {
-        if ((active & (uint64_t{1} << lane)) == 0) {
-            continue;
+    const auto& source = state.source;
+    if (source.row_values != nullptr) {
+        for (uint32_t lane = 0; lane < count; ++lane) {
+            const auto row_id = row_ids[lane];
+            if ((active & (uint64_t{1} << lane)) != 0 && row_id >= 0 &&
+                static_cast<size_t>(row_id) < source.row_count) {
+                values[lane] = source.row_values + row_id;
+                __builtin_prefetch(values[lane], 0, 1);
+            }
         }
-        values[lane] = ResolveFloatCandidateValue(state.source, row_ids[lane]);
-        if (values[lane] != nullptr) {
-            __builtin_prefetch(values[lane], 0, 1);
+    } else if (source.num_chunks == 1 && source.chunk_values != nullptr &&
+               source.chunk_values[0] != nullptr) {
+        const auto* chunk = source.chunk_values[0];
+        for (uint32_t lane = 0; lane < count; ++lane) {
+            const auto row_id = row_ids[lane];
+            if ((active & (uint64_t{1} << lane)) != 0 && row_id >= 0 &&
+                static_cast<size_t>(row_id) < source.row_count) {
+                values[lane] = chunk + row_id;
+                __builtin_prefetch(values[lane], 0, 1);
+            }
+        }
+    } else {
+        for (uint32_t lane = 0; lane < count; ++lane) {
+            if ((active & (uint64_t{1} << lane)) == 0) {
+                continue;
+            }
+            values[lane] = ResolveFloatCandidateValue(source, row_ids[lane]);
+            if (values[lane] != nullptr) {
+                __builtin_prefetch(values[lane], 0, 1);
+            }
         }
     }
     uint64_t accepted = 0;
@@ -657,8 +733,7 @@ PrepareInt64CandidateEvaluator(const Int64CandidateSourceView& source,
     PreparedCandidateEvaluator prepared;
     prepared.owner = owner;
     prepared.view.context = owner.get();
-    prepared.view.eval_batch = &EvaluateInt64Candidates;
-    prepared.view.eval_contiguous = &EvaluateInt64ContiguousCandidates;
+    ConfigureInt64EvaluatorCallbacks(*op, prepared.view);
     return prepared;
 }
 
