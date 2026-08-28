@@ -358,6 +358,14 @@ TEST(CandidateEvaluatorTest, StringComparisonRangeAndTermStayMilvusOwned) {
     CardinalDownpushPredicate like;
     like.value_type_ = CardinalDownpushPredicateValueType::String;
     like.op_ = CardinalDownpushPredicateOp::StringLikeMatch;
+    like.string_arg0_ = "_o%";
+    EXPECT_EQ(evaluate(like),
+              (uint64_t{1} << 0) | (uint64_t{1} << 2));
+
+    like.string_arg0_ = "d\\%g";
+    EXPECT_EQ(evaluate(like), uint64_t{0});
+
+    like.string_arg0_ = "broken\\";
     EXPECT_FALSE(exec::PrepareStringCandidateEvaluator(source, like)
                      .has_value());
 }

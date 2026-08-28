@@ -31,6 +31,7 @@ enum class StringEvaluatorOp : uint8_t {
     NotEqual,
     Range,
     Term,
+    Like,
 };
 
 struct StringEvaluatorState {
@@ -41,6 +42,7 @@ struct StringEvaluatorState {
     bool lower_inclusive = true;
     bool upper_inclusive = true;
     std::vector<std::string> terms;
+    std::unique_ptr<LikePatternMatcher> like_matcher;
 };
 
 std::optional<StringEvaluatorOp>
@@ -62,6 +64,8 @@ ToStringEvaluatorOp(CardinalDownpushPredicateOp op) {
             return StringEvaluatorOp::Range;
         case CardinalDownpushPredicateOp::ScalarTerm:
             return StringEvaluatorOp::Term;
+        case CardinalDownpushPredicateOp::StringLikeMatch:
+            return StringEvaluatorOp::Like;
         default:
             return std::nullopt;
     }
@@ -153,6 +157,8 @@ EvaluateStringValue(const StringEvaluatorState& state,
         case StringEvaluatorOp::Term:
             return std::binary_search(
                 state.terms.begin(), state.terms.end(), value);
+        case StringEvaluatorOp::Like:
+            return state.like_matcher != nullptr && (*state.like_matcher)(value);
     }
     return false;
 }
@@ -363,19 +369,30 @@ PrepareStringCandidateEvaluator(const StringCandidateSourceView& source,
         (*op == StringEvaluatorOp::Term && predicate.string_terms_.empty())) {
         return std::nullopt;
     }
-    auto owner = std::make_shared<StringEvaluatorState>(StringEvaluatorState{
-        source,
-        *op,
-        predicate.string_arg0_,
-        predicate.string_arg1_,
-        predicate.lower_inclusive_,
-        predicate.upper_inclusive_,
-        predicate.string_terms_});
+    auto owner = std::make_shared<StringEvaluatorState>();
+    owner->source = source;
+    owner->op = *op;
+    owner->arg0 = predicate.string_arg0_;
+    owner->arg1 = predicate.string_arg1_;
+    owner->lower_inclusive = predicate.lower_inclusive_;
+    owner->upper_inclusive = predicate.upper_inclusive_;
+    owner->terms = predicate.string_terms_;
     if (*op == StringEvaluatorOp::Term) {
         std::sort(owner->terms.begin(), owner->terms.end());
         owner->terms.erase(
             std::unique(owner->terms.begin(), owner->terms.end()),
             owner->terms.end());
+    }
+    if (*op == StringEvaluatorOp::Like) {
+        try {
+            // Reuse the same prepared matcher as the baseline String
+            // expression path.  Cardinal receives only the generic batch
+            // callback and remains unaware of LIKE syntax or tokenization.
+            owner->like_matcher =
+                std::make_unique<LikePatternMatcher>(owner->arg0);
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
     }
     PreparedCandidateEvaluator prepared;
     prepared.owner = owner;
