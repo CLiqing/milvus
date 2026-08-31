@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <ratio>
@@ -78,9 +79,35 @@ struct CardinalDownpushSearchContext {
     bool target_dictionary_id_found_{false};
     std::optional<PreparedCandidateEvaluator> candidate_evaluator_;
     std::vector<std::shared_ptr<CardinalDownpushSearchContext>> child_contexts_;
+    std::weak_ptr<CardinalDownpushSearchContext> self_;
 };
 
 namespace {
+
+void*
+AcquireCardinalDownpushLease(const void* opaque) noexcept {
+    if (opaque == nullptr) {
+        return nullptr;
+    }
+    try {
+        const auto& weak =
+            *static_cast<const std::weak_ptr<CardinalDownpushSearchContext>*>(
+                opaque);
+        auto owner = weak.lock();
+        if (owner == nullptr) {
+            return nullptr;
+        }
+        return new (std::nothrow)
+            std::shared_ptr<CardinalDownpushSearchContext>(std::move(owner));
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void
+ReleaseCardinalDownpushLease(void* opaque) noexcept {
+    delete static_cast<std::shared_ptr<CardinalDownpushSearchContext>*>(opaque);
+}
 
 std::optional<knowhere::BitsetView::ExtraScalarInt64PredicateOp>
 ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
@@ -596,6 +623,7 @@ PrepareCardinalDownpushSearchContext(
         return nullptr;
     }
     auto context = std::make_shared<CardinalDownpushSearchContext>();
+    context->self_ = context;
     std::vector<PreparedCandidateEvaluator> evaluators;
     evaluators.reserve(program.leaves.size());
     context->child_contexts_.reserve(program.leaves.size());
@@ -805,9 +833,14 @@ PhyVectorSearchNode::GetOutput() {
             evaluator.abi_major = prepared.view.abi_major;
             evaluator.struct_size = sizeof(evaluator);
             evaluator.abi_capabilities = prepared.view.abi_capabilities;
+            evaluator.abi_capabilities |=
+                knowhere::BitsetView::kCandidateEvaluatorCapabilityLease;
             evaluator.context = prepared.view.context;
             evaluator.eval_batch = prepared.view.eval_batch;
             evaluator.eval_contiguous = prepared.view.eval_contiguous;
+            evaluator.lease_factory_context = &downpush_ctx->self_;
+            evaluator.acquire_lease = &AcquireCardinalDownpushLease;
+            evaluator.release_lease = &ReleaseCardinalDownpushLease;
             search_view.set_candidate_evaluator(
                 evaluator,
                 static_cast<size_t>(segment_->get_row_count()),
