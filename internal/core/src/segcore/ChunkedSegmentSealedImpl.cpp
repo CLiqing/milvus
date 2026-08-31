@@ -4002,6 +4002,40 @@ ChunkedSegmentSealedImpl::SupportsDownpush(FieldId field_id) const {
     return IsDownpushSupportedIndexType(index_type);
 }
 
+knowhere::AnnFilterPlanResultV1
+ChunkedSegmentSealedImpl::PlanAnnFilter(
+    milvus::OpContext* op_ctx,
+    FieldId field_id,
+    const knowhere::AnnFilterPlanRequestV1& request,
+    std::shared_ptr<void>* index_lease,
+    void** vector_index) const {
+    if (!vector_indexings_.is_ready(field_id)) {
+        return {};
+    }
+    auto field_indexing = vector_indexings_.get_field_indexing(field_id);
+    // Planning runs synchronously on the segment search path. Avoid scheduling
+    // an otherwise-ready one-cell SemiFuture here: that adds a thread-pool
+    // round trip before every filtered search and can dominate the fusing
+    // savings. The direct accessor still pins the same loaded cell for the
+    // complete planner call.
+    auto accessor = field_indexing->indexing_->PinOneCellDirect(op_ctx, 0);
+    auto* vec_index =
+        dynamic_cast<index::VectorIndex*>(accessor->get_cell_of(0));
+    if (vec_index == nullptr) {
+        return {};
+    }
+    auto result = vec_index->PlanAnnFilter(request);
+    if (result.policy == knowhere::AnnFilterPolicy::kFusing) {
+        if (index_lease != nullptr) {
+            *index_lease = accessor;
+        }
+        if (vector_index != nullptr) {
+            *vector_index = vec_index;
+        }
+    }
+    return result;
+}
+
 bool
 ChunkedSegmentSealedImpl::HasJsonIndex(FieldId field_id) const {
     // JSON indexes (JsonFlatIndex + JSON-cast) live in a separate per-segment

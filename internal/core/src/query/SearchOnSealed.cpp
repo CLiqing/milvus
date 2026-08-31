@@ -106,10 +106,17 @@ SearchOnSealedIndex(const Schema& schema,
     }
 
     dataset->SetIsSparse(is_sparse);
-    auto accessor =
-        SemiInlineGet(field_indexing->indexing_->PinCells(op_context, {0}));
-    auto vec_index =
-        dynamic_cast<index::VectorIndex*>(accessor->get_cell_of(0));
+    std::shared_ptr<cachinglayer::CellAccessor<index::IndexBase>> accessor;
+    auto* vec_index = static_cast<index::VectorIndex*>(
+        search_info.ann_filter_vector_index_);
+    if (vec_index == nullptr) {
+        accessor =
+            SemiInlineGet(field_indexing->indexing_->PinCells(op_context, {0}));
+        vec_index = dynamic_cast<index::VectorIndex*>(accessor->get_cell_of(0));
+    } else {
+        AssertInfo(search_info.ann_filter_vector_index_lease_ != nullptr,
+                   "planned vector index is missing its cache-cell lease");
+    }
     AssertInfo(vec_index != nullptr, "invalid vector index");
     if (bitset.has_candidate_evaluator()) {
         auto index_type = vec_index->GetIndexType();

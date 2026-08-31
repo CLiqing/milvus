@@ -440,6 +440,23 @@ class QueryContext : public Context {
         return cardinal_downpush_search_context_;
     }
 
+    void
+    set_ann_filter_vector_index_lease(std::shared_ptr<void> lease,
+                                      void* vector_index) {
+        ann_filter_vector_index_lease_ = std::move(lease);
+        ann_filter_vector_index_ = vector_index;
+    }
+
+    const std::shared_ptr<void>&
+    get_ann_filter_vector_index_lease() const {
+        return ann_filter_vector_index_lease_;
+    }
+
+    void*
+    get_ann_filter_vector_index() const {
+        return ann_filter_vector_index_;
+    }
+
  private:
     folly::Executor* executor_;
     //folly::Executor::KeepAlive<> executor_keepalive_;
@@ -495,6 +512,8 @@ class QueryContext : public Context {
     std::optional<CardinalDownpushPredicateProgram> cardinal_downpush_program_;
     std::shared_ptr<CardinalDownpushSearchContext>
         cardinal_downpush_search_context_;
+    std::shared_ptr<void> ann_filter_vector_index_lease_;
+    void* ann_filter_vector_index_{nullptr};
 };
 
 // Represent the state of one thread of query execution.

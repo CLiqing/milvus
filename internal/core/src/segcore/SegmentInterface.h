@@ -59,6 +59,7 @@
 #include "index/SkipIndex.h"
 #include "index/TextMatchIndex.h"
 #include "index/json_stats/JsonKeyStats.h"
+#include "knowhere/ann_filter_planner.h"
 #include "mmap/ChunkedColumnInterface.h"
 #include "parquet/statistics.h"
 #include "pb/plan.pb.h"
@@ -533,6 +534,15 @@ class SegmentInternalInterface : public SegmentInterface {
     virtual bool
     SupportsDownpush(FieldId field_id) const {
         return false;
+    }
+
+    virtual knowhere::AnnFilterPlanResultV1
+    PlanAnnFilter(milvus::OpContext*,
+                  FieldId,
+                  const knowhere::AnnFilterPlanRequestV1&,
+                  std::shared_ptr<void>* = nullptr,
+                  void** = nullptr) const {
+        return {};
     }
 
     bool

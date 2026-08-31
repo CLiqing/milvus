@@ -723,6 +723,12 @@ PhyVectorSearchNode::GetOutput() {
 
     // Single search + metrics path
     milvus::SearchResult search_result;
+    if (downpush_ctx != nullptr) {
+        search_info_.ann_filter_vector_index_lease_ =
+            query_context_->get_ann_filter_vector_index_lease();
+        search_info_.ann_filter_vector_index_ =
+            query_context_->get_ann_filter_vector_index();
+    }
     segment_->vector_search(search_info_,
                             src_data,
                             src_offsets,

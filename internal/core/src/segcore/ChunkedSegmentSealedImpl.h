@@ -139,6 +139,13 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     bool
     SupportsDownpush(FieldId field_id) const override;
 
+    knowhere::AnnFilterPlanResultV1
+    PlanAnnFilter(milvus::OpContext* op_ctx,
+                  FieldId field_id,
+                  const knowhere::AnnFilterPlanRequestV1& request,
+                  std::shared_ptr<void>* index_lease = nullptr,
+                  void** vector_index = nullptr) const override;
+
     std::pair<std::shared_ptr<ChunkedColumnInterface>, bool>
     GetFieldDataIfExist(FieldId field_id) const;
 

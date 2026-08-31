@@ -483,6 +483,51 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
         return;
     }
 
+    knowhere::AnnFilterPlanRequestV1 plan_request;
+    plan_request.mode = knowhere::AnnFilterRequestMode::kExplicitFusing;
+    plan_request.row_count = static_cast<uint64_t>(
+        std::max<int64_t>(0, need_process_rows_));
+    plan_request.estimated_filtered_out_count = static_cast<uint64_t>(
+        std::max<int64_t>(0, estimated_filtered_out_count.value()));
+    plan_request.topk = static_cast<uint64_t>(
+        std::max<int64_t>(0, search_info.topk_));
+    plan_request.predicate_leaf_count =
+        static_cast<uint32_t>(program->leaves.size());
+    plan_request.predicate_logical_node_count = static_cast<uint32_t>(
+        program->nodes.size() > program->leaves.size()
+            ? program->nodes.size() - program->leaves.size()
+            : 0);
+
+    std::shared_ptr<void> vector_index_lease;
+    void* planned_vector_index = nullptr;
+    const auto plan = query_context_->get_segment()->PlanAnnFilter(
+        query_context_->get_op_context(),
+        search_info.field_id_,
+        plan_request,
+        &vector_index_lease,
+        &planned_vector_index);
+    if (plan.abi_major != knowhere::kAnnFilterPlannerAbiMajor ||
+        plan.struct_size < sizeof(knowhere::AnnFilterPlanResultV1) ||
+        plan.policy != knowhere::AnnFilterPolicy::kFusing) {
+        const char* reason = "planner_unavailable";
+        if (plan.reason == knowhere::AnnFilterPlanReason::kGraphUnavailable) {
+            reason = "graph_unavailable";
+        } else if (plan.reason ==
+                   knowhere::AnnFilterPlanReason::kCostBaseline) {
+            reason = "cost_baseline";
+        } else if (plan.reason ==
+                   knowhere::AnnFilterPlanReason::kIncompatibleRequest) {
+            reason = "plan_version_mismatch";
+        }
+        LOG_DEBUG(
+            "downpush fallback: Cardinal pre-plan rejected request, reason={}",
+            reason);
+        fallback(reason);
+        return;
+    }
+    AssertInfo(vector_index_lease != nullptr && planned_vector_index != nullptr,
+               "fusing planner accepted without an index lease");
+
     auto downpush_search_context =
         PrepareCardinalDownpushSearchContext(query_context_->get_segment(),
                                              query_context_->get_op_context(),
@@ -499,6 +544,8 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
             : 0;
     cardinal_downpush_program_ = std::move(program);
     cardinal_downpush_search_context_ = std::move(downpush_search_context);
+    query_context_->set_ann_filter_vector_index_lease(
+        std::move(vector_index_lease), planned_vector_index);
     cardinal_downpush_enabled_ = true;
 }
 

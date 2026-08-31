@@ -107,6 +107,14 @@ class VectorMemIndex : public VectorIndex {
     bool
     IsIndexRefineEnabled() const override;
 
+    knowhere::AnnFilterPlanResultV1
+    PlanAnnFilter(const knowhere::AnnFilterPlanRequestV1& request) const noexcept override {
+        const auto* planner =
+            dynamic_cast<const knowhere::AnnFilterPlanner*>(index_.Node());
+        return planner == nullptr ? knowhere::AnnFilterPlanResultV1{}
+                                  : planner->PlanAnnFilter(request);
+    }
+
     std::vector<uint8_t>
     GetVector(const DatasetPtr dataset) const override;
 

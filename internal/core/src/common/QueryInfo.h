@@ -45,6 +45,11 @@ struct SearchInfo {
     bool materialized_view_involved = false;
     bool iterative_filter_execution = false;
     bool cardinal_downpush_execution = false;
+    // Per-segment Milvus-only lease produced by the ANN filter planner. The
+    // opaque owner keeps the exact vector-index cache cell pinned; the raw
+    // pointer lets SearchOnSealed reuse that cell instead of pinning it again.
+    std::shared_ptr<void> ann_filter_vector_index_lease_;
+    void* ann_filter_vector_index_{nullptr};
     // An explicit downpush hint can be rejected before FilterBitsNode is able
     // to run its normal eligibility checks (for example, range search). Carry
     // the reason to FilterBitsNode so the baseline fallback stays observable.

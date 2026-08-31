@@ -26,6 +26,7 @@
 
 #include "Utils.h"
 #include "knowhere/comp/index_param.h"
+#include "knowhere/ann_filter_planner.h"
 #include "knowhere/index/index_factory.h"
 #include "index/Index.h"
 #include "common/Types.h"
@@ -88,6 +89,11 @@ class VectorIndex : public IndexBase {
 
     virtual bool
     IsIndexRefineEnabled() const = 0;
+
+    virtual knowhere::AnnFilterPlanResultV1
+    PlanAnnFilter(const knowhere::AnnFilterPlanRequestV1&) const noexcept {
+        return {};
+    }
 
     virtual knowhere::expected<knowhere::DataSetPtr>
     CalcDistByIDs(const knowhere::DataSetPtr query_dataset,
