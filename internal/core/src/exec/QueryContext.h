@@ -476,7 +476,7 @@ class QueryContext : public Context {
     milvus::Timestamp collection_ttl_timestamp_;
     // used for vector search
     milvus::SearchInfo search_info_;
-    const query::PlaceholderGroup* placeholder_group_;
+    const query::PlaceholderGroup* placeholder_group_{nullptr};
 
     // used for store segment search/retrieve result
     milvus::SearchResult search_result_;

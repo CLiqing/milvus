@@ -428,7 +428,9 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                    search_info.cardinal_downpush_fallback_reason.value()}})
             .Increment();
     } else if (search_info.ann_filter_request_mode !=
-               AnnFilterRequestMode::Disabled) {
+                   AnnFilterRequestMode::Disabled &&
+               query_context_->get_placeholder_group() != nullptr &&
+               !query_context_->get_placeholder_group()->empty()) {
         // Explicit fusing and default AUTO share the same loaded-index planner.
         // Any rejected or incomplete Prepare stays on the normal ExprSet path.
         TryEnableCardinalDownpush(*filter, exec_context);
@@ -496,10 +498,13 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
     plan_request.estimated_filtered_out_count = static_cast<uint64_t>(
         std::max<int64_t>(0, estimated_filtered_out_count.value()));
     const auto* placeholder_group = query_context_->get_placeholder_group();
-    if (placeholder_group != nullptr && !placeholder_group->empty()) {
-        plan_request.nq = static_cast<uint64_t>(std::max<int64_t>(
-            0, placeholder_group->at(0).num_of_queries_));
+    if (placeholder_group == nullptr || placeholder_group->empty()) {
+        LOG_DEBUG("downpush fallback: vector placeholder is unavailable");
+        fallback("missing_placeholder");
+        return;
     }
+    plan_request.nq = static_cast<uint64_t>(std::max<int64_t>(
+        0, placeholder_group->at(0).num_of_queries_));
     plan_request.topk = static_cast<uint64_t>(
         std::max<int64_t>(0, search_info.topk_));
     plan_request.predicate_leaf_count = predicate_summary->leaf_count;

@@ -61,6 +61,14 @@ using namespace milvus::exec;
 using namespace milvus::query;
 using namespace milvus::segcore;
 
+TEST(QueryContextTest, DefaultPlaceholderGroupIsNull) {
+    auto query_context = std::make_shared<QueryContext>(
+        "retrieve-filter", nullptr, 1, MAX_TIMESTAMP);
+    EXPECT_EQ(query_context->get_placeholder_group(), nullptr);
+    EXPECT_EQ(query_context->get_search_info().ann_filter_request_mode,
+              AnnFilterRequestMode::Disabled);
+}
+
 class TaskTest : public testing::TestWithParam<DataType> {
  protected:
     void

@@ -87,6 +87,9 @@ MergeExprWithNamespace(const SchemaPtr schema,
 SearchInfo
 ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
     SearchInfo search_info;
+    // No hint on a vector search means AUTO. SearchInfo itself defaults to
+    // Disabled because retrieve/filter-only plans also default-construct it.
+    search_info.ann_filter_request_mode = AnnFilterRequestMode::Auto;
     auto& query_info_proto = anns_proto.query_info();
     auto field_id = FieldId(anns_proto.field_id());
     search_info.field_id_ = field_id;

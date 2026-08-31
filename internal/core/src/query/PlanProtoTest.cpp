@@ -99,6 +99,12 @@ TEST(PlanProto, AnnFilterRequestModeSeparatesAutoExplicitAndDisabled) {
               AnnFilterRequestMode::Disabled);
 }
 
+TEST(PlanProto, DefaultSearchInfoIsInertOutsideVectorPlans) {
+    milvus::SearchInfo search_info;
+    EXPECT_EQ(search_info.ann_filter_request_mode,
+              milvus::AnnFilterRequestMode::Disabled);
+}
+
 TEST(PlanProto, DownpushRangeSearchCarriesObservableFallback) {
     using namespace milvus::query;
 

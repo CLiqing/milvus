@@ -50,9 +50,11 @@ struct SearchInfo {
     tracer::TraceContext trace_ctx_;
     bool materialized_view_involved = false;
     bool iterative_filter_execution = false;
-    // User intent, not the per-segment execution result. No hint is AUTO;
-    // Cardinal's planner may still choose baseline independently per segment.
-    AnnFilterRequestMode ann_filter_request_mode = AnnFilterRequestMode::Auto;
+    // User intent, not the per-segment execution result. A default-constructed
+    // SearchInfo is also used by retrieve/filter-only execution, so it must be
+    // inert. ParseSearchInfo explicitly selects AUTO for VectorANNS requests.
+    AnnFilterRequestMode ann_filter_request_mode =
+        AnnFilterRequestMode::Disabled;
     // Per-segment Milvus-only lease produced by the ANN filter planner. The
     // opaque owner keeps the exact vector-index cache cell pinned; the raw
     // pointer lets SearchOnSealed reuse that cell instead of pinning it again.
