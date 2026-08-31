@@ -370,11 +370,61 @@ TEST(CandidateEvaluatorTest, StringComparisonRangeAndTermStayMilvusOwned) {
                      .has_value());
 }
 
+TEST(CandidateEvaluatorTest, StringLikePreservesUtf8AndEscapeSemantics) {
+    const std::vector<std::string> values = {
+        "猫", "猫a", "é", "🙂", "100%", "a_b", R"(path\root)", "axxbYcZZd"};
+    std::string storage;
+    std::vector<uint32_t> offsets = {0};
+    for (const auto& value : values) {
+        storage.append(value);
+        offsets.push_back(static_cast<uint32_t>(storage.size()));
+    }
+    const std::array<const char*, 1> bases = {storage.data()};
+    const std::array<const uint32_t*, 1> value_offsets = {offsets.data()};
+    const std::array<size_t, 1> row_counts = {values.size()};
+    const std::array<int64_t, 2> row_offsets = {
+        0, static_cast<int64_t>(values.size())};
+    const std::array<int64_t, 8> row_ids = {0, 1, 2, 3, 4, 5, 6, 7};
+
+    exec::StringCandidateSourceView source;
+    source.chunk_bases = bases.data();
+    source.chunk_value_offsets = value_offsets.data();
+    source.chunk_row_counts = row_counts.data();
+    source.chunk_row_offsets = row_offsets.data();
+    source.num_chunks = 1;
+    source.row_count = values.size();
+    source.uniform_chunk_rows = values.size();
+
+    auto evaluate = [&](std::string pattern) {
+        CardinalDownpushPredicate like;
+        like.value_type_ = CardinalDownpushPredicateValueType::String;
+        like.op_ = CardinalDownpushPredicateOp::StringLikeMatch;
+        like.string_arg0_ = std::move(pattern);
+        auto prepared = exec::PrepareStringCandidateEvaluator(source, like);
+        EXPECT_TRUE(prepared.has_value());
+        uint64_t valid_mask = 0;
+        EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
+                                            row_ids.data(),
+                                            row_ids.size(),
+                                            (uint64_t{1} << row_ids.size()) - 1,
+                                            &valid_mask),
+                  0);
+        return valid_mask;
+    };
+
+    EXPECT_EQ(evaluate("_"),
+              (uint64_t{1} << 0) | (uint64_t{1} << 2) | (uint64_t{1} << 3));
+    EXPECT_EQ(evaluate("猫_"), uint64_t{1} << 1);
+    EXPECT_EQ(evaluate(R"(100\%)"), uint64_t{1} << 4);
+    EXPECT_EQ(evaluate(R"(a\_b)"), uint64_t{1} << 5);
+    EXPECT_EQ(evaluate(R"(path\\%)"), uint64_t{1} << 6);
+    EXPECT_EQ(evaluate("a%b_c%d"), uint64_t{1} << 7);
+}
+
 TEST(CandidateEvaluatorTest, Int64ArithmeticUsesWideIntermediate) {
     static constexpr std::array<int64_t, 8> values = {
         INT64_MIN, -100, -7, 0, 7, 100, INT64_MAX - 1, INT64_MAX};
-    static constexpr std::array<int64_t, 8> row_ids = {0, 1, 2, 3,
-                                                       4, 5, 6, 7};
+    static constexpr std::array<int64_t, 8> row_ids = {0, 1, 2, 3, 4, 5, 6, 7};
     exec::Int64CandidateSourceView source;
     source.row_values = values.data();
     source.row_count = values.size();
