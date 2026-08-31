@@ -44,7 +44,6 @@ namespace exec {
 namespace {
 
 constexpr int64_t kDownpushEstimatorSampleSize = 256;
-constexpr double kDownpushFallbackFilterOutRatio = 0.90;
 
 std::string
 BuildExprCacheKey(const plan::FilterBitsNode& filter,
@@ -313,6 +312,55 @@ TryCompileCardinalDownpushProgram(const expr::TypedExprPtr& filter,
     return program;
 }
 
+struct CandidatePredicateSummary {
+    uint32_t leaf_count{0};
+    uint32_t logical_node_count{0};
+};
+
+std::optional<CandidatePredicateSummary>
+AnalyzeCandidatePredicateShape(const expr::TypedExprPtr& filter) {
+    if (filter == nullptr) {
+        return std::nullopt;
+    }
+    if (auto logical =
+            std::dynamic_pointer_cast<const expr::LogicalBinaryExpr>(filter)) {
+        if (logical->inputs().size() != 2 ||
+            (logical->op_type_ != expr::LogicalBinaryExpr::OpType::And &&
+             logical->op_type_ != expr::LogicalBinaryExpr::OpType::Or)) {
+            return std::nullopt;
+        }
+        auto left = AnalyzeCandidatePredicateShape(logical->inputs()[0]);
+        auto right = AnalyzeCandidatePredicateShape(logical->inputs()[1]);
+        if (!left.has_value() || !right.has_value()) {
+            return std::nullopt;
+        }
+        return CandidatePredicateSummary{
+            left->leaf_count + right->leaf_count,
+            left->logical_node_count + right->logical_node_count + 1};
+    }
+    if (auto logical =
+            std::dynamic_pointer_cast<const expr::LogicalUnaryExpr>(filter)) {
+        if (logical->op_type_ != expr::LogicalUnaryExpr::OpType::LogicalNot ||
+            logical->inputs().size() != 1) {
+            return std::nullopt;
+        }
+        auto child = AnalyzeCandidatePredicateShape(logical->inputs()[0]);
+        if (!child.has_value()) {
+            return std::nullopt;
+        }
+        ++child->logical_node_count;
+        return child;
+    }
+    if (std::dynamic_pointer_cast<const expr::UnaryRangeFilterExpr>(filter) ||
+        std::dynamic_pointer_cast<const expr::BinaryRangeFilterExpr>(filter) ||
+        std::dynamic_pointer_cast<const expr::TermFilterExpr>(filter) ||
+        std::dynamic_pointer_cast<const expr::BinaryArithOpEvalRangeExpr>(
+            filter)) {
+        return CandidatePredicateSummary{1, 0};
+    }
+    return std::nullopt;
+}
+
 std::optional<int64_t>
 EstimateFilteredOutCountBySample(QueryContext* query_context,
                                  ExprSet* exprs,
@@ -411,75 +459,25 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
         return;
     }
 
-    // The vector index must support predicate fusion. Backend-agnostic
-    // capability query so this node never reads the raw index type.
-    if (!query_context_->get_segment()->SupportsDownpush(
-            search_info.field_id_)) {
-        LOG_DEBUG("downpush fallback: vector index does not support fusion");
-        fallback("unsupported_index");
-        return;
-    }
-
-    // entity TTL: ExprSet compilation injects the TTL predicate into exprs_.
-    // Because only the *user* predicate is deferred into the vector index, the
-    // TTL predicate is compiled separately and kept as a normal logical-space
-    // bitset (evaluated in GetOutput).
-    auto ttl_expr = CreateTTLFieldFilterExpression(query_context_);
-    if (ttl_expr != nullptr) {
-        // ExprSet normally injects entity TTL into its first source. This
-        // source is already the TTL expression itself, so disable injection
-        // here to avoid compiling TTL AND TTL.
-        ttl_exprs_ = std::make_unique<ExprSet>(
-            std::vector<expr::TypedExprPtr>{ttl_expr}, exec_context, false);
-    }
-
-    auto program =
-        TryCompileCardinalDownpushProgram(filter.filter(), query_context_);
-    if (!program.has_value()) {
-        LOG_DEBUG(
-            "downpush fallback: unsupported predicate shape or scalar source");
-        fallback("unsupported_predicate");
-        return;
-    }
-
-    // A LIKE predicate requires raw varchar values.  A sealed segment backed
-    // by STL_SORT can expose dictionary IDs for equality, inequality and term
-    // predicates while not exposing the raw string chunk view needed by LIKE.
-    // Do not defer that availability check until VectorSearchNode: FilterBits
-    // has already skipped materializing the normal bitmap by then, so failure
-    // there would turn an optional hint into a request error.  Phase 1 must
-    // always preserve correctness by falling back to the ordinary filter.
-    if (std::any_of(
-            program->leaves.begin(),
-            program->leaves.end(),
-            [](const auto& leaf) { return IsStringMatchOp(leaf.op_); })) {
-        LOG_DEBUG(
-            "downpush fallback: varchar match needs a raw value source that "
-            "is unavailable for some sealed scalar-index layouts");
+    // Planning sees only a cheap expression-shape summary. Building the
+    // Milvus-owned executable predicate program is deliberately deferred until
+    // Cardinal commits FUSING, so BASELINE/AUTO rejection pays no IR cost.
+    auto predicate_summary = AnalyzeCandidatePredicateShape(filter.filter());
+    if (!predicate_summary.has_value()) {
+        LOG_DEBUG("downpush fallback: unsupported predicate shape");
         fallback("unsupported_predicate");
         return;
     }
 
     std::vector<expr::TypedExprPtr> filters{filter.filter()};
-    ExprSet sample_exprs(filters, exec_context);
+    // Cost-model selectivity describes only the optional user predicate.
+    // Mandatory entity TTL remains a separate upper-layer constraint.
+    ExprSet sample_exprs(filters, exec_context, false);
     auto estimated_filtered_out_count = EstimateFilteredOutCountBySample(
         query_context_, &sample_exprs, exec_context);
     if (!estimated_filtered_out_count.has_value()) {
         LOG_DEBUG("downpush fallback: failed to estimate filter ratio");
         fallback("estimate_failed");
-        return;
-    }
-
-    auto ratio =
-        need_process_rows_ > 0
-            ? static_cast<double>(estimated_filtered_out_count.value()) /
-                  static_cast<double>(need_process_rows_)
-            : 0.0;
-    if (ratio >= kDownpushFallbackFilterOutRatio) {
-        LOG_DEBUG("downpush fallback: filter-out ratio {} >= threshold {}",
-                  ratio,
-                  kDownpushFallbackFilterOutRatio);
-        fallback("ratio_threshold");
         return;
     }
 
@@ -491,12 +489,9 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
         std::max<int64_t>(0, estimated_filtered_out_count.value()));
     plan_request.topk = static_cast<uint64_t>(
         std::max<int64_t>(0, search_info.topk_));
-    plan_request.predicate_leaf_count =
-        static_cast<uint32_t>(program->leaves.size());
-    plan_request.predicate_logical_node_count = static_cast<uint32_t>(
-        program->nodes.size() > program->leaves.size()
-            ? program->nodes.size() - program->leaves.size()
-            : 0);
+    plan_request.predicate_leaf_count = predicate_summary->leaf_count;
+    plan_request.predicate_logical_node_count =
+        predicate_summary->logical_node_count;
 
     std::shared_ptr<void> vector_index_lease;
     void* planned_vector_index = nullptr;
@@ -527,6 +522,37 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
     }
     AssertInfo(vector_index_lease != nullptr && planned_vector_index != nullptr,
                "fusing planner accepted without an index lease");
+
+    auto program =
+        TryCompileCardinalDownpushProgram(filter.filter(), query_context_);
+    if (!program.has_value()) {
+        LOG_DEBUG(
+            "downpush fallback: unsupported predicate operation or scalar source");
+        fallback("unsupported_predicate");
+        return;
+    }
+
+    // A LIKE predicate requires raw varchar values. A sealed segment backed by
+    // STL_SORT may expose dictionary IDs without the raw string chunk required
+    // by LIKE. This remains inside the pre-commit Prepare transaction.
+    if (std::any_of(
+            program->leaves.begin(),
+            program->leaves.end(),
+            [](const auto& leaf) { return IsStringMatchOp(leaf.op_); })) {
+        LOG_DEBUG(
+            "downpush fallback: varchar match needs a raw value source that "
+            "is unavailable for some sealed scalar-index layouts");
+        fallback("unsupported_predicate");
+        return;
+    }
+
+    // Only FUSING needs a separate mandatory TTL bitmap; baseline ExprSet
+    // already owns its normal TTL injection.
+    auto ttl_expr = CreateTTLFieldFilterExpression(query_context_);
+    if (ttl_expr != nullptr) {
+        ttl_exprs_ = std::make_unique<ExprSet>(
+            std::vector<expr::TypedExprPtr>{ttl_expr}, exec_context, false);
+    }
 
     auto downpush_search_context =
         PrepareCardinalDownpushSearchContext(query_context_->get_segment(),
