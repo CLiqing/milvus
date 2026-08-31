@@ -246,6 +246,9 @@ DEFINE_PROMETHEUS_COUNTER_FAMILY(internal_core_downpush_fallback_count,
 DEFINE_PROMETHEUS_COUNTER_FAMILY(
     internal_core_downpush_execution_count,
     "[cpp]downpush execution count by source, value type and iterator mode")
+DEFINE_PROMETHEUS_COUNTER_FAMILY(
+    internal_core_ann_filter_plan_count,
+    "[cpp]ANN filter plan decisions by mode, policy and reason")
 // mmap metrics
 std::map<std::string, std::string> mmapAllocatedSpaceAnonLabel = {
     {"type", "anon"}};

@@ -102,6 +102,7 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
     // Preserve baseline behavior, but do not silently discard an explicit
     // downpush request: FilterBitsNode records this pre-plan fallback.
     if (search_info.search_params_.contains(RADIUS)) {
+        search_info.ann_filter_request_mode = AnnFilterRequestMode::Disabled;
         const bool downpush_requested =
             query_info_proto.hints() == DOWNPUSH ||
             (search_info.search_params_.contains(HINTS) &&
@@ -113,10 +114,15 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
         if (query_info_proto.hints() != "") {
             if (query_info_proto.hints() == "disable") {
                 search_info.iterative_filter_execution = false;
+                search_info.ann_filter_request_mode =
+                    AnnFilterRequestMode::Disabled;
             } else if (query_info_proto.hints() == ITERATIVE_FILTER) {
                 search_info.iterative_filter_execution = true;
+                search_info.ann_filter_request_mode =
+                    AnnFilterRequestMode::Disabled;
             } else if (query_info_proto.hints() == DOWNPUSH) {
-                search_info.cardinal_downpush_execution = true;
+                search_info.ann_filter_request_mode =
+                    AnnFilterRequestMode::ExplicitFusing;
             } else {
                 // check if hints is valid
                 ThrowInfo(ConfigInvalid,
@@ -126,11 +132,15 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
         } else if (search_info.search_params_.contains(HINTS)) {
             if (search_info.search_params_[HINTS] == ITERATIVE_FILTER) {
                 search_info.iterative_filter_execution = true;
+                search_info.ann_filter_request_mode =
+                    AnnFilterRequestMode::Disabled;
             } else if (search_info.search_params_[HINTS] == DOWNPUSH) {
-                search_info.cardinal_downpush_execution = true;
+                search_info.ann_filter_request_mode =
+                    AnnFilterRequestMode::ExplicitFusing;
             } else if (search_info.search_params_[HINTS] == "disable") {
                 search_info.iterative_filter_execution = false;
-                search_info.cardinal_downpush_execution = false;
+                search_info.ann_filter_request_mode =
+                    AnnFilterRequestMode::Disabled;
             } else {
                 // check if hints is valid
                 ThrowInfo(ConfigInvalid,

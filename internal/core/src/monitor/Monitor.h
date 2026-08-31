@@ -73,6 +73,8 @@ DECLARE_PROMETHEUS_HISTOGRAM(internal_core_expr_filter_ratio);
 DECLARE_PROMETHEUS_COUNTER_FAMILY(internal_core_downpush_fallback_count_family);
 DECLARE_PROMETHEUS_COUNTER_FAMILY(
     internal_core_downpush_execution_count_family);
+DECLARE_PROMETHEUS_COUNTER_FAMILY(
+    internal_core_ann_filter_plan_count_family);
 
 // async cgo metrics
 DECLARE_PROMETHEUS_HISTOGRAM_FAMILY(internal_cgo_queue_duration_seconds);

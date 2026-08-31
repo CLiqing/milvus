@@ -73,6 +73,32 @@ TEST(PlanProto, RejectsGlobalRefineRatiosBelowOne) {
     EXPECT_ANY_THROW(parser.PlanNodeFromProto(BuildSearchPlanNode(1.5f, 0.5f)));
 }
 
+TEST(PlanProto, AnnFilterRequestModeSeparatesAutoExplicitAndDisabled) {
+    using namespace milvus;
+    using namespace milvus::query;
+
+    auto auto_plan = CreateSearchPlanFromPlanNode(
+        BuildSchema(), BuildSearchPlanNode(1.0f, 1.0f));
+    EXPECT_EQ(auto_plan->plan_node_->search_info_.ann_filter_request_mode,
+              AnnFilterRequestMode::Auto);
+
+    auto explicit_node = BuildSearchPlanNode(1.0f, 1.0f);
+    explicit_node.mutable_vector_anns()->mutable_query_info()->set_hints(
+        "downpush");
+    auto explicit_plan =
+        CreateSearchPlanFromPlanNode(BuildSchema(), explicit_node);
+    EXPECT_EQ(explicit_plan->plan_node_->search_info_.ann_filter_request_mode,
+              AnnFilterRequestMode::ExplicitFusing);
+
+    auto disabled_node = BuildSearchPlanNode(1.0f, 1.0f);
+    disabled_node.mutable_vector_anns()->mutable_query_info()->set_hints(
+        "disable");
+    auto disabled_plan =
+        CreateSearchPlanFromPlanNode(BuildSchema(), disabled_node);
+    EXPECT_EQ(disabled_plan->plan_node_->search_info_.ann_filter_request_mode,
+              AnnFilterRequestMode::Disabled);
+}
+
 TEST(PlanProto, DownpushRangeSearchCarriesObservableFallback) {
     using namespace milvus::query;
 
@@ -83,7 +109,8 @@ TEST(PlanProto, DownpushRangeSearchCarriesObservableFallback) {
 
     auto plan = CreateSearchPlanFromPlanNode(BuildSchema(), plan_node);
     const auto& search_info = plan->plan_node_->search_info_;
-    EXPECT_FALSE(search_info.cardinal_downpush_execution);
+    EXPECT_EQ(search_info.ann_filter_request_mode,
+              milvus::AnnFilterRequestMode::Disabled);
     ASSERT_TRUE(search_info.cardinal_downpush_fallback_reason.has_value());
     EXPECT_EQ(search_info.cardinal_downpush_fallback_reason.value(),
               "range_search");

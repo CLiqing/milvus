@@ -427,11 +427,10 @@ PhyFilterBitsNode::PhyFilterBitsNode(
             .Add({{"reason",
                    search_info.cardinal_downpush_fallback_reason.value()}})
             .Increment();
-    } else if (search_info.cardinal_downpush_execution) {
-        // downpush hint (ann filter fusing): attempt to fuse the scalar
-        // predicate into the vector index. The hint is advisory — if any
-        // precondition is unmet we silently fall back to the normal ExprSet
-        // path below and never break correctness.
+    } else if (search_info.ann_filter_request_mode !=
+               AnnFilterRequestMode::Disabled) {
+        // Explicit fusing and default AUTO share the same loaded-index planner.
+        // Any rejected or incomplete Prepare stays on the normal ExprSet path.
         TryEnableCardinalDownpush(*filter, exec_context);
     }
 
@@ -446,10 +445,17 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
                                              ExecContext* exec_context) {
     const auto& search_info = query_context_->get_search_info();
 
-    auto fallback = [](const char* reason) {
-        milvus::monitor::internal_core_downpush_fallback_count_family
-            .Add({{"reason", reason}})
-            .Increment();
+    const bool explicit_fusing =
+        search_info.ann_filter_request_mode ==
+        AnnFilterRequestMode::ExplicitFusing;
+    auto fallback = [explicit_fusing](const char* reason) {
+        // AUTO choosing or remaining on baseline is a normal plan decision,
+        // not an explicit-hint fallback.
+        if (explicit_fusing) {
+            milvus::monitor::internal_core_downpush_fallback_count_family
+                .Add({{"reason", reason}})
+                .Increment();
+        }
     };
 
     // Fusion is not implemented for element-level (array-of-vectors) search.
@@ -482,11 +488,18 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
     }
 
     knowhere::AnnFilterPlanRequestV1 plan_request;
-    plan_request.mode = knowhere::AnnFilterRequestMode::kExplicitFusing;
+    plan_request.mode =
+        explicit_fusing ? knowhere::AnnFilterRequestMode::kExplicitFusing
+                        : knowhere::AnnFilterRequestMode::kAuto;
     plan_request.row_count = static_cast<uint64_t>(
         std::max<int64_t>(0, need_process_rows_));
     plan_request.estimated_filtered_out_count = static_cast<uint64_t>(
         std::max<int64_t>(0, estimated_filtered_out_count.value()));
+    const auto* placeholder_group = query_context_->get_placeholder_group();
+    if (placeholder_group != nullptr && !placeholder_group->empty()) {
+        plan_request.nq = static_cast<uint64_t>(std::max<int64_t>(
+            0, placeholder_group->at(0).num_of_queries_));
+    }
     plan_request.topk = static_cast<uint64_t>(
         std::max<int64_t>(0, search_info.topk_));
     plan_request.predicate_leaf_count = predicate_summary->leaf_count;
@@ -501,23 +514,33 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
         plan_request,
         &vector_index_lease,
         &planned_vector_index);
+    const char* plan_reason = "planner_unavailable";
+    if (plan.reason == knowhere::AnnFilterPlanReason::kNone) {
+        plan_reason = "none";
+    } else if (plan.reason ==
+               knowhere::AnnFilterPlanReason::kGraphUnavailable) {
+        plan_reason = "graph_unavailable";
+    } else if (plan.reason ==
+               knowhere::AnnFilterPlanReason::kCostBaseline) {
+        plan_reason = "cost_baseline";
+    } else if (plan.reason ==
+               knowhere::AnnFilterPlanReason::kIncompatibleRequest) {
+        plan_reason = "plan_version_mismatch";
+    }
+    milvus::monitor::internal_core_ann_filter_plan_count_family
+        .Add({{"mode", explicit_fusing ? "explicit" : "auto"},
+              {"policy",
+               plan.policy == knowhere::AnnFilterPolicy::kFusing ? "fusing"
+                                                                 : "baseline"},
+              {"reason", plan_reason}})
+        .Increment();
     if (plan.abi_major != knowhere::kAnnFilterPlannerAbiMajor ||
         plan.struct_size < sizeof(knowhere::AnnFilterPlanResultV1) ||
         plan.policy != knowhere::AnnFilterPolicy::kFusing) {
-        const char* reason = "planner_unavailable";
-        if (plan.reason == knowhere::AnnFilterPlanReason::kGraphUnavailable) {
-            reason = "graph_unavailable";
-        } else if (plan.reason ==
-                   knowhere::AnnFilterPlanReason::kCostBaseline) {
-            reason = "cost_baseline";
-        } else if (plan.reason ==
-                   knowhere::AnnFilterPlanReason::kIncompatibleRequest) {
-            reason = "plan_version_mismatch";
-        }
         LOG_DEBUG(
             "downpush fallback: Cardinal pre-plan rejected request, reason={}",
-            reason);
-        fallback(reason);
+            plan_reason);
+        fallback(plan_reason);
         return;
     }
     AssertInfo(vector_index_lease != nullptr && planned_vector_index != nullptr,

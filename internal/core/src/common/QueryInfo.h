@@ -25,6 +25,12 @@
 
 namespace milvus {
 
+enum class AnnFilterRequestMode : uint8_t {
+    Disabled = 0,
+    ExplicitFusing = 1,
+    Auto = 2,
+};
+
 struct SearchIteratorV2Info {
     std::string token = "";
     uint32_t batch_size = 0;
@@ -44,7 +50,9 @@ struct SearchInfo {
     tracer::TraceContext trace_ctx_;
     bool materialized_view_involved = false;
     bool iterative_filter_execution = false;
-    bool cardinal_downpush_execution = false;
+    // User intent, not the per-segment execution result. No hint is AUTO;
+    // Cardinal's planner may still choose baseline independently per segment.
+    AnnFilterRequestMode ann_filter_request_mode = AnnFilterRequestMode::Auto;
     // Per-segment Milvus-only lease produced by the ANN filter planner. The
     // opaque owner keeps the exact vector-index cache cell pinned; the raw
     // pointer lets SearchOnSealed reuse that cell instead of pinning it again.
