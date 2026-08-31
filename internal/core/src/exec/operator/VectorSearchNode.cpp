@@ -68,8 +68,6 @@ struct CardinalDownpushSearchContext {
     std::vector<const bool*> string_chunk_valid_data_;
     std::vector<size_t> string_chunk_row_counts_;
     size_t string_uniform_chunk_rows_{0};
-    std::vector<const char*> string_term_value_ptrs_;
-    std::vector<uint32_t> string_term_value_sizes_;
     std::vector<const int64_t*> int64_chunk_values_;
     std::vector<const float*> float_chunk_values_;
     std::vector<int64_t> chunk_offsets_;
@@ -107,48 +105,6 @@ AcquireCardinalDownpushLease(const void* opaque) noexcept {
 void
 ReleaseCardinalDownpushLease(void* opaque) noexcept {
     delete static_cast<std::shared_ptr<CardinalDownpushSearchContext>*>(opaque);
-}
-
-std::optional<knowhere::BitsetView::ExtraScalarInt64PredicateOp>
-ToKnowherePredicateOp(CardinalDownpushPredicateOp op) {
-    using KnowhereOp = knowhere::BitsetView::ExtraScalarInt64PredicateOp;
-    switch (op) {
-        case CardinalDownpushPredicateOp::Int64GreaterEqual:
-            return KnowhereOp::kGreaterEqual;
-        case CardinalDownpushPredicateOp::Int64ModLessThan:
-            return KnowhereOp::kModLessThan;
-        case CardinalDownpushPredicateOp::Int64GreaterThan:
-            return KnowhereOp::kGreaterThan;
-        case CardinalDownpushPredicateOp::Int64LessEqual:
-            return KnowhereOp::kLessEqual;
-        case CardinalDownpushPredicateOp::Int64LessThan:
-            return KnowhereOp::kLessThan;
-        case CardinalDownpushPredicateOp::Int64Equal:
-            return KnowhereOp::kEqual;
-        case CardinalDownpushPredicateOp::Int64NotEqual:
-            return KnowhereOp::kNotEqual;
-        case CardinalDownpushPredicateOp::ScalarRange:
-            return KnowhereOp::kRange;
-        case CardinalDownpushPredicateOp::ScalarAddLessThan:
-            return KnowhereOp::kAddLessThan;
-        case CardinalDownpushPredicateOp::ScalarTerm:
-            return KnowhereOp::kTerm;
-        case CardinalDownpushPredicateOp::ScalarSubLessThan:
-            return KnowhereOp::kSubLessThan;
-        case CardinalDownpushPredicateOp::ScalarMulLessThan:
-            return KnowhereOp::kMulLessThan;
-        case CardinalDownpushPredicateOp::ScalarDivLessThan:
-            return KnowhereOp::kDivLessThan;
-        case CardinalDownpushPredicateOp::StringPrefixMatch:
-            return KnowhereOp::kPrefixMatch;
-        case CardinalDownpushPredicateOp::StringPostfixMatch:
-            return KnowhereOp::kPostfixMatch;
-        case CardinalDownpushPredicateOp::StringInnerMatch:
-            return KnowhereOp::kInnerMatch;
-        case CardinalDownpushPredicateOp::StringLikeMatch:
-            return KnowhereOp::kLikeMatch;
-    }
-    return std::nullopt;
 }
 
 bool
@@ -413,99 +369,6 @@ BuildCardinalDownpushSearchContext(
     }
 
     return nullptr;
-}
-
-std::optional<knowhere::BitsetView::ExtraScalarPredicateValueType>
-ToKnowherePredicateValueType(CardinalDownpushPredicateValueType value_type,
-                             const CardinalDownpushSearchContext& ctx) {
-    using KnowhereValueType =
-        knowhere::BitsetView::ExtraScalarPredicateValueType;
-    switch (value_type) {
-        case CardinalDownpushPredicateValueType::Int64:
-            return KnowhereValueType::kInt64;
-        case CardinalDownpushPredicateValueType::Float:
-            return KnowhereValueType::kFloat;
-        case CardinalDownpushPredicateValueType::String:
-            return ctx.row_dictionary_ids_ == nullptr
-                       ? KnowhereValueType::kString
-                       : KnowhereValueType::kDictionaryId;
-    }
-    return std::nullopt;
-}
-
-void
-FillKnowhereDownpushValueSource(
-    knowhere::BitsetView::ExtraScalarInt64PredicateFilter& filter,
-    const CardinalDownpushSearchContext& ctx) {
-    filter.row_values = ctx.int64_row_values_ == nullptr
-                            ? nullptr
-                            : ctx.int64_row_values_->data();
-    filter.chunk_values = ctx.int64_chunk_values_.data();
-    filter.row_float_values = ctx.float_row_values_ == nullptr
-                                  ? nullptr
-                                  : ctx.float_row_values_->data();
-    filter.chunk_float_values = ctx.float_chunk_values_.data();
-    filter.string_column.chunk_bases = ctx.string_chunk_bases_.data();
-    filter.string_column.chunk_value_offsets =
-        ctx.string_chunk_value_offsets_.data();
-    filter.string_column.chunk_valid_data = ctx.string_chunk_valid_data_.data();
-    filter.string_column.chunk_row_counts = ctx.string_chunk_row_counts_.data();
-    filter.string_column.chunk_row_offsets = ctx.chunk_offsets_.data();
-    filter.string_column.num_chunks = ctx.string_pins_.size();
-    filter.string_column.row_count =
-        ctx.string_chunk_row_counts_.empty()
-            ? 0
-            : static_cast<size_t>(ctx.chunk_offsets_.back());
-    filter.string_column.uniform_chunk_rows = ctx.string_uniform_chunk_rows_;
-    filter.row_dictionary_ids = ctx.row_dictionary_ids_;
-    filter.target_dictionary_id = ctx.target_dictionary_id_;
-    filter.target_dictionary_id_found = ctx.target_dictionary_id_found_;
-    filter.chunk_offsets = ctx.chunk_offsets_.data();
-    if (!ctx.int64_chunk_values_.empty()) {
-        filter.num_chunks = ctx.int64_chunk_values_.size();
-    } else if (!ctx.float_chunk_values_.empty()) {
-        filter.num_chunks = ctx.float_chunk_values_.size();
-    }
-}
-
-void
-FillKnowhereDownpushArgs(
-    knowhere::BitsetView::ExtraScalarInt64PredicateFilter& filter,
-    const CardinalDownpushPredicate& predicate,
-    CardinalDownpushSearchContext& ctx) {
-    filter.arg0 = predicate.arg0_;
-    filter.arg1 = predicate.arg1_;
-    filter.double_arg0 = predicate.double_arg0_;
-    filter.double_arg1 = predicate.double_arg1_;
-    filter.string_arg0_data = predicate.string_arg0_.data();
-    filter.string_arg0_size =
-        static_cast<uint32_t>(predicate.string_arg0_.size());
-    filter.string_arg1_data = predicate.string_arg1_.data();
-    filter.string_arg1_size =
-        static_cast<uint32_t>(predicate.string_arg1_.size());
-    filter.like_pattern.token_offsets = predicate.like_token_offsets_.data();
-    filter.like_pattern.token_sizes = predicate.like_token_sizes_.data();
-    filter.like_pattern.token_types = predicate.like_token_types_.data();
-    filter.like_pattern.token_count = predicate.like_token_types_.size();
-    filter.int64_terms = predicate.int64_terms_.data();
-    filter.int64_term_count = predicate.int64_terms_.size();
-    filter.double_terms = predicate.double_terms_.data();
-    filter.double_term_count = predicate.double_terms_.size();
-    if (!predicate.string_terms_.empty()) {
-        ctx.string_term_value_ptrs_.reserve(predicate.string_terms_.size());
-        ctx.string_term_value_sizes_.reserve(predicate.string_terms_.size());
-        for (const auto& term : predicate.string_terms_) {
-            ctx.string_term_value_ptrs_.push_back(term.data());
-            ctx.string_term_value_sizes_.push_back(
-                static_cast<uint32_t>(term.size()));
-        }
-        filter.string_term_values = ctx.string_term_value_ptrs_.data();
-        filter.string_term_sizes = ctx.string_term_value_sizes_.data();
-        filter.string_term_count = ctx.string_term_value_ptrs_.size();
-        filter.string_terms_sorted = true;
-    }
-    filter.lower_inclusive = predicate.lower_inclusive_;
-    filter.upper_inclusive = predicate.upper_inclusive_;
 }
 
 bool
@@ -822,50 +685,23 @@ PhyVectorSearchNode::GetOutput() {
         AssertInfo(has_candidate_evaluator,
                    "candidate evaluator was not prepared before downpush "
                    "commit");
-        if (has_candidate_evaluator) {
-            AssertInfo(downpush_ctx->candidate_evaluator_.has_value() &&
-                           static_cast<bool>(
-                               downpush_ctx->candidate_evaluator_.value()),
-                       "candidate evaluator was not prepared before "
-                       "downpush commit");
-            const auto& prepared = downpush_ctx->candidate_evaluator_.value();
-            knowhere::BitsetView::CandidateEvaluatorV1 evaluator;
-            evaluator.abi_major = prepared.view.abi_major;
-            evaluator.struct_size = sizeof(evaluator);
-            evaluator.abi_capabilities = prepared.view.abi_capabilities;
-            evaluator.abi_capabilities |=
-                knowhere::BitsetView::kCandidateEvaluatorCapabilityLease;
-            evaluator.context = prepared.view.context;
-            evaluator.eval_batch = prepared.view.eval_batch;
-            evaluator.eval_contiguous = prepared.view.eval_contiguous;
-            evaluator.lease_factory_context = &downpush_ctx->self_;
-            evaluator.acquire_lease = &AcquireCardinalDownpushLease;
-            evaluator.release_lease = &ReleaseCardinalDownpushLease;
-            search_view.set_candidate_evaluator(
-                evaluator,
-                static_cast<size_t>(segment_->get_row_count()),
-                static_cast<size_t>(program->estimated_filtered_out_count));
-        } else {
-            AssertInfo(program->leaves.size() == 1,
-                       "legacy predicate carrier only supports one leaf");
-            const auto& predicate = program->leaves.front();
-            auto op = ToKnowherePredicateOp(predicate.op_);
-            auto value_type = ToKnowherePredicateValueType(
-                predicate.value_type_, *downpush_ctx);
-            if (!op.has_value() || !value_type.has_value()) {
-                ThrowInfo(UnexpectedError,
-                          "failed to translate Cardinal downpush predicate");
-            }
-            knowhere::BitsetView::ExtraScalarInt64PredicateFilter filter;
-            filter.value_type = value_type.value();
-            FillKnowhereDownpushValueSource(filter, *downpush_ctx);
-            filter.row_count = static_cast<size_t>(segment_->get_row_count());
-            filter.op = op.value();
-            FillKnowhereDownpushArgs(filter, predicate, *downpush_ctx);
-            search_view.set_extra_scalar_int64_predicate_filter(
-                filter,
-                static_cast<size_t>(program->estimated_filtered_out_count));
-        }
+        const auto& prepared = downpush_ctx->candidate_evaluator_.value();
+        knowhere::BitsetView::CandidateEvaluatorV1 evaluator;
+        evaluator.abi_major = prepared.view.abi_major;
+        evaluator.struct_size = sizeof(evaluator);
+        evaluator.abi_capabilities = prepared.view.abi_capabilities;
+        evaluator.abi_capabilities |=
+            knowhere::BitsetView::kCandidateEvaluatorCapabilityLease;
+        evaluator.context = prepared.view.context;
+        evaluator.eval_batch = prepared.view.eval_batch;
+        evaluator.eval_contiguous = prepared.view.eval_contiguous;
+        evaluator.lease_factory_context = &downpush_ctx->self_;
+        evaluator.acquire_lease = &AcquireCardinalDownpushLease;
+        evaluator.release_lease = &ReleaseCardinalDownpushLease;
+        search_view.set_candidate_evaluator(
+            evaluator,
+            static_cast<size_t>(segment_->get_row_count()),
+            static_cast<size_t>(program->estimated_filtered_out_count));
         const auto& first_predicate = program->leaves.front();
         const char* value_type_name =
             program->leaves.size() > 1 ? "composite"
