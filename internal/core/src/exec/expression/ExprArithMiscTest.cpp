@@ -76,9 +76,10 @@
 
 EXPR_TEST_INSTANTIATE();
 
-TEST(CandidateEvaluatorTest, Int64ModSupportsContiguousChunkedAndPartialBatches) {
-    static constexpr std::array<int64_t, 10> values =
-        {-9, -1, 0, 1, 2, 3, 4, 5, 8, 13};
+TEST(CandidateEvaluatorTest,
+     Int64ModSupportsContiguousChunkedAndPartialBatches) {
+    static constexpr std::array<int64_t, 10> values = {
+        -9, -1, 0, 1, 2, 3, 4, 5, 8, 13};
     static constexpr std::array<const int64_t*, 3> chunks = {
         values.data(), values.data() + 3, values.data() + 7};
     static constexpr std::array<int64_t, 4> chunk_offsets = {0, 3, 7, 10};
@@ -89,12 +90,11 @@ TEST(CandidateEvaluatorTest, Int64ModSupportsContiguousChunkedAndPartialBatches)
         ASSERT_TRUE(prepared.has_value());
         ASSERT_TRUE(static_cast<bool>(prepared.value()));
         uint64_t valid_mask = 0;
-        const auto status = prepared->view.eval_batch(
-            prepared->view.context,
-            row_ids.data(),
-            row_ids.size(),
-            0b11101111,
-            &valid_mask);
+        const auto status = prepared->view.eval_batch(prepared->view.context,
+                                                      row_ids.data(),
+                                                      row_ids.size(),
+                                                      0b11101111,
+                                                      &valid_mask);
         EXPECT_EQ(status, 0);
 
         uint64_t expected = 0;
@@ -139,20 +139,20 @@ TEST(CandidateEvaluatorTest, Int64ModSupportsContiguousChunkedAndPartialBatches)
     chunked.num_chunks = chunks.size();
     check(chunked);
 
-    EXPECT_FALSE(exec::PrepareInt64ModCandidateEvaluator(contiguous, 0, 1)
-                     .has_value());
-    EXPECT_FALSE(exec::PrepareInt64ModCandidateEvaluator(contiguous, 5, 6)
-                     .has_value());
+    EXPECT_FALSE(
+        exec::PrepareInt64ModCandidateEvaluator(contiguous, 0, 1).has_value());
+    EXPECT_FALSE(
+        exec::PrepareInt64ModCandidateEvaluator(contiguous, 5, 6).has_value());
 }
 
 TEST(CandidateEvaluatorTest, Int64ComparisonRangeAndTermStayMilvusOwned) {
-    static constexpr std::array<int64_t, 9> values =
-        {-8, -1, 0, 1, 2, 3, 4, 8, 13};
+    static constexpr std::array<int64_t, 9> values = {
+        -8, -1, 0, 1, 2, 3, 4, 8, 13};
     static constexpr std::array<const int64_t*, 3> chunks = {
         values.data(), values.data() + 2, values.data() + 6};
     static constexpr std::array<int64_t, 4> chunk_offsets = {0, 2, 6, 9};
-    static constexpr std::array<int64_t, 9> row_ids = {8, 0, 7, 1, 6,
-                                                       2, 5, 3, 4};
+    static constexpr std::array<int64_t, 9> row_ids = {
+        8, 0, 7, 1, 6, 2, 5, 3, 4};
 
     exec::Int64CandidateSourceView contiguous;
     contiguous.row_values = values.data();
@@ -251,8 +251,7 @@ TEST(CandidateEvaluatorTest, Int64ComparisonRangeAndTermStayMilvusOwned) {
     term.value_type_ = CardinalDownpushPredicateValueType::Int64;
     term.op_ = CardinalDownpushPredicateOp::ScalarTerm;
     term.int64_terms_ = {-8, 1, 4, 13};
-    auto prepared =
-        exec::PrepareInt64CandidateEvaluator(contiguous, term);
+    auto prepared = exec::PrepareInt64CandidateEvaluator(contiguous, term);
     ASSERT_TRUE(prepared.has_value());
     uint64_t valid_mask = 0;
     EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
@@ -282,12 +281,12 @@ TEST(CandidateEvaluatorTest, StringComparisonRangeAndTermStayMilvusOwned) {
     static constexpr std::array<const char*, 2> bases = {chunk0, chunk1};
     static constexpr std::array<uint32_t, 4> offsets0 = {0, 3, 6, 9};
     static constexpr std::array<uint32_t, 4> offsets1 = {0, 3, 6, 9};
-    static constexpr std::array<const uint32_t*, 2> offsets = {
-        offsets0.data(), offsets1.data()};
+    static constexpr std::array<const uint32_t*, 2> offsets = {offsets0.data(),
+                                                               offsets1.data()};
     static constexpr std::array<bool, 3> valid0 = {true, false, true};
     static constexpr std::array<bool, 3> valid1 = {true, true, true};
-    static constexpr std::array<const bool*, 2> validity = {
-        valid0.data(), valid1.data()};
+    static constexpr std::array<const bool*, 2> validity = {valid0.data(),
+                                                            valid1.data()};
     static constexpr std::array<size_t, 2> row_counts = {3, 3};
     static constexpr std::array<int64_t, 3> row_offsets = {0, 3, 6};
     static constexpr std::array<int64_t, 6> row_ids = {5, 0, 3, 1, 4, 2};
@@ -304,7 +303,8 @@ TEST(CandidateEvaluatorTest, StringComparisonRangeAndTermStayMilvusOwned) {
 
     auto evaluate = [&](CardinalDownpushPredicate predicate) {
         predicate.value_type_ = CardinalDownpushPredicateValueType::String;
-        auto prepared = exec::PrepareStringCandidateEvaluator(source, predicate);
+        auto prepared =
+            exec::PrepareStringCandidateEvaluator(source, predicate);
         EXPECT_TRUE(prepared.has_value());
         uint64_t valid_mask = 0;
         EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
@@ -327,8 +327,8 @@ TEST(CandidateEvaluatorTest, StringComparisonRangeAndTermStayMilvusOwned) {
     range.string_arg1_ = "fox";
     range.lower_inclusive_ = true;
     range.upper_inclusive_ = false;
-    EXPECT_EQ(evaluate(range), (uint64_t{1} << 2) | (uint64_t{1} << 4) |
-                                   (uint64_t{1} << 5));
+    EXPECT_EQ(evaluate(range),
+              (uint64_t{1} << 2) | (uint64_t{1} << 4) | (uint64_t{1} << 5));
 
     CardinalDownpushPredicate term;
     term.op_ = CardinalDownpushPredicateOp::ScalarTerm;
@@ -346,28 +346,27 @@ TEST(CandidateEvaluatorTest, StringComparisonRangeAndTermStayMilvusOwned) {
     auto prepared = exec::PrepareStringCandidateEvaluator(dictionary, equal);
     ASSERT_TRUE(prepared.has_value());
     uint64_t valid_mask = 0;
-    EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
-                                        dictionary_rows.data(),
-                                        dictionary_rows.size(),
-                                        (uint64_t{1} << dictionary_rows.size()) -
-                                            1,
-                                        &valid_mask),
-              0);
+    EXPECT_EQ(
+        prepared->view.eval_batch(prepared->view.context,
+                                  dictionary_rows.data(),
+                                  dictionary_rows.size(),
+                                  (uint64_t{1} << dictionary_rows.size()) - 1,
+                                  &valid_mask),
+        0);
     EXPECT_EQ(valid_mask, (uint64_t{1} << 0) | (uint64_t{1} << 3));
 
     CardinalDownpushPredicate like;
     like.value_type_ = CardinalDownpushPredicateValueType::String;
     like.op_ = CardinalDownpushPredicateOp::StringLikeMatch;
     like.string_arg0_ = "_o%";
-    EXPECT_EQ(evaluate(like),
-              (uint64_t{1} << 0) | (uint64_t{1} << 2));
+    EXPECT_EQ(evaluate(like), (uint64_t{1} << 0) | (uint64_t{1} << 2));
 
     like.string_arg0_ = "d\\%g";
     EXPECT_EQ(evaluate(like), uint64_t{0});
 
     like.string_arg0_ = "broken\\";
-    EXPECT_FALSE(exec::PrepareStringCandidateEvaluator(source, like)
-                     .has_value());
+    EXPECT_FALSE(
+        exec::PrepareStringCandidateEvaluator(source, like).has_value());
 }
 
 TEST(CandidateEvaluatorTest, StringLikePreservesUtf8AndEscapeSemantics) {
@@ -421,6 +420,76 @@ TEST(CandidateEvaluatorTest, StringLikePreservesUtf8AndEscapeSemantics) {
     EXPECT_EQ(evaluate("a%b_c%d"), uint64_t{1} << 7);
 }
 
+TEST(CandidateEvaluatorTest, LogicalComposerPreservesThreeValuedSemantics) {
+    static constexpr std::array<int64_t, 8> numeric_values = {
+        0, 1, 2, 3, 4, 5, 6, 7};
+    static constexpr std::array<int32_t, 8> dictionary_ids = {
+        0, 1, 1, 1, 0, -1, 1, 0};
+    static constexpr std::array<int64_t, 8> row_ids = {0, 1, 2, 3, 4, 5, 6, 7};
+
+    exec::Int64CandidateSourceView numeric_source;
+    numeric_source.row_values = numeric_values.data();
+    numeric_source.row_count = numeric_values.size();
+
+    CardinalDownpushPredicate greater_equal;
+    greater_equal.value_type_ = CardinalDownpushPredicateValueType::Int64;
+    greater_equal.op_ = CardinalDownpushPredicateOp::Int64GreaterEqual;
+    greater_equal.arg0_ = 3;
+    auto ge =
+        exec::PrepareInt64CandidateEvaluator(numeric_source, greater_equal);
+    ASSERT_TRUE(ge.has_value());
+
+    exec::StringCandidateSourceView string_source;
+    string_source.row_count = dictionary_ids.size();
+    string_source.row_dictionary_ids = dictionary_ids.data();
+    string_source.target_dictionary_id = 0;
+    string_source.target_dictionary_id_found = true;
+    CardinalDownpushPredicate string_equal;
+    string_equal.value_type_ = CardinalDownpushPredicateValueType::String;
+    string_equal.op_ = CardinalDownpushPredicateOp::Int64Equal;
+    string_equal.string_arg0_ = "x";
+    auto eq =
+        exec::PrepareStringCandidateEvaluator(string_source, string_equal);
+    ASSERT_TRUE(eq.has_value());
+
+    CardinalDownpushPredicate equal_zero;
+    equal_zero.value_type_ = CardinalDownpushPredicateValueType::Int64;
+    equal_zero.op_ = CardinalDownpushPredicateOp::Int64Equal;
+    equal_zero.arg0_ = 0;
+    auto zero =
+        exec::PrepareInt64CandidateEvaluator(numeric_source, equal_zero);
+    ASSERT_TRUE(zero.has_value());
+
+    // (numeric >= 3 AND NOT(string == "x")) OR numeric == 0
+    const std::vector<exec::CandidatePredicateNode> nodes = {
+        {exec::CandidatePredicateNodeType::Leaf, 0, 0},
+        {exec::CandidatePredicateNodeType::Leaf, 1, 0},
+        {exec::CandidatePredicateNodeType::Not, 1, 0},
+        {exec::CandidatePredicateNodeType::And, 0, 2},
+        {exec::CandidatePredicateNodeType::Leaf, 2, 0},
+        {exec::CandidatePredicateNodeType::Or, 3, 4},
+    };
+    std::vector<exec::PreparedCandidateEvaluator> leaves;
+    leaves.push_back(std::move(*ge));
+    leaves.push_back(std::move(*eq));
+    leaves.push_back(std::move(*zero));
+    auto composite =
+        exec::ComposeCandidateEvaluators(std::move(leaves), nodes, 5);
+    ASSERT_TRUE(composite.has_value());
+
+    uint64_t accepted = 0;
+    EXPECT_EQ(composite->view.eval_batch(composite->view.context,
+                                         row_ids.data(),
+                                         row_ids.size(),
+                                         UINT64_MAX,
+                                         &accepted),
+              0);
+    // Row 5 is NULL in the string source. NOT(NULL) stays NULL and therefore
+    // is not accepted at the root; it must not be mistaken for NOT(false).
+    EXPECT_EQ(accepted,
+              (uint64_t{1} << 0) | (uint64_t{1} << 3) | (uint64_t{1} << 6));
+}
+
 TEST(CandidateEvaluatorTest, Int64ArithmeticUsesWideIntermediate) {
     static constexpr std::array<int64_t, 8> values = {
         INT64_MIN, -100, -7, 0, 7, 100, INT64_MAX - 1, INT64_MAX};
@@ -439,27 +508,19 @@ TEST(CandidateEvaluatorTest, Int64ArithmeticUsesWideIntermediate) {
         {CardinalDownpushPredicateOp::ScalarAddLessThan,
          9,
          50,
-         [](int64_t v) {
-             return static_cast<__int128>(v) + 9 < 50;
-         }},
+         [](int64_t v) { return static_cast<__int128>(v) + 9 < 50; }},
         {CardinalDownpushPredicateOp::ScalarSubLessThan,
          -9,
          50,
-         [](int64_t v) {
-             return static_cast<__int128>(v) - (-9) < 50;
-         }},
+         [](int64_t v) { return static_cast<__int128>(v) - (-9) < 50; }},
         {CardinalDownpushPredicateOp::ScalarMulLessThan,
          3,
          50,
-         [](int64_t v) {
-             return static_cast<__int128>(v) * 3 < 50;
-         }},
+         [](int64_t v) { return static_cast<__int128>(v) * 3 < 50; }},
         {CardinalDownpushPredicateOp::ScalarDivLessThan,
          -1,
          50,
-         [](int64_t v) {
-             return static_cast<__int128>(v) / (-1) < 50;
-         }},
+         [](int64_t v) { return static_cast<__int128>(v) / (-1) < 50; }},
     };
 
     for (const auto& test_case : cases) {
@@ -468,8 +529,7 @@ TEST(CandidateEvaluatorTest, Int64ArithmeticUsesWideIntermediate) {
         predicate.op_ = test_case.op;
         predicate.arg0_ = test_case.operand;
         predicate.arg1_ = test_case.threshold;
-        auto prepared =
-            exec::PrepareInt64CandidateEvaluator(source, predicate);
+        auto prepared = exec::PrepareInt64CandidateEvaluator(source, predicate);
         ASSERT_TRUE(prepared.has_value());
         uint64_t valid_mask = 0;
         EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
@@ -489,8 +549,7 @@ TEST(CandidateEvaluatorTest, Int64ArithmeticUsesWideIntermediate) {
 
     CardinalDownpushPredicate divide_by_zero;
     divide_by_zero.value_type_ = CardinalDownpushPredicateValueType::Int64;
-    divide_by_zero.op_ =
-        CardinalDownpushPredicateOp::ScalarDivLessThan;
+    divide_by_zero.op_ = CardinalDownpushPredicateOp::ScalarDivLessThan;
     divide_by_zero.arg0_ = 0;
     EXPECT_FALSE(exec::PrepareInt64CandidateEvaluator(source, divide_by_zero)
                      .has_value());
@@ -554,16 +613,14 @@ TEST(CandidateEvaluatorTest, FloatLeavesPreserveIeeeSemantics) {
     predicate.double_arg1_ = 3.5;
     predicate.lower_inclusive_ = false;
     predicate.upper_inclusive_ = true;
-    check(predicate,
-          [](float value) { return value > -3.5 && value <= 3.5; });
+    check(predicate, [](float value) { return value > -3.5 && value <= 3.5; });
 
     predicate.op_ = CardinalDownpushPredicateOp::ScalarTerm;
     predicate.double_terms_ = {
         std::numeric_limits<double>::quiet_NaN(), -3.5, 0.0, 8.0};
-    check(predicate,
-          [](float value) {
-              return value == -3.5F || value == 0.0F || value == 8.0F;
-          });
+    check(predicate, [](float value) {
+        return value == -3.5F || value == 0.0F || value == 8.0F;
+    });
 
     predicate.double_terms_.clear();
     predicate.op_ = CardinalDownpushPredicateOp::ScalarAddLessThan;

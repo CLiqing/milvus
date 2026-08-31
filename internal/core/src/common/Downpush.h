@@ -54,6 +54,7 @@ enum class CardinalDownpushPredicateValueType {
 struct CardinalDownpushPredicate {
     FieldId field_id_;
     DataType field_data_type_{DataType::NONE};
+    bool field_nullable_{false};
     CardinalDownpushPredicateValueType value_type_{
         CardinalDownpushPredicateValueType::Int64};
     CardinalDownpushPredicateOp op_{

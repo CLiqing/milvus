@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace milvus {
 struct CardinalDownpushPredicate;
@@ -14,14 +15,20 @@ struct CardinalDownpushPredicate;
 
 namespace milvus::exec {
 
+struct CandidatePredicateNode;
+
 inline constexpr uint32_t kCandidateEvaluatorAbiMajor = 1;
 
 using CandidateEvalBatchFn = int32_t (*)(
-    const void*, const int64_t*, uint32_t, uint64_t, uint64_t*
-) noexcept;
-using CandidateEvalContiguousFn = int32_t (*)(
-    const void*, int64_t, uint32_t, uint64_t, uint64_t*
-) noexcept;
+    const void*, const int64_t*, uint32_t, uint64_t, uint64_t*) noexcept;
+using CandidateEvalContiguousFn =
+    int32_t (*)(const void*, int64_t, uint32_t, uint64_t, uint64_t*) noexcept;
+using CandidateEvalTruthBatchFn = int32_t (*)(const void*,
+                                              const int64_t*,
+                                              uint32_t,
+                                              uint64_t,
+                                              uint64_t*,
+                                              uint64_t*) noexcept;
 
 // Milvus-owned executable view. The owner keeps the callback context and all
 // referenced scalar source memory alive for the complete query execution.
@@ -37,12 +44,21 @@ struct CandidateEvaluatorV1 {
 struct PreparedCandidateEvaluator {
     CandidateEvaluatorV1 view;
     std::shared_ptr<const void> owner;
+    // Milvus-only three-valued result used by the logical composer. `true`
+    // is always a subset of `known`; unknown lanes model SQL NULL. The public
+    // candidate ABI intentionally exposes only root-level accepted lanes.
+    CandidateEvalTruthBatchFn eval_truth_batch = nullptr;
 
     explicit operator bool() const noexcept {
         return owner != nullptr && view.context != nullptr &&
                view.eval_batch != nullptr;
     }
 };
+
+std::optional<PreparedCandidateEvaluator>
+ComposeCandidateEvaluators(std::vector<PreparedCandidateEvaluator> leaves,
+                           const std::vector<CandidatePredicateNode>& nodes,
+                           size_t root);
 
 // Internal Numeric-module source contract. It never crosses into Knowhere or
 // Cardinal; it lets the Numeric evaluator retain the existing zero-copy

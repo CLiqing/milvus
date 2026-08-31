@@ -93,16 +93,15 @@ ResolveRawStringCandidate(const StringCandidateSourceView& source,
             }
             local_offset -= chunk_idx * source.uniform_chunk_rows;
         } else {
-            const auto* upper =
-                std::upper_bound(source.chunk_row_offsets,
-                                 source.chunk_row_offsets +
-                                     source.num_chunks + 1,
-                                 row_id);
+            const auto* upper = std::upper_bound(
+                source.chunk_row_offsets,
+                source.chunk_row_offsets + source.num_chunks + 1,
+                row_id);
             if (upper == source.chunk_row_offsets) {
                 return false;
             }
-            chunk_idx = static_cast<size_t>(
-                (upper - source.chunk_row_offsets) - 1);
+            chunk_idx =
+                static_cast<size_t>((upper - source.chunk_row_offsets) - 1);
             if (chunk_idx >= source.num_chunks) {
                 return false;
             }
@@ -146,19 +145,18 @@ EvaluateStringValue(const StringEvaluatorState& state,
         case StringEvaluatorOp::NotEqual:
             return value != state.arg0;
         case StringEvaluatorOp::Range: {
-            const bool lower_ok = state.lower_inclusive
-                                      ? value >= state.arg0
-                                      : value > state.arg0;
-            const bool upper_ok = state.upper_inclusive
-                                      ? value <= state.arg1
-                                      : value < state.arg1;
+            const bool lower_ok = state.lower_inclusive ? value >= state.arg0
+                                                        : value > state.arg0;
+            const bool upper_ok = state.upper_inclusive ? value <= state.arg1
+                                                        : value < state.arg1;
             return lower_ok && upper_ok;
         }
         case StringEvaluatorOp::Term:
             return std::binary_search(
                 state.terms.begin(), state.terms.end(), value);
         case StringEvaluatorOp::Like:
-            return state.like_matcher != nullptr && (*state.like_matcher)(value);
+            return state.like_matcher != nullptr &&
+                   (*state.like_matcher)(value);
     }
     return false;
 }
@@ -197,8 +195,8 @@ EvaluateStringCandidates(const void* context,
                          uint64_t* valid_mask) noexcept {
     if (context == nullptr || candidate_ids == nullptr ||
         valid_mask == nullptr || count > 64 ||
-        (active_mask & ~((count == 64) ? ~uint64_t{0}
-                                      : ((uint64_t{1} << count) - 1))) != 0) {
+        (active_mask &
+         ~((count == 64) ? ~uint64_t{0} : ((uint64_t{1} << count) - 1))) != 0) {
         return -1;
     }
     const auto& state = *static_cast<const StringEvaluatorState*>(context);
@@ -211,6 +209,63 @@ EvaluateStringCandidates(const void* context,
         }
     }
     *valid_mask = accepted;
+    return 0;
+}
+
+int32_t
+EvaluateStringTruth(const void* context,
+                    const int64_t* candidate_ids,
+                    uint32_t count,
+                    uint64_t active_mask,
+                    uint64_t* true_mask,
+                    uint64_t* known_mask) noexcept {
+    if (context == nullptr || candidate_ids == nullptr ||
+        true_mask == nullptr || known_mask == nullptr || count > 64 ||
+        (active_mask &
+         ~((count == 64) ? ~uint64_t{0} : ((uint64_t{1} << count) - 1))) != 0) {
+        return -1;
+    }
+    const auto& state = *static_cast<const StringEvaluatorState*>(context);
+    uint64_t accepted = 0;
+    uint64_t known = 0;
+    for (uint32_t lane = 0; lane < count; ++lane) {
+        const auto lane_bit = uint64_t{1} << lane;
+        if ((active_mask & lane_bit) == 0) {
+            continue;
+        }
+        const auto row_id = candidate_ids[lane];
+        if (row_id < 0 ||
+            static_cast<size_t>(row_id) >= state.source.row_count) {
+            continue;
+        }
+        bool passed = false;
+        if (state.source.row_dictionary_ids != nullptr) {
+            const auto value_id = state.source.row_dictionary_ids[row_id];
+            if (value_id < 0) {
+                continue;
+            }
+            known |= lane_bit;
+            if (state.op == StringEvaluatorOp::Equal) {
+                passed = state.source.target_dictionary_id_found &&
+                         value_id == state.source.target_dictionary_id;
+            } else if (state.op == StringEvaluatorOp::NotEqual) {
+                passed = !state.source.target_dictionary_id_found ||
+                         value_id != state.source.target_dictionary_id;
+            }
+        } else {
+            std::string_view value;
+            if (!ResolveRawStringCandidate(state.source, row_id, &value)) {
+                continue;
+            }
+            known |= lane_bit;
+            passed = EvaluateStringValue(state, value);
+        }
+        if (passed) {
+            accepted |= lane_bit;
+        }
+    }
+    *true_mask = accepted;
+    *known_mask = known;
     return 0;
 }
 
@@ -245,6 +300,7 @@ class StringProvider final : public DownpushPredicateProvider {
         CardinalDownpushPredicate predicate;
         predicate.field_id_ = column.field_id_;
         predicate.field_data_type_ = column.data_type_;
+        predicate.field_nullable_ = column.nullable_;
         predicate.value_type_ = CardinalDownpushPredicateValueType::String;
         return predicate;
     }
@@ -353,14 +409,14 @@ std::optional<PreparedCandidateEvaluator>
 PrepareStringCandidateEvaluator(const StringCandidateSourceView& source,
                                 const CardinalDownpushPredicate& predicate) {
     const auto op = ToStringEvaluatorOp(predicate.op_);
-    const bool has_raw_source =
-        source.chunk_bases != nullptr &&
-        source.chunk_value_offsets != nullptr &&
-        source.chunk_row_counts != nullptr &&
-        source.chunk_row_offsets != nullptr && source.num_chunks > 0;
+    const bool has_raw_source = source.chunk_bases != nullptr &&
+                                source.chunk_value_offsets != nullptr &&
+                                source.chunk_row_counts != nullptr &&
+                                source.chunk_row_offsets != nullptr &&
+                                source.num_chunks > 0;
     const bool dictionary_op =
-        op.has_value() && (*op == StringEvaluatorOp::Equal ||
-                           *op == StringEvaluatorOp::NotEqual);
+        op.has_value() &&
+        (*op == StringEvaluatorOp::Equal || *op == StringEvaluatorOp::NotEqual);
     const bool has_dictionary_source =
         source.row_dictionary_ids != nullptr && dictionary_op;
     if (predicate.value_type_ != CardinalDownpushPredicateValueType::String ||
@@ -399,6 +455,7 @@ PrepareStringCandidateEvaluator(const StringCandidateSourceView& source,
     prepared.view.context = owner.get();
     prepared.view.eval_batch = &EvaluateStringCandidates;
     prepared.view.eval_contiguous = &EvaluateStringContiguousCandidates;
+    prepared.eval_truth_batch = &EvaluateStringTruth;
     return prepared;
 }
 

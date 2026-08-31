@@ -94,7 +94,7 @@ class PhyFilterBitsNode : public Operator {
     bool enable_expr_cache_ = false;
     std::string expr_cache_key_;
     bool cardinal_downpush_enabled_ = false;
-    std::optional<CardinalDownpushPredicate> cardinal_downpush_predicate_;
+    std::optional<CardinalDownpushPredicateProgram> cardinal_downpush_program_;
     std::shared_ptr<CardinalDownpushSearchContext>
         cardinal_downpush_search_context_;
 };

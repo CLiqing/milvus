@@ -32,6 +32,7 @@
 #include "common/Exception.h"
 #include "common/ArrayOffsets.h"
 #include "common/OpContext.h"
+#include "exec/operator/DownpushSearchContext.h"
 #include "segcore/SegmentInterface.h"
 #include "segcore/Utils.h"
 
@@ -413,18 +414,18 @@ class QueryContext : public Context {
     }
 
     void
-    set_cardinal_downpush_predicate(CardinalDownpushPredicate predicate) {
-        cardinal_downpush_predicate_ = predicate;
+    set_cardinal_downpush_program(CardinalDownpushPredicateProgram program) {
+        cardinal_downpush_program_ = std::move(program);
     }
 
-    const std::optional<CardinalDownpushPredicate>&
-    get_cardinal_downpush_predicate() const {
-        return cardinal_downpush_predicate_;
+    const std::optional<CardinalDownpushPredicateProgram>&
+    get_cardinal_downpush_program() const {
+        return cardinal_downpush_program_;
     }
 
     void
-    clear_cardinal_downpush_predicate() {
-        cardinal_downpush_predicate_.reset();
+    clear_cardinal_downpush_program() {
+        cardinal_downpush_program_.reset();
         cardinal_downpush_search_context_.reset();
     }
 
@@ -491,7 +492,7 @@ class QueryContext : public Context {
     // bitmaps in the same request path.
     bool enable_sub_expr_cache_write_ = true;
 
-    std::optional<CardinalDownpushPredicate> cardinal_downpush_predicate_;
+    std::optional<CardinalDownpushPredicateProgram> cardinal_downpush_program_;
     std::shared_ptr<CardinalDownpushSearchContext>
         cardinal_downpush_search_context_;
 };

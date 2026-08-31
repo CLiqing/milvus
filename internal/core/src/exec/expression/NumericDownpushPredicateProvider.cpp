@@ -137,10 +137,10 @@ EvaluateInt64ValueSpecialized(const Int64EvaluatorState& state,
     } else if constexpr (Op == Int64EvaluatorOp::NotEqual) {
         return value != state.arg0;
     } else if constexpr (Op == Int64EvaluatorOp::Range) {
-        const bool lower_ok = state.lower_inclusive ? value >= state.arg0
-                                                    : value > state.arg0;
-        const bool upper_ok = state.upper_inclusive ? value <= state.arg1
-                                                    : value < state.arg1;
+        const bool lower_ok =
+            state.lower_inclusive ? value >= state.arg0 : value > state.arg0;
+        const bool upper_ok =
+            state.upper_inclusive ? value <= state.arg1 : value < state.arg1;
         return lower_ok && upper_ok;
     } else if constexpr (Op == Int64EvaluatorOp::Term) {
         return std::binary_search(
@@ -182,12 +182,10 @@ EvaluateFloatValue(const FloatEvaluatorState& state, float raw_value) noexcept {
         case Int64EvaluatorOp::NotEqual:
             return value != state.arg0;
         case Int64EvaluatorOp::Range: {
-            const bool lower_ok = state.lower_inclusive
-                                      ? value >= state.arg0
-                                      : value > state.arg0;
-            const bool upper_ok = state.upper_inclusive
-                                      ? value <= state.arg1
-                                      : value < state.arg1;
+            const bool lower_ok = state.lower_inclusive ? value >= state.arg0
+                                                        : value > state.arg0;
+            const bool upper_ok = state.upper_inclusive ? value <= state.arg1
+                                                        : value < state.arg1;
             return lower_ok && upper_ok;
         }
         case Int64EvaluatorOp::Term:
@@ -223,8 +221,7 @@ EvaluateInt64Candidates(const void* opaque,
 
     const uint64_t lane_mask =
         count == 64 ? UINT64_MAX
-                    : (count == 0 ? uint64_t{0}
-                                  : ((uint64_t{1} << count) - 1));
+                    : (count == 0 ? uint64_t{0} : ((uint64_t{1} << count) - 1));
     const uint64_t active = active_mask & lane_mask;
 
     std::array<const int64_t*, 64> values{};
@@ -286,8 +283,7 @@ EvaluateInt64ContiguousCandidates(const void* opaque,
     const auto& state = *static_cast<const Int64EvaluatorState*>(opaque);
     const uint64_t lane_mask =
         count == 64 ? UINT64_MAX
-                    : (count == 0 ? uint64_t{0}
-                                  : ((uint64_t{1} << count) - 1));
+                    : (count == 0 ? uint64_t{0} : ((uint64_t{1} << count) - 1));
     const uint64_t active = active_mask & lane_mask;
     if (static_cast<size_t>(first_row_id) > state.source.row_count ||
         count > state.source.row_count - static_cast<size_t>(first_row_id)) {
@@ -322,15 +318,40 @@ EvaluateInt64ContiguousCandidates(const void* opaque,
     return 0;
 }
 
+template <Int64EvaluatorOp Op>
+int32_t
+EvaluateInt64Truth(const void* opaque,
+                   const int64_t* row_ids,
+                   uint32_t count,
+                   uint64_t active_mask,
+                   uint64_t* true_mask,
+                   uint64_t* known_mask) noexcept {
+    if (known_mask == nullptr) {
+        return -1;
+    }
+    const auto status = EvaluateInt64Candidates<Op>(
+        opaque, row_ids, count, active_mask, true_mask);
+    if (status == 0) {
+        const auto lanes =
+            count == 64
+                ? ~uint64_t{0}
+                : (count == 0 ? uint64_t{0} : ((uint64_t{1} << count) - 1));
+        *known_mask = active_mask & lanes;
+    }
+    return status;
+}
+
 void
 ConfigureInt64EvaluatorCallbacks(Int64EvaluatorOp op,
-                                 CandidateEvaluatorV1& view) {
-#define SET_INT64_EVALUATOR_CALLBACKS(op_name)                            \
-    case Int64EvaluatorOp::op_name:                                      \
-        view.eval_batch = &EvaluateInt64Candidates<                      \
-            Int64EvaluatorOp::op_name>;                                  \
-        view.eval_contiguous = &EvaluateInt64ContiguousCandidates<       \
-            Int64EvaluatorOp::op_name>;                                  \
+                                 PreparedCandidateEvaluator& prepared) {
+#define SET_INT64_EVALUATOR_CALLBACKS(op_name)                             \
+    case Int64EvaluatorOp::op_name:                                        \
+        prepared.view.eval_batch =                                         \
+            &EvaluateInt64Candidates<Int64EvaluatorOp::op_name>;           \
+        prepared.view.eval_contiguous =                                    \
+            &EvaluateInt64ContiguousCandidates<Int64EvaluatorOp::op_name>; \
+        prepared.eval_truth_batch =                                        \
+            &EvaluateInt64Truth<Int64EvaluatorOp::op_name>;                \
         return
 
     switch (op) {
@@ -364,8 +385,7 @@ EvaluateFloatCandidates(const void* opaque,
     const auto& state = *static_cast<const FloatEvaluatorState*>(opaque);
     const uint64_t lane_mask =
         count == 64 ? UINT64_MAX
-                    : (count == 0 ? uint64_t{0}
-                                  : ((uint64_t{1} << count) - 1));
+                    : (count == 0 ? uint64_t{0} : ((uint64_t{1} << count) - 1));
     const uint64_t active = active_mask & lane_mask;
 
     std::array<const float*, 64> values{};
@@ -413,6 +433,28 @@ EvaluateFloatCandidates(const void* opaque,
 }
 
 int32_t
+EvaluateFloatTruth(const void* opaque,
+                   const int64_t* row_ids,
+                   uint32_t count,
+                   uint64_t active_mask,
+                   uint64_t* true_mask,
+                   uint64_t* known_mask) noexcept {
+    if (known_mask == nullptr) {
+        return -1;
+    }
+    const auto status =
+        EvaluateFloatCandidates(opaque, row_ids, count, active_mask, true_mask);
+    if (status == 0) {
+        const auto lanes =
+            count == 64
+                ? ~uint64_t{0}
+                : (count == 0 ? uint64_t{0} : ((uint64_t{1} << count) - 1));
+        *known_mask = active_mask & lanes;
+    }
+    return status;
+}
+
+int32_t
 EvaluateFloatContiguousCandidates(const void* opaque,
                                   int64_t first_row_id,
                                   uint32_t count,
@@ -425,8 +467,7 @@ EvaluateFloatContiguousCandidates(const void* opaque,
     const auto& state = *static_cast<const FloatEvaluatorState*>(opaque);
     const uint64_t lane_mask =
         count == 64 ? UINT64_MAX
-                    : (count == 0 ? uint64_t{0}
-                                  : ((uint64_t{1} << count) - 1));
+                    : (count == 0 ? uint64_t{0} : ((uint64_t{1} << count) - 1));
     const uint64_t active = active_mask & lane_mask;
     if (static_cast<size_t>(first_row_id) > state.source.row_count ||
         count > state.source.row_count - static_cast<size_t>(first_row_id)) {
@@ -530,6 +571,7 @@ class NumericProvider final : public DownpushPredicateProvider {
         CardinalDownpushPredicate predicate;
         predicate.field_id_ = column.field_id_;
         predicate.field_data_type_ = column.data_type_;
+        predicate.field_nullable_ = column.nullable_;
         predicate.value_type_ = column.data_type_ == DataType::FLOAT
                                     ? CardinalDownpushPredicateValueType::Float
                                     : CardinalDownpushPredicateValueType::Int64;
@@ -699,8 +741,7 @@ PrepareInt64CandidateEvaluator(const Int64CandidateSourceView& source,
                                     source.chunk_offsets != nullptr &&
                                     source.num_chunks > 0;
     const auto op = ToInt64EvaluatorOp(predicate.op_);
-    if (predicate.value_type_ !=
-            CardinalDownpushPredicateValueType::Int64 ||
+    if (predicate.value_type_ != CardinalDownpushPredicateValueType::Int64 ||
         !op.has_value() || source.row_count == 0 ||
         (!has_contiguous_source && !has_chunked_source)) {
         return std::nullopt;
@@ -716,14 +757,14 @@ PrepareInt64CandidateEvaluator(const Int64CandidateSourceView& source,
     if (*op == Int64EvaluatorOp::DivLessThan && predicate.arg0_ == 0) {
         return std::nullopt;
     }
-    auto owner = std::make_shared<Int64EvaluatorState>(Int64EvaluatorState{
-        source,
-        *op,
-        predicate.arg0_,
-        predicate.arg1_,
-        predicate.lower_inclusive_,
-        predicate.upper_inclusive_,
-        predicate.int64_terms_});
+    auto owner = std::make_shared<Int64EvaluatorState>(
+        Int64EvaluatorState{source,
+                            *op,
+                            predicate.arg0_,
+                            predicate.arg1_,
+                            predicate.lower_inclusive_,
+                            predicate.upper_inclusive_,
+                            predicate.int64_terms_});
     if (*op == Int64EvaluatorOp::Term) {
         std::sort(owner->terms.begin(), owner->terms.end());
         owner->terms.erase(
@@ -733,7 +774,7 @@ PrepareInt64CandidateEvaluator(const Int64CandidateSourceView& source,
     PreparedCandidateEvaluator prepared;
     prepared.owner = owner;
     prepared.view.context = owner.get();
-    ConfigureInt64EvaluatorCallbacks(*op, prepared.view);
+    ConfigureInt64EvaluatorCallbacks(*op, prepared);
     return prepared;
 }
 
@@ -754,18 +795,17 @@ PrepareFloatCandidateEvaluator(const FloatCandidateSourceView& source,
     if (*op == Int64EvaluatorOp::Term && predicate.double_terms_.empty()) {
         return std::nullopt;
     }
-    if (*op == Int64EvaluatorOp::DivLessThan &&
-        predicate.double_arg0_ == 0.0) {
+    if (*op == Int64EvaluatorOp::DivLessThan && predicate.double_arg0_ == 0.0) {
         return std::nullopt;
     }
-    auto owner = std::make_shared<FloatEvaluatorState>(FloatEvaluatorState{
-        source,
-        *op,
-        static_cast<float>(predicate.double_arg0_),
-        static_cast<float>(predicate.double_arg1_),
-        predicate.lower_inclusive_,
-        predicate.upper_inclusive_,
-        {}});
+    auto owner = std::make_shared<FloatEvaluatorState>(
+        FloatEvaluatorState{source,
+                            *op,
+                            static_cast<float>(predicate.double_arg0_),
+                            static_cast<float>(predicate.double_arg1_),
+                            predicate.lower_inclusive_,
+                            predicate.upper_inclusive_,
+                            {}});
     if (*op == Int64EvaluatorOp::Term) {
         owner->terms.reserve(predicate.double_terms_.size());
         for (const auto value : predicate.double_terms_) {
@@ -786,6 +826,7 @@ PrepareFloatCandidateEvaluator(const FloatCandidateSourceView& source,
     prepared.view.context = owner.get();
     prepared.view.eval_batch = &EvaluateFloatCandidates;
     prepared.view.eval_contiguous = &EvaluateFloatContiguousCandidates;
+    prepared.eval_truth_batch = &EvaluateFloatTruth;
     return prepared;
 }
 

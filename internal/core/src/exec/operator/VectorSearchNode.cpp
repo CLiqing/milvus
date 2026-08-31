@@ -77,6 +77,7 @@ struct CardinalDownpushSearchContext {
     int32_t target_dictionary_id_{-1};
     bool target_dictionary_id_found_{false};
     std::optional<PreparedCandidateEvaluator> candidate_evaluator_;
+    std::vector<std::shared_ptr<CardinalDownpushSearchContext>> child_contexts_;
 };
 
 namespace {
@@ -514,8 +515,7 @@ PrepareCardinalDownpushSearchContext(
         !IsDownpushPredicateSourceReady(*context, predicate.value_type_)) {
         return nullptr;
     }
-    if (predicate.value_type_ ==
-        CardinalDownpushPredicateValueType::Int64) {
+    if (predicate.value_type_ == CardinalDownpushPredicateValueType::Int64) {
         Int64CandidateSourceView source;
         source.row_values = context->int64_row_values_ == nullptr
                                 ? nullptr
@@ -564,9 +564,10 @@ PrepareCardinalDownpushSearchContext(
             context->string_chunk_valid_data_.empty()
                 ? nullptr
                 : context->string_chunk_valid_data_.data();
-        source.chunk_row_counts = context->string_chunk_row_counts_.empty()
-                                      ? nullptr
-                                      : context->string_chunk_row_counts_.data();
+        source.chunk_row_counts =
+            context->string_chunk_row_counts_.empty()
+                ? nullptr
+                : context->string_chunk_row_counts_.data();
         source.chunk_row_offsets = context->chunk_offsets_.empty()
                                        ? nullptr
                                        : context->chunk_offsets_.data();
@@ -585,8 +586,44 @@ PrepareCardinalDownpushSearchContext(
     return context;
 }
 
+std::shared_ptr<CardinalDownpushSearchContext>
+PrepareCardinalDownpushSearchContext(
+    const segcore::SegmentInternalInterface* segment,
+    OpContext* op_context,
+    const CardinalDownpushPredicateProgram& program) {
+    if (program.leaves.empty() || program.nodes.empty() ||
+        program.root >= program.nodes.size()) {
+        return nullptr;
+    }
+    auto context = std::make_shared<CardinalDownpushSearchContext>();
+    std::vector<PreparedCandidateEvaluator> evaluators;
+    evaluators.reserve(program.leaves.size());
+    context->child_contexts_.reserve(program.leaves.size());
+    for (const auto& predicate : program.leaves) {
+        auto child = PrepareCardinalDownpushSearchContext(
+            segment, op_context, predicate);
+        if (child == nullptr || !child->candidate_evaluator_.has_value() ||
+            !static_cast<bool>(*child->candidate_evaluator_)) {
+            return nullptr;
+        }
+        evaluators.push_back(*child->candidate_evaluator_);
+        context->child_contexts_.push_back(std::move(child));
+    }
+    auto composite = ComposeCandidateEvaluators(
+        std::move(evaluators), program.nodes, program.root);
+    if (!composite.has_value()) {
+        return nullptr;
+    }
+    context->candidate_evaluator_ = std::move(*composite);
+    return context;
+}
+
 const char*
 CardinalDownpushSourceName(const CardinalDownpushSearchContext& context) {
+    if (!context.child_contexts_.empty()) {
+        return context.child_contexts_.size() == 1 ? "candidate_evaluator"
+                                                   : "composite_evaluator";
+    }
     if (context.row_dictionary_ids_ != nullptr) {
         return "stl_sort_dictionary_id";
     }
@@ -738,9 +775,8 @@ PhyVectorSearchNode::GetOutput() {
 
     auto op_context = query_context_->get_op_context();
     std::shared_ptr<CardinalDownpushSearchContext> downpush_ctx;
-    if (const auto& predicate =
-            query_context_->get_cardinal_downpush_predicate();
-        predicate.has_value()) {
+    if (const auto& program = query_context_->get_cardinal_downpush_program();
+        program.has_value()) {
         // element-level (array-of-vectors) search is rejected by the
         // FilterBitsNode gate before the predicate is ever set; this assert is
         // purely defensive against future regressions.
@@ -748,23 +784,16 @@ PhyVectorSearchNode::GetOutput() {
                    "downpush hint does not support element-level vector "
                    "search");
         downpush_ctx = query_context_->get_cardinal_downpush_search_context();
-        if (downpush_ctx == nullptr ||
-            !IsDownpushPredicateSourceReady(*downpush_ctx,
-                                            predicate->value_type_)) {
+        if (downpush_ctx == nullptr) {
             ThrowInfo(UnexpectedError,
                       "failed to build Cardinal downpush search context");
         }
         const bool has_candidate_evaluator =
             downpush_ctx->candidate_evaluator_.has_value() &&
             static_cast<bool>(downpush_ctx->candidate_evaluator_.value());
-        const bool is_numeric_predicate =
-            predicate->value_type_ ==
-                CardinalDownpushPredicateValueType::Int64 ||
-            predicate->value_type_ ==
-                CardinalDownpushPredicateValueType::Float;
-        AssertInfo(!is_numeric_predicate || has_candidate_evaluator,
-                   "numeric candidate evaluator was not prepared before "
-                   "downpush commit");
+        AssertInfo(has_candidate_evaluator,
+                   "candidate evaluator was not prepared before downpush "
+                   "commit");
         if (has_candidate_evaluator) {
             AssertInfo(downpush_ctx->candidate_evaluator_.has_value() &&
                            static_cast<bool>(
@@ -782,12 +811,14 @@ PhyVectorSearchNode::GetOutput() {
             search_view.set_candidate_evaluator(
                 evaluator,
                 static_cast<size_t>(segment_->get_row_count()),
-                static_cast<size_t>(
-                    predicate->estimated_filtered_out_count_));
+                static_cast<size_t>(program->estimated_filtered_out_count));
         } else {
-            auto op = ToKnowherePredicateOp(predicate->op_);
+            AssertInfo(program->leaves.size() == 1,
+                       "legacy predicate carrier only supports one leaf");
+            const auto& predicate = program->leaves.front();
+            auto op = ToKnowherePredicateOp(predicate.op_);
             auto value_type = ToKnowherePredicateValueType(
-                predicate->value_type_, *downpush_ctx);
+                predicate.value_type_, *downpush_ctx);
             if (!op.has_value() || !value_type.has_value()) {
                 ThrowInfo(UnexpectedError,
                           "failed to translate Cardinal downpush predicate");
@@ -797,16 +828,18 @@ PhyVectorSearchNode::GetOutput() {
             FillKnowhereDownpushValueSource(filter, *downpush_ctx);
             filter.row_count = static_cast<size_t>(segment_->get_row_count());
             filter.op = op.value();
-            FillKnowhereDownpushArgs(filter, predicate.value(), *downpush_ctx);
+            FillKnowhereDownpushArgs(filter, predicate, *downpush_ctx);
             search_view.set_extra_scalar_int64_predicate_filter(
                 filter,
-                static_cast<size_t>(
-                    predicate->estimated_filtered_out_count_));
+                static_cast<size_t>(program->estimated_filtered_out_count));
         }
+        const auto& first_predicate = program->leaves.front();
         const char* value_type_name =
-            predicate->value_type_ == CardinalDownpushPredicateValueType::Int64
+            program->leaves.size() > 1 ? "composite"
+            : first_predicate.value_type_ ==
+                    CardinalDownpushPredicateValueType::Int64
                 ? "int64"
-            : predicate->value_type_ ==
+            : first_predicate.value_type_ ==
                     CardinalDownpushPredicateValueType::Float
                 ? "float"
                 : "string";
