@@ -73,6 +73,12 @@ SetDefaultEnableParquetStatsSkipIndex(bool val);
 void
 SetEnableLatestDeleteSnapshotOptimization(bool val);
 
+void
+SetSparseFilterResultConfig(bool enabled,
+                            int64_t max_cardinality,
+                            int64_t min_segment_rows,
+                            double max_ratio);
+
 // dynamic update segcore params
 void
 SetLogLevel(const char* level);

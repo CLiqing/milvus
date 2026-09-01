@@ -23,11 +23,14 @@
 #include <vector>
 
 #include "common/EasyAssert.h"
+#include "common/Common.h"
 #include "common/Tracer.h"
 #include "common/Types.h"
 #include "exec/QueryContext.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/ExprCache.h"
+#include "exec/expression/ConjunctExpr.h"
+#include "exec/operator/AdaptiveFilterSink.h"
 #include "expr/ITypeExpr.h"
 #include "fmt/core.h"
 #include "monitor/Monitor.h"
@@ -143,14 +146,18 @@ PhyFilterBitsNode::GetOutput() {
         return nullptr;
     }
 
+    // QueryContext is query-owned today, but FilterBits may be re-entered or
+    // reused by future plan shapes.  Never let a Dense result inherit a Sparse
+    // payload produced by an earlier execution of the same context.
+    query_context_->clear_sparse_id_payload();
+
     const auto search_info = query_context_->get_search_info();
     // Retrieve plans have no vector-search params.  They still pass through
     // FilterBitsNode for ordinary scalar predicates, so treat a null params
     // value exactly as the default vector-search mode.
     const auto scan_mode = search_info.search_params_.is_object()
                                ? search_info.search_params_.value(
-                                     "bf_filter_scan_mode",
-                                     std::string{"auto"})
+                                     "bf_filter_scan_mode", std::string{"auto"})
                                : std::string{"auto"};
     if (scan_mode == "roaring_valid_per_query") {
         ThrowInfo(ConfigInvalid,
@@ -162,80 +169,104 @@ PhyFilterBitsNode::GetOutput() {
     // cache gate and the native valid-ID path below.
     const bool use_sparse_representation =
         search_info.UseSparseFilterRepresentation();
+    if (use_sparse_representation &&
+        !milvus::ENABLE_SPARSE_FILTER_RESULT.load()) {
+        ThrowInfo(ConfigInvalid,
+                  "adaptive sparse filter result is disabled; set "
+                  "queryNode.segcore.enableSparseFilterResult=true");
+    }
+    const auto configured_sparse_max_cardinality =
+        search_info.SparseResultMaxCardinality(
+        milvus::SPARSE_FILTER_RESULT_MAX_CARDINALITY.load());
+    const auto sparse_max_cardinality = ComputeSparseFilterResultCap(
+        need_process_rows_,
+        configured_sparse_max_cardinality,
+        milvus::SPARSE_FILTER_RESULT_MIN_SEGMENT_ROWS.load(),
+        milvus::SPARSE_FILTER_RESULT_MAX_RATIO.load());
+    // Phase one deliberately leaves OR on the original Dense path.  This also
+    // preserves its expression-cache behavior until Sparse union and SQL 3VL
+    // semantics are designed and tested independently.
+    const auto root_conjunct =
+        exprs_->size() == 1
+            ? std::dynamic_pointer_cast<PhyConjunctFilterExpr>(exprs_->expr(0))
+            : nullptr;
+    const bool phase_one_or =
+        root_conjunct != nullptr && !root_conjunct->IsAnd();
+    const bool selector_eligible = sparse_max_cardinality > 0;
+    const bool adaptive_output_eligible = use_sparse_representation &&
+                                          selector_eligible &&
+                                          exprs_->size() == 1 && !phase_one_or;
+    const std::string cache_signature =
+        adaptive_output_eligible ? fmt::format("{}|adaptive_sparse:{}",
+                                               expr_cache_key_,
+                                               sparse_max_cardinality)
+                                 : expr_cache_key_;
+    if (use_sparse_representation && phase_one_or) {
+        milvus::monitor::internal_core_adaptive_filter_output_or_dense
+            .Increment();
+    }
 
     // Cache read: Stage 2 of two-stage search reuses the bitset cached by Stage 1.
     // Cache lives in the process-level ExprResCacheManager keyed by
     // (segment_id, FilterBitsNode signature + dynamic filter context), so
     // cross-query reuse is automatic only when the effective predicate matches.
     auto* cache_segment = query_context_->get_segment();
-    const bool can_use_cache = !use_sparse_representation &&
-                               enable_expr_cache_ && !expr_cache_key_.empty() &&
+    // Dense and Adaptive use representation-specific cache signatures.  An
+    // Adaptive hit must return its cached Sparse list or threshold-Dense
+    // result directly; scanning a cached N-bit Dense result on every request
+    // recreates the universe cost and previously produced a 12% latency tail.
+    const bool can_use_cache = enable_expr_cache_ && !expr_cache_key_.empty() &&
                                cache_segment != nullptr &&
                                cache_segment->type() == SegmentType::Sealed &&
                                ExprResCacheManager::IsEnabled();
+    if (adaptive_output_eligible && !can_use_cache) {
+        milvus::monitor::internal_core_adaptive_filter_cache_disabled
+            .Increment();
+    }
     if (can_use_cache) {
         ExprResCacheManager::Key key{cache_segment->get_segment_id(),
-                                     expr_cache_key_};
+                                     cache_signature};
+        if (adaptive_output_eligible) {
+            ExprResCacheManager::SparseValue sparse_cached;
+            sparse_cached.active_count = need_process_rows_;
+            if (ExprResCacheManager::Instance().GetSparse(key, sparse_cached)) {
+                milvus::monitor::internal_core_adaptive_filter_cache_sparse_hit
+                    .Increment();
+                num_processed_rows_ = need_process_rows_;
+                query_context_->set_sparse_id_payload(
+                    sparse_cached.accepted_ids, need_process_rows_);
+                milvus::monitor::internal_core_adaptive_filter_output_sparse
+                    .Increment();
+                std::vector<VectorPtr> col_res;
+                col_res.push_back(std::make_shared<ColumnVector>(
+                    TargetBitmap(1, false), TargetBitmap(1, true)));
+                return std::make_shared<RowVector>(col_res);
+            }
+        }
         ExprResCacheManager::Value cached;
         cached.active_count = need_process_rows_;
         if (ExprResCacheManager::Instance().Get(key, cached) &&
             cached.result != nullptr &&
             cached.result->size() == need_process_rows_) {
+            if (adaptive_output_eligible) {
+                milvus::monitor::internal_core_adaptive_filter_cache_dense_hit
+                    .Increment();
+            }
             num_processed_rows_ = need_process_rows_;
             std::vector<VectorPtr> col_res;
+            if (adaptive_output_eligible) {
+                milvus::monitor::internal_core_adaptive_filter_output_dense
+                    .Increment();
+            }
             col_res.push_back(std::make_shared<ColumnVector>(
                 cached.result->clone(),
                 cached.valid_result ? cached.valid_result->clone()
                                     : TargetBitmap(need_process_rows_, true)));
             return std::make_shared<RowVector>(col_res);
         }
-    }
-
-    // Native accepted-ID path for Cardinal.  BitmapIndex may retain a
-    // Roaring posting internally, but the only payload crossing this boundary
-    // is a valid-ID list.  A supported AND conjunction may additionally
-    // retain that list across its second scalar predicate.  MvccNode
-    // subsequently applies timestamp/delete visibility; every unsupported
-    // expression keeps the dense path below.
-    const bool native_list_mode = use_sparse_representation;
-    const bool native_list_eligible = native_list_mode &&
-                                      exprs_->size() == 1 &&
-                                      cache_segment != nullptr &&
-                                      cache_segment->type() == SegmentType::Sealed;
-    if (native_list_eligible) {
-        // Keep the scalar-index readiness contract identical to the regular
-        // expression path below.  A native lookup must not race an
-        // asynchronously prefetched BitmapIndex on the first request.
-        exprs_->WaitPrefetch();
-        const auto native_scalar_start =
-            std::chrono::high_resolution_clock::now();
-        EvalCtx native_eval_ctx(operator_context_->get_exec_context());
-        auto native_ids = exprs_->expr(0)->TryGetNativeValidIds(native_eval_ctx);
-        if (native_ids != nullptr) {
-            const auto native_scalar_end =
-                std::chrono::high_resolution_clock::now();
-            const double native_scalar_cost =
-                std::chrono::duration<double, std::micro>(native_scalar_end -
-                                                           native_scalar_start)
-                    .count();
-            // Keep native-list producer timing in the same scalar histogram
-            // as the Dense FilterBits path so E2E collection can compare
-            // predicate-result construction without treating endpoint time
-            // as a producer proxy.
-            milvus::monitor::internal_core_search_latency_scalar.Observe(
-                native_scalar_cost / 1000);
-            query_context_->set_valid_id_payload(std::move(native_ids),
-                                                  need_process_rows_);
-            num_processed_rows_ = need_process_rows_;
-            std::vector<VectorPtr> col_res;
-            // MvccNode and VectorSearchNode recognize the native payload and
-            // never inspect this placeholder. The driver nevertheless
-            // requires every non-null RowVector to contain at least one row,
-            // so use a one-bit sentinel rather than the former pair of
-            // N-bit allocations in the no-delete fast path.
-            col_res.push_back(std::make_shared<ColumnVector>(
-                TargetBitmap(1, false), TargetBitmap(1, true)));
-            return std::make_shared<RowVector>(col_res);
+        if (adaptive_output_eligible) {
+            milvus::monitor::internal_core_adaptive_filter_cache_miss
+                .Increment();
         }
     }
 
@@ -243,12 +274,149 @@ PhyFilterBitsNode::GetOutput() {
         "PhyFilterBitsNode::Execute", tracer::GetRootSpan(), true);
     tracer::AddEvent(fmt::format("input_rows: {}", need_process_rows_));
 
+    // Use one readiness/timing boundary for native Sparse, the adaptive
+    // streaming sink, and the Dense baseline.
     exprs_->WaitPrefetch();
+    const auto scalar_start = std::chrono::high_resolution_clock::now();
+    const auto observe_scalar_cost = [&]() {
+        const auto scalar_end = std::chrono::high_resolution_clock::now();
+        const double scalar_cost =
+            std::chrono::duration<double, std::micro>(scalar_end - scalar_start)
+                .count();
+        milvus::monitor::internal_core_search_latency_scalar.Observe(
+            scalar_cost / 1000);
+    };
 
-    std::chrono::high_resolution_clock::time_point scalar_start =
-        std::chrono::high_resolution_clock::now();
+    // Centralize Adaptive cache/counter/payload ownership. Dense cache state
+    // is cloned because the returned ColumnVector takes the original bitmap.
+    const auto finalize_adaptive = [&](SparseFilterResult result) {
+        AssertInfo(result.universe == need_process_rows_,
+                   "adaptive predicate universe {} does not match filter "
+                   "universe {}",
+                   result.universe,
+                   need_process_rows_);
+        AssertInfo(result.IsSparse() != result.IsDense(),
+                   "adaptive predicate must return exactly one representation");
+
+        std::vector<VectorPtr> col_res;
+        if (result.IsSparse()) {
+            AssertInfo(result.accepted_ids->size() <=
+                           static_cast<size_t>(sparse_max_cardinality),
+                       "adaptive Sparse result {} exceeds cap {}",
+                       result.accepted_ids->size(),
+                       sparse_max_cardinality);
+            if (can_use_cache) {
+                ExprResCacheManager::Key key{cache_segment->get_segment_id(),
+                                             cache_signature};
+                ExprResCacheManager::SparseValue cached;
+                cached.accepted_ids = result.accepted_ids;
+                cached.active_count = result.universe;
+                ExprResCacheManager::Instance().PutSparse(key, cached);
+                milvus::monitor::internal_core_adaptive_filter_cache_sparse_put
+                    .Increment();
+            }
+            query_context_->set_sparse_id_payload(result.accepted_ids,
+                                                  result.universe);
+            milvus::monitor::internal_core_adaptive_filter_output_sparse
+                .Increment();
+            col_res.push_back(std::make_shared<ColumnVector>(
+                TargetBitmap(1, false), TargetBitmap(1, true)));
+        } else {
+            AssertInfo(result.filtered->size() ==
+                           static_cast<size_t>(need_process_rows_),
+                       "adaptive Dense result size {} does not match {}",
+                       result.filtered->size(),
+                       need_process_rows_);
+            if (can_use_cache) {
+                ExprResCacheManager::Key key{cache_segment->get_segment_id(),
+                                             cache_signature};
+                ExprResCacheManager::Value cached;
+                cached.result =
+                    std::make_shared<TargetBitmap>(result.filtered->clone());
+                cached.valid_result =
+                    std::make_shared<TargetBitmap>(need_process_rows_, true);
+                cached.active_count = need_process_rows_;
+                ExprResCacheManager::Instance().Put(key, cached);
+                milvus::monitor::internal_core_adaptive_filter_cache_dense_put
+                    .Increment();
+            }
+            milvus::monitor::internal_core_adaptive_filter_output_dense
+                .Increment();
+            col_res.push_back(std::make_shared<ColumnVector>(
+                std::move(*result.filtered),
+                TargetBitmap(need_process_rows_, true)));
+        }
+        num_processed_rows_ = need_process_rows_;
+        observe_scalar_cost();
+        return std::make_shared<RowVector>(col_res);
+    };
+
+    // Native accepted-ID path.  BitmapIndex may retain a
+    // Roaring posting internally, but the only payload crossing this boundary
+    // is a valid-ID list.  A supported AND conjunction may additionally
+    // retain that list across its second scalar predicate.  MvccNode
+    // subsequently applies timestamp/delete visibility; every unsupported
+    // expression keeps the dense path below.
+    const bool native_list_eligible =
+        adaptive_output_eligible && exprs_->size() == 1 &&
+        cache_segment != nullptr &&
+        cache_segment->type() == SegmentType::Sealed;
+    bool native_dense_fallback = false;
+    if (native_list_eligible) {
+        EvalCtx native_eval_ctx(operator_context_->get_exec_context());
+        auto native_expr = exprs_->expr(0);
+        const auto preflight = native_expr->PreflightSparseFilter(
+            native_eval_ctx,
+            /*has_sparse_input=*/false,
+            sparse_max_cardinality);
+        if (preflight == SparseFilterPreflight::Sparse) {
+            auto native_result = native_expr->TryApplySparseFilter(
+                native_eval_ctx, std::nullopt, sparse_max_cardinality);
+            AssertInfo(native_result.has_value(),
+                       "Sparse capability preflight succeeded but root "
+                       "predicate declined execution");
+            AssertInfo(native_result->IsDense() ||
+                           (native_result->IsSparse() &&
+                            native_result->accepted_ids->size() <=
+                                static_cast<size_t>(sparse_max_cardinality)),
+                       "native Sparse predicate violated result cap {}",
+                       sparse_max_cardinality);
+            return finalize_adaptive(std::move(*native_result));
+        }
+        native_dense_fallback = preflight == SparseFilterPreflight::Dense;
+    }
 
     EvalCtx eval_ctx(operator_context_->get_exec_context());
+
+    if (adaptive_output_eligible && !native_dense_fallback) {
+        // Feed each ordinary predicate batch directly into the final
+        // representation. Sparse success never allocates a complete
+        // FilterBits bitmap; T+1 switches once with at most O(T) backfill.
+        // Do not call SetExecuteAllAtOnce in this mode.
+        AdaptiveFilterSink sink(need_process_rows_, sparse_max_cardinality);
+        while (num_processed_rows_ < need_process_rows_) {
+            exprs_->Eval(0, 1, true, eval_ctx, results_);
+            AssertInfo(results_.size() == 1 && results_[0] != nullptr,
+                       "PhyFilterBitsNode result size should be one and not "
+                       "be nullptr");
+            auto col_vec = std::dynamic_pointer_cast<ColumnVector>(results_[0]);
+            AssertInfo(
+                col_vec != nullptr && col_vec->IsBitmap(),
+                "PhyFilterBitsNode result should be bitmap ColumnVector");
+            const auto rows = col_vec->size();
+            AssertInfo(
+                rows > 0 && num_processed_rows_ + static_cast<int64_t>(rows) <=
+                                need_process_rows_,
+                "adaptive predicate batch {} exceeds remaining rows {}",
+                rows,
+                need_process_rows_ - num_processed_rows_);
+            TargetBitmapView data(col_vec->GetRawData(), rows);
+            TargetBitmapView valid(col_vec->GetValidRawData(), rows);
+            sink.ConsumeBatch(data, valid, num_processed_rows_);
+            num_processed_rows_ += rows;
+        }
+        return finalize_adaptive(sink.Finish());
+    }
 
     TargetBitmap bitset;
     TargetBitmap valid_bitset;
@@ -280,25 +448,25 @@ PhyFilterBitsNode::GetOutput() {
 
         if (can_use_cache) {
             ExprResCacheManager::Key key{cache_segment->get_segment_id(),
-                                         expr_cache_key_};
+                                         cache_signature};
             ExprResCacheManager::Value v;
             v.result = std::make_shared<TargetBitmap>(view);
             v.valid_result = std::make_shared<TargetBitmap>(valid_view);
             v.active_count = need_process_rows_;
             ExprResCacheManager::Instance().Put(key, v);
+            if (native_dense_fallback) {
+                milvus::monitor::internal_core_adaptive_filter_cache_dense_put
+                    .Increment();
+            }
         }
 
+        if (native_dense_fallback) {
+            milvus::monitor::internal_core_adaptive_filter_output_dense
+                .Increment();
+        }
+        observe_scalar_cost();
         std::vector<VectorPtr> col_res;
         col_res.push_back(std::move(results_[0]));
-
-        std::chrono::high_resolution_clock::time_point scalar_end =
-            std::chrono::high_resolution_clock::now();
-        double scalar_cost =
-            std::chrono::duration<double, std::micro>(scalar_end - scalar_start)
-                .count();
-        milvus::monitor::internal_core_search_latency_scalar.Observe(
-            scalar_cost / 1000);
-
         return std::make_shared<RowVector>(col_res);
     }
 
@@ -344,26 +512,25 @@ PhyFilterBitsNode::GetOutput() {
     // the ColumnVector return value below.
     if (can_use_cache) {
         ExprResCacheManager::Key key{cache_segment->get_segment_id(),
-                                     expr_cache_key_};
+                                     cache_signature};
         ExprResCacheManager::Value v;
         v.result = std::make_shared<TargetBitmap>(bitset.clone());
         v.valid_result = std::make_shared<TargetBitmap>(valid_bitset.clone());
         v.active_count = need_process_rows_;
         ExprResCacheManager::Instance().Put(key, v);
+        if (native_dense_fallback) {
+            milvus::monitor::internal_core_adaptive_filter_cache_dense_put
+                .Increment();
+        }
     }
 
-    // num_processed_rows_ = need_process_rows_;
+    if (native_dense_fallback) {
+        milvus::monitor::internal_core_adaptive_filter_output_dense.Increment();
+    }
+    observe_scalar_cost();
     std::vector<VectorPtr> col_res;
     col_res.push_back(std::make_shared<ColumnVector>(std::move(bitset),
                                                      std::move(valid_bitset)));
-    std::chrono::high_resolution_clock::time_point scalar_end =
-        std::chrono::high_resolution_clock::now();
-    double scalar_cost =
-        std::chrono::duration<double, std::micro>(scalar_end - scalar_start)
-            .count();
-    milvus::monitor::internal_core_search_latency_scalar.Observe(scalar_cost /
-                                                                 1000);
-
     return std::make_shared<RowVector>(col_res);
 }
 

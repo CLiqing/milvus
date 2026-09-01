@@ -71,6 +71,38 @@ func TestSetupCoreConfigChangeCallback(t *testing.T) {
 	assert.Equal(t, "32", pt.CommonCfg.ThreadPoolMaxThreadsSize.GetValue())
 }
 
+func TestSparseFilterResultConfigChangeCallback(t *testing.T) {
+	paramtable.Init()
+	pt := paramtable.Get()
+	enabled := &pt.QueryNodeCfg.EnableSparseFilterResult
+	maxCardinality := &pt.QueryNodeCfg.SparseResultMaxCardinality
+	minSegmentRows := &pt.QueryNodeCfg.SparseResultMinSegmentRows
+	maxRatio := &pt.QueryNodeCfg.SparseResultMaxRatio
+
+	assert.NotPanics(t, func() { SetupCoreConfigChangelCallback() })
+	t.Cleanup(func() {
+		assert.NoError(t, pt.Reset(enabled.Key))
+		assert.NoError(t, pt.Reset(maxCardinality.Key))
+		assert.NoError(t, pt.Reset(minSegmentRows.Key))
+		assert.NoError(t, pt.Reset(maxRatio.Key))
+	})
+
+	// Saving either key synchronously invokes UpdateSparseFilterResultConfig,
+	// including the C setter. The setter intentionally has no getter, so keep
+	// this test at the callback boundary instead of adding a production API only
+	// for test observability.
+	assert.NotPanics(t, func() {
+		assert.NoError(t, pt.Save(enabled.Key, "true"))
+		assert.NoError(t, pt.Save(maxCardinality.Key, "4096"))
+		assert.NoError(t, pt.Save(minSegmentRows.Key, "100000"))
+		assert.NoError(t, pt.Save(maxRatio.Key, "0.004"))
+	})
+	assert.True(t, enabled.GetAsBool())
+	assert.Equal(t, int64(4096), maxCardinality.GetAsInt64())
+	assert.Equal(t, int64(100000), minSegmentRows.GetAsInt64())
+	assert.InDelta(t, 0.004, maxRatio.GetAsFloat(), 1e-12)
+}
+
 // TestRegisterArrowIOThreadPoolWatchers verifies the lifted helper registers
 // a handler under each of the two watched keys. The sentinel handler we
 // register after the helper fires whenever the dispatcher receives an event

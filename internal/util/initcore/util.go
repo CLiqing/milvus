@@ -75,6 +75,15 @@ func UpdateDefaultExprEvalBatchSize(size int) {
 	C.SetDefaultExprEvalBatchSize(C.int64_t(size))
 }
 
+func UpdateSparseFilterResultConfig() {
+	params := paramtable.Get()
+	C.SetSparseFilterResultConfig(
+		C.bool(params.QueryNodeCfg.EnableSparseFilterResult.GetAsBool()),
+		C.int64_t(params.QueryNodeCfg.SparseResultMaxCardinality.GetAsInt64()),
+		C.int64_t(params.QueryNodeCfg.SparseResultMinSegmentRows.GetAsInt64()),
+		C.double(params.QueryNodeCfg.SparseResultMaxRatio.GetAsFloat()))
+}
+
 func UpdateDefaultDeleteDumpBatchSize(size int) {
 	C.SetDefaultDeleteDumpBatchSize(C.int64_t(size))
 }

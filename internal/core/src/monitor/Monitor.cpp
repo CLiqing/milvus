@@ -197,16 +197,24 @@ std::map<std::string, std::string> randomSampleLatencyLabels{
     {"type", "random_sample_latency"}};
 std::map<std::string, std::string> optimizeExprLatencyLabels{
     {"type", "optimize_expr_latency"}};
-std::map<std::string, std::string> bValidateLatencyLabels{
-    {"type", "b_validate"}};
-std::map<std::string, std::string> bGroupLatencyLabels{
-    {"type", "b_group"}};
-std::map<std::string, std::string> bSkipLatencyLabels{
-    {"type", "b_skip"}};
-std::map<std::string, std::string> bPinLatencyLabels{
-    {"type", "b_pin"}};
-std::map<std::string, std::string> bReadLatencyLabels{
-    {"type", "b_read"}};
+std::map<std::string, std::string> adaptiveFilterOutputSparseLabels{
+    {"representation", "sparse"}};
+std::map<std::string, std::string> adaptiveFilterOutputDenseLabels{
+    {"representation", "dense_threshold"}};
+std::map<std::string, std::string> adaptiveFilterOutputOrDenseLabels{
+    {"representation", "dense_or_phase1"}};
+std::map<std::string, std::string> adaptiveFilterCacheDisabledLabels{
+    {"path", "disabled"}};
+std::map<std::string, std::string> adaptiveFilterCacheMissLabels{
+    {"path", "miss"}};
+std::map<std::string, std::string> adaptiveFilterCacheSparseHitLabels{
+    {"path", "sparse_hit"}};
+std::map<std::string, std::string> adaptiveFilterCacheDenseHitLabels{
+    {"path", "dense_hit"}};
+std::map<std::string, std::string> adaptiveFilterCacheSparsePutLabels{
+    {"path", "sparse_put"}};
+std::map<std::string, std::string> adaptiveFilterCacheDensePutLabels{
+    {"path", "dense_put"}};
 std::map<std::string, std::string> filterRatioLabels{
     {"type", "expr_filter_ratio"}};
 std::map<std::string, std::string> gisCoarseRatioLabels{
@@ -248,21 +256,39 @@ DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_get_target_entry_latency,
 DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_random_sample,
                             internal_core_search_latency,
                             randomSampleLatencyLabels)
-DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_validate,
-                            internal_core_search_latency,
-                            bValidateLatencyLabels)
-DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_group,
-                            internal_core_search_latency,
-                            bGroupLatencyLabels)
-DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_skip,
-                            internal_core_search_latency,
-                            bSkipLatencyLabels)
-DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_pin,
-                            internal_core_search_latency,
-                            bPinLatencyLabels)
-DEFINE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_read,
-                            internal_core_search_latency,
-                            bReadLatencyLabels)
+DEFINE_PROMETHEUS_COUNTER_FAMILY(
+    internal_core_adaptive_filter_output_total,
+    "[cpp]count of adaptive scalar-filter outputs by final representation")
+DEFINE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_output_sparse,
+                          internal_core_adaptive_filter_output_total,
+                          adaptiveFilterOutputSparseLabels)
+DEFINE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_output_dense,
+                          internal_core_adaptive_filter_output_total,
+                          adaptiveFilterOutputDenseLabels)
+DEFINE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_output_or_dense,
+                          internal_core_adaptive_filter_output_total,
+                          adaptiveFilterOutputOrDenseLabels)
+DEFINE_PROMETHEUS_COUNTER_FAMILY(
+    internal_core_adaptive_filter_cache_total,
+    "[cpp]count of adaptive FilterBits expression-cache paths")
+DEFINE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_cache_disabled,
+                          internal_core_adaptive_filter_cache_total,
+                          adaptiveFilterCacheDisabledLabels)
+DEFINE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_cache_miss,
+                          internal_core_adaptive_filter_cache_total,
+                          adaptiveFilterCacheMissLabels)
+DEFINE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_cache_sparse_hit,
+                          internal_core_adaptive_filter_cache_total,
+                          adaptiveFilterCacheSparseHitLabels)
+DEFINE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_cache_dense_hit,
+                          internal_core_adaptive_filter_cache_total,
+                          adaptiveFilterCacheDenseHitLabels)
+DEFINE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_cache_sparse_put,
+                          internal_core_adaptive_filter_cache_total,
+                          adaptiveFilterCacheSparsePutLabels)
+DEFINE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_cache_dense_put,
+                          internal_core_adaptive_filter_cache_total,
+                          adaptiveFilterCacheDensePutLabels)
 DEFINE_PROMETHEUS_HISTOGRAM(internal_core_optimize_expr_latency,
                             internal_core_search_latency,
                             optimizeExprLatencyLabels)

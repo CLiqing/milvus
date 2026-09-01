@@ -87,6 +87,36 @@ TEST(ExprResCacheManagerTest, PutGetBasic) {
     ExprResCacheManager::SetEnabled(false);
 }
 
+TEST(ExprResCacheManagerTest, SparseSidecarGetAndSegmentErase) {
+    auto& mgr = ExprResCacheManager::Instance();
+    ExprResCacheManager::SetEnabled(true);
+    mgr.Clear();
+
+    ExprResCacheManager::Key key{321, "expr:A|adaptive_sparse:1000"};
+    ExprResCacheManager::SparseValue value;
+    value.accepted_ids =
+        std::make_shared<const std::vector<int32_t>>(std::vector<int32_t>{
+            1, 17, 99});
+    value.active_count = 128;
+    mgr.PutSparse(key, value);
+
+    ExprResCacheManager::SparseValue got;
+    got.active_count = 128;
+    ASSERT_TRUE(mgr.GetSparse(key, got));
+    ASSERT_EQ(*got.accepted_ids, *value.accepted_ids);
+
+    ExprResCacheManager::SparseValue stale;
+    stale.active_count = 129;
+    ASSERT_FALSE(mgr.GetSparse(key, stale));
+
+    ASSERT_EQ(mgr.EraseSegment(321), 1u);
+    got.active_count = 128;
+    ASSERT_FALSE(mgr.GetSparse(key, got));
+
+    mgr.Clear();
+    ExprResCacheManager::SetEnabled(false);
+}
+
 TEST(ExprResCacheManagerTest, ClockEvictionByCapacity) {
     auto& mgr = ExprResCacheManager::Instance();
     ExprResCacheManager::SetEnabled(true);

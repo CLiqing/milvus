@@ -140,6 +140,16 @@ class ExprResCacheManager {
             0};  // eval duration in us, 0 = skip cost check
     };
 
+    // Adaptive Sparse results are deliberately kept in a bounded in-memory
+    // sidecar even when the Dense cache backend is disk based.  Their payload
+    // is capped (normally at 1,000 int32 row IDs), so serializing them through
+    // the N-bit DiskSlotFile format would both waste space and reintroduce the
+    // Dense-to-Sparse materialization that this representation avoids.
+    struct SparseValue {
+        std::shared_ptr<const std::vector<int32_t>> accepted_ids;
+        int64_t active_count{0};
+    };
+
  public:
     static ExprResCacheManager&
     Instance();
@@ -184,6 +194,12 @@ class ExprResCacheManager {
     // Insert or update cache entry. The provided value.result must be non-null.
     void
     Put(const Key& key, const Value& value);
+
+    bool
+    GetSparse(const Key& key, SparseValue& out_value);
+
+    void
+    PutSparse(const Key& key, const SparseValue& value);
 
     void
     Clear();
@@ -237,6 +253,11 @@ class ExprResCacheManager {
     FrequencyTracker frequency_tracker_;
     std::atomic<size_t> reported_memory_bytes_{0};
     std::atomic<size_t> reported_disk_bytes_{0};
+
+    mutable std::shared_mutex sparse_entries_mutex_;
+    std::unordered_map<Key, SparseValue, KeyHasher> sparse_entries_;
+    size_t sparse_entries_bytes_{0};
+    static constexpr size_t kSparseSidecarMaxBytes = 64ULL * 1024 * 1024;
 };
 
 // Helper API: erase all cache for a given segment id, returns erased entry count

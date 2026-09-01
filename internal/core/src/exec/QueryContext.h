@@ -176,11 +176,14 @@ class Context {
 
 class QueryContext : public Context {
  public:
-    // The only native pre-filter representation currently accepted by the
-    // Cardinal BF bridge. `ids` owns (or shares ownership of) immutable row
-    // IDs in the sealed segment's internal row-ID domain; `universe` makes
-    // that domain explicit at every consumer.
-    struct ValidIdPayload {
+    // Sparse filter-result contract.  This first landing carries the accepted
+    // (valid) side of a scalar predicate as immutable, unique sealed-segment
+    // row IDs.  Producer order is intentionally preserved: ordering is not a
+    // property of the canonical payload. `universe` defines the row-ID domain
+    // shared by every downstream consumer. A future excluded-ID
+    // representation must extend this contract explicitly; it must not
+    // overload these IDs.
+    struct SparseIdPayload {
         std::shared_ptr<const std::vector<int32_t>> ids;
         int64_t universe;
     };
@@ -398,20 +401,35 @@ class QueryContext : public Context {
     }
 
     void
-    set_valid_id_payload(std::shared_ptr<const std::vector<int32_t>> ids,
-                         int64_t universe) {
+    set_sparse_id_payload(std::shared_ptr<const std::vector<int32_t>> ids,
+                          int64_t universe) {
         AssertInfo(ids != nullptr,
-                   "valid-ID payload must have an owning ID list");
+                   "sparse-ID payload must have an owning ID list");
         AssertInfo(universe >= 0,
-                   "valid-ID payload universe {} must not be negative",
+                   "sparse-ID payload universe {} must not be negative",
                    universe);
-        valid_id_payload_ = std::make_shared<const ValidIdPayload>(
-            ValidIdPayload{std::move(ids), universe});
+        // Native producers establish uniqueness structurally (one row offset
+        // per accepted row), and subset consumers preserve it. Keep the hot
+        // cross-operator handoff O(V) with sequential range validation only;
+        // do not rebuild a hash set merely to re-prove that invariant.
+        for (const auto id : *ids) {
+            AssertInfo(id >= 0 && id < universe,
+                       "sparse-ID payload contains ID {} outside universe {}",
+                       id,
+                       universe);
+        }
+        sparse_id_payload_ = std::make_shared<const SparseIdPayload>(
+            SparseIdPayload{std::move(ids), universe});
     }
 
-    std::shared_ptr<const ValidIdPayload>
-    get_valid_id_payload() const {
-        return valid_id_payload_;
+    std::shared_ptr<const SparseIdPayload>
+    get_sparse_id_payload() const {
+        return sparse_id_payload_;
+    }
+
+    void
+    clear_sparse_id_payload() {
+        sparse_id_payload_.reset();
     }
 
     void
@@ -482,7 +500,7 @@ class QueryContext : public Context {
     // single List representation even if BitmapIndex uses Roaring internally.
     // MVCC may replace it with a query-owned compacted list while preserving
     // the row-ID universe.
-    std::shared_ptr<const ValidIdPayload> valid_id_payload_{nullptr};
+    std::shared_ptr<const SparseIdPayload> sparse_id_payload_{nullptr};
 
     // Expression filter cache for two-stage search
     bool enable_expr_cache_ = false;

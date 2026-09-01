@@ -252,7 +252,9 @@ const (
 
 // expr query params
 const (
-	ExprUseJSONStatsKey = "expr_use_json_stats"
+	ExprUseJSONStatsKey           = "expr_use_json_stats"
+	FilterResultRepresentationKey = "filter_result_representation"
+	SparseResultMaxCardinalityKey = "sparse_result_max_cardinality"
 )
 
 // Doc-in-doc-out

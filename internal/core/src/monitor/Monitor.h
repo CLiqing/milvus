@@ -67,14 +67,20 @@ DECLARE_PROMETHEUS_HISTOGRAM(internal_core_retrieve_get_target_entry_latency);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_get_target_entry_latency);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_random_sample);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_core_optimize_expr_latency);
-// Per-phase latency of the Sparse B consumer (FilterSortedNativeIdsByRawData),
-// in microseconds.  Used to attribute the Sparse P90 tail to a specific
-// sub-operation (validation / grouping / skip-index / chunk pin / read).
-DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_validate);
-DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_group);
-DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_skip);
-DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_pin);
-DECLARE_PROMETHEUS_HISTOGRAM(internal_core_search_latency_b_read);
+DECLARE_PROMETHEUS_COUNTER_FAMILY(internal_core_adaptive_filter_output_total);
+DECLARE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_output_sparse);
+DECLARE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_output_dense);
+DECLARE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_output_or_dense);
+// Request-level closure for the adaptive FilterBits expression-cache path.
+// The sum of disabled + miss + sparse_hit + dense_hit equals the number of
+// adaptive-eligible FilterBits executions; puts explain how misses are filled.
+DECLARE_PROMETHEUS_COUNTER_FAMILY(internal_core_adaptive_filter_cache_total);
+DECLARE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_cache_disabled);
+DECLARE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_cache_miss);
+DECLARE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_cache_sparse_hit);
+DECLARE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_cache_dense_hit);
+DECLARE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_cache_sparse_put);
+DECLARE_PROMETHEUS_COUNTER(internal_core_adaptive_filter_cache_dense_put);
 DECLARE_PROMETHEUS_HISTOGRAM(internal_core_expr_filter_ratio);
 // GIS split-fusion pruning ratios, emitted once per completed GIS group per
 // segment query when queryNode.segcore.enableGISSplitFusion is on (no split

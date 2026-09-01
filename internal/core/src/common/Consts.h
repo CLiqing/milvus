@@ -106,12 +106,6 @@ const int64_t DEFAULT_BITMAP_INDEX_BUILD_MODE_BOUND = 500;
 
 const int64_t DEFAULT_HYBRID_INDEX_BITMAP_CARDINALITY_LIMIT = 100;
 
-// Upper bound on the number of accepted IDs a Sparse valid-ID list may hold
-// before the producer abandons the Sparse representation and falls back to the
-// Dense filtered bitmap.  Kept small so the fallback overhead (the extra ctz /
-// push_back / bit-set work before the cap is hit) stays negligible.
-const size_t DEFAULT_SPARSE_LIST_CAP = 1000;
-
 const size_t MARISA_NULL_KEY_ID = -1;
 
 const std::string JSON_CAST_TYPE = "json_cast_type";

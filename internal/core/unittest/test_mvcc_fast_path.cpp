@@ -14,6 +14,7 @@
 #include <memory>
 #include <vector>
 
+#include "common/Common.h"
 #include "common/Schema.h"
 #include "exec/QueryContext.h"
 #include "exec/Task.h"
@@ -21,6 +22,7 @@
 #include "index/ScalarIndexSort.h"
 #include "pb/plan.pb.h"
 #include "plan/PlanNode.h"
+#include "segcore/ChunkedSegmentSealedImpl.h"
 #include "segcore/SegcoreConfig.h"
 #include "segcore/SegmentSealed.h"
 #include "segcore/SegmentGrowingImpl.h"
@@ -32,15 +34,44 @@ using namespace milvus;
 using namespace milvus::exec;
 using namespace milvus::segcore;
 
+namespace {
+
+// Deterministic regression seam for the delete-publication race: the segment
+// owns a real DeletedRecord and mask_with_delete() sees it, while the earlier
+// count observation reports zero.  Sparse MVCC must still apply the mask.
+class ZeroReportedDeleteCountSegment final : public ChunkedSegmentSealedImpl {
+ public:
+    explicit ZeroReportedDeleteCountSegment(SchemaPtr schema)
+        : ChunkedSegmentSealedImpl(std::move(schema),
+                                   empty_index_meta,
+                                   SegcoreConfig::default_config(),
+                                   /*segment_id=*/0) {
+    }
+
+    int64_t
+    get_deleted_count() const override {
+        return 0;
+    }
+};
+
+}  // namespace
+
 class MvccFastPathTest : public ::testing::Test {
  protected:
     void
     SetUp() override {
+        original_sparse_filter_enabled_ =
+            ENABLE_SPARSE_FILTER_RESULT.exchange(true);
         schema_ = std::make_shared<Schema>();
         vec_fid_ = schema_->AddDebugField(
             "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
         int64_fid_ = schema_->AddDebugField("counter", DataType::INT64);
         schema_->set_primary_field_id(int64_fid_);
+    }
+
+    void
+    TearDown() override {
+        ENABLE_SPARSE_FILTER_RESULT.store(original_sparse_filter_enabled_);
     }
 
     // Helper: create sealed segment with no deletes
@@ -113,17 +144,17 @@ class MvccFastPathTest : public ::testing::Test {
         return result;
     }
 
-    // Execute the real FilterBitsNode -> MvccNode topology with a pre-built
-    // scalar candidate list.  This models the native STLSORT producer: the
-    // upstream bitmap is intentionally ignored by MvccNode once the list is
-    // present, while timestamp/delete visibility must still be identical.
+    // Execute the real FilterBitsNode -> MvccNode topology with a native
+    // STLSORT range producer.  This ensures Mvcc sees the exact list emitted
+    // by FilterBits, while timestamp/delete visibility stays identical to the
+    // Dense route.
     std::shared_ptr<const std::vector<int32_t>>
     RunNativeListMvccPlan(const SegmentInternalInterface* segment,
-                          std::vector<int32_t> candidate_ids,
+                          int64_t upper_bound,
                           Timestamp collection_ttl = 0,
                           Timestamp query_timestamp = MAX_TIMESTAMP) {
         proto::plan::GenericValue value;
-        value.set_int64_val(N_ / 2);
+        value.set_int64_val(upper_bound);
         auto expr = std::make_shared<expr::UnaryRangeFilterExpr>(
             expr::ColumnInfo(int64_fid_, DataType::INT64),
             proto::plan::OpType::LessThan,
@@ -148,17 +179,13 @@ class MvccFastPathTest : public ::testing::Test {
             {"bf_filter_scan_mode", "valid_ids_per_query"},
         };
         query_context->set_search_info(search_info);
-        query_context->set_valid_id_payload(
-            std::make_shared<const std::vector<int32_t>>(std::move(candidate_ids)),
-            N_);
-
         auto task = Task::Create("task_native_list_mvcc",
                                  plan::PlanFragment(mvcc_node),
                                  0,
                                  query_context);
         while (task->Next()) {
         }
-        auto payload = query_context->get_valid_id_payload();
+        auto payload = query_context->get_sparse_id_payload();
         return payload ? payload->ids : nullptr;
     }
 
@@ -166,6 +193,7 @@ class MvccFastPathTest : public ::testing::Test {
     FieldId vec_fid_;
     FieldId int64_fid_;
     int64_t N_ = 1000;
+    bool original_sparse_filter_enabled_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -229,11 +257,65 @@ TEST_F(MvccFastPathTest, Level3_SealedWithTTL_DefaultPath) {
 // that delete visibility is applied by compacting only the candidate IDs.
 TEST_F(MvccFastPathTest, NativeValidIds_CompactsDeletedCandidates) {
     auto segment = CreateSealedSegmentWithDeletes(/*num_deletes=*/5);
-    auto survivors = RunNativeListMvccPlan(
-        segment.get(), std::vector<int32_t>{0, 2, 5, 42, 999});
+    auto survivors = RunNativeListMvccPlan(segment.get(), /*upper_bound=*/10);
 
     ASSERT_NE(survivors, nullptr);
-    EXPECT_EQ(*survivors, (std::vector<int32_t>{5, 42, 999}));
+    EXPECT_EQ(*survivors, (std::vector<int32_t>{5, 6, 7, 8, 9}));
+}
+
+TEST_F(MvccFastPathTest, LegacySparseKnobRespectsDisabledFeatureGate) {
+    auto segment = CreateSealedSegment();
+    ENABLE_SPARSE_FILTER_RESULT.store(false);
+
+    EXPECT_ANY_THROW(RunNativeListMvccPlan(segment.get(), /*upper_bound=*/10));
+}
+
+TEST_F(MvccFastPathTest, SparseDeleteMaskDoesNotTrustReportedDeleteCount) {
+    auto raw_data = DataGen(schema_, N_);
+    auto segment = std::make_shared<ZeroReportedDeleteCountSegment>(schema_);
+    LoadGeneratedDataIntoSegment(raw_data, segment.get());
+
+    constexpr int64_t kDeleted = 5;
+    std::vector<idx_t> pks;
+    for (int64_t i = 0; i < kDeleted; ++i) {
+        pks.push_back(i);
+    }
+    auto ids = std::make_unique<IdArray>();
+    ids->mutable_int_id()->mutable_data()->Add(pks.begin(), pks.end());
+    std::vector<Timestamp> timestamps(kDeleted, 10);
+    LoadDeletedRecordInfo info = {timestamps.data(), ids.get(), kDeleted};
+    segment->LoadDeletedRecord(info);
+
+    // This is the exact stale observation that previously bypassed the mask.
+    ASSERT_EQ(segment->get_deleted_count(), 0);
+    TargetBitmap expected_delete_mask(N_, false);
+    TargetBitmapView expected_delete_view(expected_delete_mask);
+    const SegmentInternalInterface* segment_interface = segment.get();
+    segment_interface->mask_with_delete(
+        expected_delete_view, N_, MAX_TIMESTAMP);
+    ASSERT_EQ(expected_delete_view.count(), kDeleted);
+
+    auto survivors = RunNativeListMvccPlan(segment.get(), /*upper_bound=*/10);
+
+    ASSERT_NE(survivors, nullptr);
+    EXPECT_EQ(*survivors, (std::vector<int32_t>{5, 6, 7, 8, 9}));
+}
+
+// The same native list must observe delete visibility at the query snapshot,
+// not merely the segment's latest delete state.  Deletes are loaded at ts=10
+// by CreateSealedSegmentWithDeletes: a snapshot at ts=5 must retain IDs 0..5,
+// while the current snapshot above removes the deleted prefix.  DataGen assigns
+// later insert timestamps to later rows, so IDs 6..9 are intentionally excluded
+// from this historical snapshot.
+TEST_F(MvccFastPathTest, NativeValidIds_HistoricalSnapshotPrecedesDelete) {
+    auto segment = CreateSealedSegmentWithDeletes(/*num_deletes=*/5);
+    auto survivors = RunNativeListMvccPlan(segment.get(),
+                                           /*upper_bound=*/10,
+                                           /*collection_ttl=*/0,
+                                           /*query_timestamp=*/5);
+
+    ASSERT_NE(survivors, nullptr);
+    EXPECT_EQ(*survivors, (std::vector<int32_t>{0, 1, 2, 3, 4, 5}));
 }
 
 // TTL uses the same invalid mask as the Dense route.  The test deliberately
@@ -241,32 +323,34 @@ TEST_F(MvccFastPathTest, NativeValidIds_CompactsDeletedCandidates) {
 // the <= collection_ttl expiration rule.
 TEST_F(MvccFastPathTest, NativeValidIds_CompactsTtlExpiredCandidates) {
     auto segment = CreateSealedSegment();
-    auto survivors = RunNativeListMvccPlan(
-        segment.get(),
-        std::vector<int32_t>{50, 100, 101, 500},
-        /*collection_ttl=*/100);
+    auto survivors = RunNativeListMvccPlan(segment.get(),
+                                           /*upper_bound=*/600,
+                                           /*collection_ttl=*/100);
 
     ASSERT_NE(survivors, nullptr);
-    EXPECT_EQ(*survivors, (std::vector<int32_t>{101, 500}));
+    ASSERT_EQ(survivors->size(), 499);
+    EXPECT_EQ(survivors->front(), 101);
+    EXPECT_EQ(survivors->back(), 599);
 }
 
 // Historical reads also use the regular timestamp invalid mask.  Rows whose
 // insert timestamp is newer than the snapshot must not reach Cardinal.
 TEST_F(MvccFastPathTest, NativeValidIds_CompactsFutureCandidatesAtSnapshot) {
     auto segment = CreateSealedSegment();
-    auto survivors = RunNativeListMvccPlan(
-        segment.get(),
-        std::vector<int32_t>{50, 100, 101, 500},
-        /*collection_ttl=*/0,
-        /*query_timestamp=*/100);
+    auto survivors = RunNativeListMvccPlan(segment.get(),
+                                           /*upper_bound=*/600,
+                                           /*collection_ttl=*/0,
+                                           /*query_timestamp=*/100);
 
     ASSERT_NE(survivors, nullptr);
-    EXPECT_EQ(*survivors, (std::vector<int32_t>{50, 100}));
+    ASSERT_EQ(survivors->size(), 101);
+    EXPECT_EQ(survivors->front(), 0);
+    EXPECT_EQ(survivors->back(), 100);
 }
 
-// STLSORT produces the native list in scalar-index order (not row-ID order).
-// Cardinal must therefore accept the producer order without an extra sort.
-TEST_F(MvccFastPathTest, NativeValidIds_StlSortRangeKeepsProducerOrder) {
+// Sparse-ID payloads preserve producer order. STLSORT is value ordered, so a
+// range posting must not pay an unrelated row-ID sort before handoff.
+TEST_F(MvccFastPathTest, NativeValidIds_StlSortRangePreservesProducerOrder) {
     const std::vector<int64_t> values{50, 5, 100, 7, 75};
     auto sort_index = index::CreateScalarIndexSort<int64_t>();
     sort_index->Build(values.size(), values.data());
@@ -279,6 +363,44 @@ TEST_F(MvccFastPathTest, NativeValidIds_StlSortRangeKeepsProducerOrder) {
 
     ASSERT_NE(ids, nullptr);
     EXPECT_EQ(*ids, (std::vector<int32_t>{3, 0, 4}));
+}
+
+TEST_F(MvccFastPathTest, SparseIdPayloadAcceptsUnorderedUniqueIds) {
+    QueryContext query_context("unordered_sparse_payload", nullptr, 5, 0);
+    auto ids = std::make_shared<const std::vector<int32_t>>(
+        std::vector<int32_t>{3, 0, 4});
+
+    EXPECT_NO_THROW(query_context.set_sparse_id_payload(ids, 5));
+    ASSERT_NE(query_context.get_sparse_id_payload(), nullptr);
+    EXPECT_EQ(*query_context.get_sparse_id_payload()->ids, *ids);
+}
+
+TEST_F(MvccFastPathTest, SparseIdPayloadRejectsOutOfRangeIds) {
+    QueryContext query_context("invalid_sparse_payload", nullptr, 5, 0);
+    auto out_of_range = std::make_shared<const std::vector<int32_t>>(
+        std::vector<int32_t>{3, 5});
+
+    EXPECT_ANY_THROW(query_context.set_sparse_id_payload(out_of_range, 5));
+}
+
+// Sparse is an output contract, not a sealed-index-only fast path.  Growing
+// segments deliberately cannot take FilterBits' native scalar-index branch;
+// this verifies its normal Dense evaluator is converted at the boundary and
+// that Mvcc can consume that Sparse result without changing visibility.
+TEST_F(MvccFastPathTest, SparseOutput_GrowingFallsBackToDenseEvaluator) {
+    auto raw_data = DataGen(schema_, N_);
+    auto segment = CreateGrowingSegment(schema_, empty_index_meta);
+    segment->PreInsert(N_);
+    segment->Insert(0,
+                    N_,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+
+    auto survivors = RunNativeListMvccPlan(segment.get(), /*upper_bound=*/10);
+
+    ASSERT_NE(survivors, nullptr);
+    EXPECT_EQ(*survivors, (std::vector<int32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
 }
 
 // ---------------------------------------------------------------------------

@@ -77,9 +77,8 @@ ExecPlanNodeVisitor::ExecuteTask(
                 // Retrieve plans do not carry vector-search parameters.  Keep
                 // the normal bitmap result path usable for them instead of
                 // asking nlohmann::json::value() to read a null JSON value.
-                const auto& search_info = query_context->get_search_info();
                 const bool native_valid_ids =
-                    search_info.UseSparseFilterRepresentation();
+                    query_context->get_sparse_id_payload() != nullptr;
                 if (first_column->IsBitmap() && !native_valid_ids) {
                     if (query_context->bitset_is_element_level()) {
                         Assert(processed_num ==
@@ -306,6 +305,21 @@ ExecPlanNodeVisitor::visit(RetrievePlanNode& node) {
                            std::shared_ptr<milvus::exec::BaseConfig>>(),
         entity_ttl_physical_time_us_);
 
+    // Retrieve has no VectorANNS.search_params.  Carry the request-scoped
+    // adaptive-filter experiment controls through PlanOption so Query can run
+    // Dense/Adaptive ABBA on one instance without mutating global config.
+    if (!node.plan_options_.filter_result_representation.empty()) {
+        SearchInfo filter_info;
+        filter_info.search_params_ = knowhere::Json::object();
+        filter_info.search_params_["filter_result_representation"] =
+            node.plan_options_.filter_result_representation;
+        if (node.plan_options_.sparse_result_max_cardinality > 0) {
+            filter_info.search_params_["sparse_result_max_cardinality"] =
+                node.plan_options_.sparse_result_max_cardinality;
+        }
+        query_context->set_search_info(std::move(filter_info));
+    }
+
     // Set op context to query context
     auto op_context = milvus::OpContext(cancel_token_);
     query_context->set_op_context(&op_context);
@@ -350,6 +364,10 @@ ExecPlanNodeVisitor::setupRetrieveResult(
                "children inside row vector must be of column vector for now");
     tmp_retrieve_result.total_data_cnt_ = first_column->size();
     if (first_column->IsBitmap()) {
+        AssertInfo(query_context->get_sparse_id_payload() == nullptr,
+                   "Sparse retrieve output currently requires a native "
+                   "consumer such as count(*); bitmap fallback would consume "
+                   "the one-row Sparse placeholder");
         BitsetTypeView view(first_column->GetRawData(), first_column->size());
         if (query_context->bitset_is_element_level()) {
             // Element-level query: bitset is element-level, need to convert to (doc_id, element_index)

@@ -59,6 +59,23 @@ namespace milvus::query {
 
 namespace {
 
+// ValidIdList is accepted-ID storage for Cardinal-aware consumers.  Generic
+// Knowhere BF consumes only the legacy dense filtered-ID convention.
+TargetBitmap
+MaterializeValidIdListForLegacyKnowhere(const BitsetView& bitset) {
+    AssertInfo(bitset.is_valid_id_list(),
+               "valid-ID-list materialization requires a ValidIdList bitset");
+    TargetBitmap dense(bitset.size(), true);
+    for (const auto id : bitset.valid_ids()) {
+        AssertInfo(id >= 0 && static_cast<size_t>(id) < dense.size(),
+                   "valid ID {} is outside sparse payload universe {}",
+                   id,
+                   dense.size());
+        dense.set(static_cast<size_t>(id), false);
+    }
+    return dense;
+}
+
 std::atomic<bool>&
 AfterChunkSnapshotHookEnabled() {
     static std::atomic<bool> enabled{false};
@@ -290,11 +307,21 @@ SearchOnGrowing(const segcore::SegmentGrowingImpl& segment,
         const auto has_offset_mapping =
             offset_mapping.IsEnabled() && !is_element_level_search;
 
+        // Raw growing chunks are searched through generic Knowhere BF.  It
+        // consumes only a dense filtered-ID bitset, unlike Cardinal's index
+        // dispatcher which can consume ValidIdList directly.
+        TargetBitmap sparse_compat_bitset;
+        BitsetView effective_bitset = bitset;
+        if (bitset.is_valid_id_list()) {
+            sparse_compat_bitset = MaterializeValidIdListForLegacyKnowhere(bitset);
+            effective_bitset = BitsetView(sparse_compat_bitset);
+        }
+
         TargetBitmap transformed_bitset;
-        BitsetView search_bitset = bitset;
-        if (has_offset_mapping && !bitset.empty()) {
+        BitsetView search_bitset = effective_bitset;
+        if (has_offset_mapping && !effective_bitset.empty()) {
             auto status =
-                offset_mapping.TransformBitset(bitset, transformed_bitset);
+                offset_mapping.TransformBitset(effective_bitset, transformed_bitset);
             if (status == OffsetMapping::BitsetTransformStatus::AllFiltered) {
                 FillEmptySearchResult(search_result, num_queries, info.topk_);
                 return;
@@ -316,9 +343,9 @@ SearchOnGrowing(const segcore::SegmentGrowingImpl& segment,
         // and min() would silently drop the tail rows from the scan. Knowhere
         // already bounds element ids by the element bitset's size.
         const int64_t logical_bound =
-            (bitset.empty() || is_element_level_search)
+            (effective_bitset.empty() || is_element_level_search)
                 ? plan_bound
-                : std::min(int64_t(bitset.size()), plan_bound);
+                : std::min(int64_t(effective_bitset.size()), plan_bound);
 
         // Nullable vector fields store only non-null rows, so the chunk walk
         // below runs in the mapping's physical row space. Convert the bound
@@ -340,7 +367,7 @@ SearchOnGrowing(const segcore::SegmentGrowingImpl& segment,
             FillEmptySearchResult(search_result, num_queries, info.topk_);
             return;
         }
-        if (has_offset_mapping && !bitset.empty() &&
+        if (has_offset_mapping && !effective_bitset.empty() &&
             !transformed_bitset.empty()) {
             search_bitset =
                 search_result.PinBitset(std::move(transformed_bitset));

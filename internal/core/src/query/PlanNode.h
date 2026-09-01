@@ -30,6 +30,8 @@ class PlanNodeVisitor;
 
 struct PlanOptions {
     bool expr_use_json_stats = true;
+    std::string filter_result_representation;
+    int64_t sparse_result_max_cardinality = 0;
 };
 
 // Base of all Nodes

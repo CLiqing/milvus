@@ -32,6 +32,55 @@ func shouldPanic(t *testing.T, name string, f func()) {
 	t.Errorf("%s should have panicked", name)
 }
 
+func TestSparseFilterResultConfig(t *testing.T) {
+	Init()
+	params := Get()
+	enabledKey := params.QueryNodeCfg.EnableSparseFilterResult.Key
+	thresholdKey := params.QueryNodeCfg.SparseResultMaxCardinality.Key
+	minRowsKey := params.QueryNodeCfg.SparseResultMinSegmentRows.Key
+	ratioKey := params.QueryNodeCfg.SparseResultMaxRatio.Key
+	params.Reset(enabledKey)
+	params.Reset(thresholdKey)
+	params.Reset(minRowsKey)
+	params.Reset(ratioKey)
+	t.Cleanup(func() {
+		params.Reset(enabledKey)
+		params.Reset(thresholdKey)
+		params.Reset(minRowsKey)
+		params.Reset(ratioKey)
+	})
+
+	assert.False(t, params.QueryNodeCfg.EnableSparseFilterResult.GetAsBool())
+	assert.Equal(t, int64(6000), params.QueryNodeCfg.SparseResultMaxCardinality.GetAsInt64())
+	assert.Equal(t, int64(50000), params.QueryNodeCfg.SparseResultMinSegmentRows.GetAsInt64())
+	assert.InDelta(t, 0.006, params.QueryNodeCfg.SparseResultMaxRatio.GetAsFloat(), 1e-12)
+
+	params.Save(enabledKey, "true")
+	params.Save(thresholdKey, "4096")
+	params.Save(minRowsKey, "100000")
+	params.Save(ratioKey, "0.004")
+	assert.True(t, params.QueryNodeCfg.EnableSparseFilterResult.GetAsBool())
+	assert.Equal(t, int64(4096), params.QueryNodeCfg.SparseResultMaxCardinality.GetAsInt64())
+	assert.Equal(t, int64(100000), params.QueryNodeCfg.SparseResultMinSegmentRows.GetAsInt64())
+	assert.InDelta(t, 0.004, params.QueryNodeCfg.SparseResultMaxRatio.GetAsFloat(), 1e-12)
+
+	// Non-positive values are normalized to the documented safe default.
+	params.Save(thresholdKey, "0")
+	params.Save(minRowsKey, "0")
+	params.Save(ratioKey, "0")
+	assert.Equal(t, int64(6000), params.QueryNodeCfg.SparseResultMaxCardinality.GetAsInt64())
+	assert.Equal(t, int64(50000), params.QueryNodeCfg.SparseResultMinSegmentRows.GetAsInt64())
+	assert.InDelta(t, 0.006, params.QueryNodeCfg.SparseResultMaxRatio.GetAsFloat(), 1e-12)
+
+	// Sparse row IDs are int32. Oversized dynamic configuration must be
+	// normalized before it reaches the C++ setter instead of failing later in
+	// the query-time AdaptiveFilterSink.
+	params.Save(thresholdKey, "2147483648")
+	params.Save(ratioKey, "1.001")
+	assert.Equal(t, int64(6000), params.QueryNodeCfg.SparseResultMaxCardinality.GetAsInt64())
+	assert.InDelta(t, 0.006, params.QueryNodeCfg.SparseResultMaxRatio.GetAsFloat(), 1e-12)
+}
+
 func TestComponentParam_DataCoordBumpSchemaVersionCompactionParams(t *testing.T) {
 	Init()
 	params := Get()

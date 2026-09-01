@@ -33,6 +33,7 @@
 #include "bitset/bitset.h"
 #include "common/Array.h"
 #include "common/Consts.h"
+#include "common/Common.h"
 #include "common/EasyAssert.h"
 #include "common/FastMem.h"
 #include "common/FieldDataInterface.h"
@@ -48,7 +49,6 @@
 #include "knowhere/binaryset.h"
 #include "log/Log.h"
 #include "nlohmann/json.hpp"
-#include "roaring/roaring.hh"
 #include "pb/common.pb.h"
 #include "pb/schema.pb.h"
 #include "storage/DiskFileManagerImpl.h"
@@ -649,87 +649,10 @@ ScalarIndexSort<T>::FindRangeBounds(const T& lower_bound_value,
 }
 
 template <typename T>
-std::shared_ptr<const roaring_bitmap_t>
-ScalarIndexSort<T>::BuildRoaringFromBounds(const IndexStructure<T>* lb,
-                                           const IndexStructure<T>* ub) const {
-    // Cardinal's brute-force consumer represents IDs as int32_t even though
-    // CRoaring supports the full uint32_t universe.
-    constexpr uint64_t kMaxCardinalRoaringUniverse =
-        static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
-    if (!is_built_ || is_nested_index_ ||
-        static_cast<uint64_t>(total_num_rows_) > kMaxCardinalRoaringUniverse) {
-        return nullptr;
-    }
-
-    // The scalar index is ordered by value, whereas posting IDs are row
-    // offsets and therefore normally random in this span.  CRoaring's bulk
-    // insertion benefits when both the high-16-bit container key and the
-    // low-16-bit values are ordered.  For normal and large hit sets, a
-    // radix sort supplies that ordering in O(V) time.  The 64K-entry histogram
-    // has a fixed cost: very small hit sets use std::sort, and small/medium
-    // sets use four 8-bit radix passes before large sets switch to two 16-bit
-    // passes.
-    auto owner = std::make_shared<roaring::Roaring>();
-    std::vector<uint32_t> ids;
-    ids.reserve(static_cast<size_t>(ub - lb));
-    for (auto it = lb; it != ub; ++it) {
-        if (it->idx_ < 0 || it->idx_ >= total_num_rows_) {
-            return nullptr;
-        }
-        ids.push_back(static_cast<uint32_t>(it->idx_));
-    }
-    constexpr size_t kSmallHitCount = 4096;
-    if (ids.size() <= kSmallHitCount) {
-        std::sort(ids.begin(), ids.end());
-    } else if (!ids.empty()) {
-        const uint32_t radix_bits = ids.size() < (1U << 16) ? 8U : 16U;
-        const uint32_t radix = 1U << radix_bits;
-        std::vector<uint32_t> scratch(ids.size());
-        std::vector<uint32_t> counts(radix);
-        for (uint32_t shift = 0; shift < 32; shift += radix_bits) {
-            std::fill(counts.begin(), counts.end(), 0);
-            for (const auto id : ids) {
-                ++counts[(id >> shift) & (radix - 1)];
-            }
-            for (uint32_t key = 1; key < radix; ++key) {
-                counts[key] += counts[key - 1];
-            }
-            for (auto it = ids.rbegin(); it != ids.rend(); ++it) {
-                scratch[--counts[(*it >> shift) & (radix - 1)]] = *it;
-            }
-            ids.swap(scratch);
-        }
-    }
-    if (!ids.empty()) {
-        owner->addMany(ids.size(), ids.data());
-    }
-    return std::shared_ptr<const roaring_bitmap_t>(owner, &owner->roaring);
-}
-
-template <typename T>
-std::shared_ptr<const roaring_bitmap_t>
-ScalarIndexSort<T>::TryGetRoaringRange(const T& value, const OpType op) const {
-    AssertInfo(is_built_, "index has not been built");
-    const auto [lb, ub] = FindRangeBounds(value, op);
-    return BuildRoaringFromBounds(lb, ub);
-}
-
-template <typename T>
-std::shared_ptr<const roaring_bitmap_t>
-ScalarIndexSort<T>::TryGetRoaringRange(const T& lower_bound_value,
-                                       bool lb_inclusive,
-                                       const T& upper_bound_value,
-                                       bool ub_inclusive) const {
-    AssertInfo(is_built_, "index has not been built");
-    const auto [lb, ub] = FindRangeBounds(
-        lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
-    return BuildRoaringFromBounds(lb, ub);
-}
-
-template <typename T>
 std::shared_ptr<const std::vector<int32_t>>
 ScalarIndexSort<T>::BuildValidIdsFromBounds(const IndexStructure<T>* lb,
-                                            const IndexStructure<T>* ub) const {
+                                            const IndexStructure<T>* ub,
+                                            size_t max_cardinality) const {
     constexpr uint64_t kMaxCardinalId =
         static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
     if (!is_built_ || is_nested_index_ ||
@@ -740,7 +663,7 @@ ScalarIndexSort<T>::BuildValidIdsFromBounds(const IndexStructure<T>* lb,
     // the sparse-list cap, give up the Sparse representation so the caller
     // keeps the Dense bitmap; building a huge valid-ID list would be worse
     // than the Dense path.
-    if (static_cast<size_t>(ub - lb) > DEFAULT_SPARSE_LIST_CAP) {
+    if (static_cast<size_t>(ub - lb) > max_cardinality) {
         return nullptr;
     }
     auto ids = std::make_shared<std::vector<int32_t>>();
@@ -751,20 +674,30 @@ ScalarIndexSort<T>::BuildValidIdsFromBounds(const IndexStructure<T>* lb,
         }
         ids->push_back(static_cast<int32_t>(it->idx_));
     }
-    // The sort index is ordered by value, so [lb, ub) yields row offsets in
-    // value order.  The sparse valid-ID consumer (FilterSortedNativeIdsByRawData)
-    // requires ascending, unique segment offsets to amortize chunk pinning and
-    // group candidates by chunk; sort the offsets into ascending order here.
-    std::sort(ids->begin(), ids->end());
+    // [lb, ub) is value ordered, so row offsets normally appear in producer
+    // order rather than row-ID order. Sparse IDs have no ordering contract;
+    // consumers that need chunk locality group the bounded list themselves.
     return ids;
 }
 
 template <typename T>
 std::shared_ptr<const std::vector<int32_t>>
 ScalarIndexSort<T>::TryGetValidIdRange(const T& value, const OpType op) const {
+    const auto configured_cap = SPARSE_FILTER_RESULT_MAX_CARDINALITY.load();
+    if (configured_cap < 0) {
+        return nullptr;
+    }
+    return TryGetValidIdRange(value, op, static_cast<size_t>(configured_cap));
+}
+
+template <typename T>
+std::shared_ptr<const std::vector<int32_t>>
+ScalarIndexSort<T>::TryGetValidIdRange(const T& value,
+                                       const OpType op,
+                                       size_t max_cardinality) const {
     AssertInfo(is_built_, "index has not been built");
     const auto [lb, ub] = FindRangeBounds(value, op);
-    return BuildValidIdsFromBounds(lb, ub);
+    return BuildValidIdsFromBounds(lb, ub, max_cardinality);
 }
 
 template <typename T>
@@ -773,10 +706,89 @@ ScalarIndexSort<T>::TryGetValidIdRange(const T& lower_bound_value,
                                        bool lb_inclusive,
                                        const T& upper_bound_value,
                                        bool ub_inclusive) const {
+    const auto configured_cap = SPARSE_FILTER_RESULT_MAX_CARDINALITY.load();
+    if (configured_cap < 0) {
+        return nullptr;
+    }
+    return TryGetValidIdRange(lower_bound_value,
+                              lb_inclusive,
+                              upper_bound_value,
+                              ub_inclusive,
+                              static_cast<size_t>(configured_cap));
+}
+
+template <typename T>
+std::shared_ptr<const std::vector<int32_t>>
+ScalarIndexSort<T>::TryGetValidIdRange(const T& lower_bound_value,
+                                       bool lb_inclusive,
+                                       const T& upper_bound_value,
+                                       bool ub_inclusive,
+                                       size_t max_cardinality) const {
     AssertInfo(is_built_, "index has not been built");
     const auto [lb, ub] = FindRangeBounds(
         lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
-    return BuildValidIdsFromBounds(lb, ub);
+    return BuildValidIdsFromBounds(lb, ub, max_cardinality);
+}
+
+template <typename T>
+bool
+ScalarIndexSort<T>::CanGetValidIdRange(const T& value,
+                                       const OpType op,
+                                       size_t max_cardinality) const {
+    return PreflightValidIdRange(value, op, max_cardinality) ==
+           NativeValidIdPreflight::Fits;
+}
+
+template <typename T>
+NativeValidIdPreflight
+ScalarIndexSort<T>::PreflightValidIdRange(const T& value,
+                                          const OpType op,
+                                          size_t max_cardinality) const {
+    constexpr uint64_t kMaxCardinalId =
+        static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+    if (!is_built_ || is_nested_index_ ||
+        static_cast<uint64_t>(total_num_rows_) > kMaxCardinalId) {
+        return NativeValidIdPreflight::Unsupported;
+    }
+    const auto [lb, ub] = FindRangeBounds(value, op);
+    return static_cast<size_t>(ub - lb) <= max_cardinality
+               ? NativeValidIdPreflight::Fits
+               : NativeValidIdPreflight::Exceeds;
+}
+
+template <typename T>
+bool
+ScalarIndexSort<T>::CanGetValidIdRange(const T& lower_bound_value,
+                                       bool lb_inclusive,
+                                       const T& upper_bound_value,
+                                       bool ub_inclusive,
+                                       size_t max_cardinality) const {
+    return PreflightValidIdRange(lower_bound_value,
+                                 lb_inclusive,
+                                 upper_bound_value,
+                                 ub_inclusive,
+                                 max_cardinality) ==
+           NativeValidIdPreflight::Fits;
+}
+
+template <typename T>
+NativeValidIdPreflight
+ScalarIndexSort<T>::PreflightValidIdRange(const T& lower_bound_value,
+                                          bool lb_inclusive,
+                                          const T& upper_bound_value,
+                                          bool ub_inclusive,
+                                          size_t max_cardinality) const {
+    constexpr uint64_t kMaxCardinalId =
+        static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+    if (!is_built_ || is_nested_index_ ||
+        static_cast<uint64_t>(total_num_rows_) > kMaxCardinalId) {
+        return NativeValidIdPreflight::Unsupported;
+    }
+    const auto [lb, ub] = FindRangeBounds(
+        lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
+    return static_cast<size_t>(ub - lb) <= max_cardinality
+               ? NativeValidIdPreflight::Fits
+               : NativeValidIdPreflight::Exceeds;
 }
 
 template <typename T>

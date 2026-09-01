@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -23,7 +24,9 @@
 #include <utility>
 #include <vector>
 
+#include "common/Common.h"
 #include "common/Types.h"
+#include "common/QueryInfo.h"
 #include "common/Vector.h"
 #include "exec/QueryContext.h"
 #include "exec/expression/ConjunctExpr.h"
@@ -81,6 +84,11 @@ class FixedSparseProducerExpr : public Expr {
         return ids_;
     }
 
+    bool
+    CanApplySparseFilter(EvalCtx&, bool has_sparse_input, int64_t) override {
+        return !has_sparse_input;
+    }
+
     std::string
     ToString() const override {
         return "FixedSparseProducerExpr";
@@ -93,6 +101,63 @@ class FixedSparseProducerExpr : public Expr {
 
  private:
     std::shared_ptr<const std::vector<int32_t>> ids_;
+};
+
+class CountingAllTrueNativeExpr : public Expr {
+ public:
+    explicit CountingAllTrueNativeExpr(int64_t universe)
+        : Expr(DataType::BOOL, {}, "CountingAllTrueNativeExpr", nullptr),
+          universe_(universe) {
+    }
+
+    void
+    Eval(EvalCtx& context, VectorPtr& result) override {
+        ++eval_count_;
+        const auto* offsets = context.get_offset_input();
+        const auto rows = offsets == nullptr ? static_cast<size_t>(universe_)
+                                             : offsets->size();
+        result = std::make_shared<ColumnVector>(TargetBitmap(rows, true),
+                                                TargetBitmap(rows, true));
+    }
+
+    bool
+    CanApplySparseFilter(EvalCtx&, bool has_sparse_input, int64_t) override {
+        return !has_sparse_input;
+    }
+
+    std::optional<SparseFilterResult>
+    TryApplySparseFilter(EvalCtx&,
+                         std::optional<SparseFilterResult> input,
+                         int64_t max_cardinality) override {
+        ++apply_count_;
+        last_cap_ = max_cardinality;
+        if (input.has_value()) {
+            return std::nullopt;
+        }
+        auto ids = std::make_shared<std::vector<int32_t>>();
+        ids->reserve(universe_);
+        for (int32_t id = 0; id < universe_; ++id) {
+            ids->push_back(id);
+        }
+        return SparseFilterResult{std::move(ids), nullptr, universe_};
+    }
+
+    std::string
+    ToString() const override {
+        return "CountingAllTrueNativeExpr";
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return std::nullopt;
+    }
+
+    int apply_count_ = 0;
+    int eval_count_ = 0;
+    int64_t last_cap_ = -1;
+
+ private:
+    int64_t universe_;
 };
 
 class OffsetMembershipExpr : public Expr {
@@ -132,6 +197,11 @@ class OffsetMembershipExpr : public Expr {
         return output;
     }
 
+    bool
+    CanApplySparseFilter(EvalCtx&, bool has_sparse_input, int64_t) override {
+        return has_sparse_input;
+    }
+
     std::string
     ToString() const override {
         return "OffsetMembershipExpr";
@@ -147,6 +217,98 @@ class OffsetMembershipExpr : public Expr {
 
  private:
     std::unordered_set<int32_t> accepted_;
+};
+
+// Test double for the representation-neutral predicate contract.  It can
+// seed either representation and can consume Sparse candidates.
+class AdaptiveMembershipExpr : public Expr {
+ public:
+    AdaptiveMembershipExpr(std::vector<int32_t> accepted,
+                           int64_t universe,
+                           bool seed_dense)
+        : Expr(DataType::BOOL, {}, "AdaptiveMembershipExpr", nullptr),
+          accepted_(accepted.begin(), accepted.end()),
+          universe_(universe),
+          seed_dense_(seed_dense) {
+    }
+
+    void
+    Eval(EvalCtx&, VectorPtr& result) override {
+        ++eval_count_;
+        TargetBitmap data(universe_, false);
+        TargetBitmap valid(universe_, true);
+        for (const auto id : accepted_) {
+            data[id] = true;
+        }
+        result =
+            std::make_shared<ColumnVector>(std::move(data), std::move(valid));
+    }
+
+    std::optional<SparseFilterResult>
+    TryApplySparseFilter(EvalCtx& context,
+                         std::optional<SparseFilterResult> input,
+                         int64_t max_cardinality) override {
+        ++apply_count_;
+        last_cap_ = max_cardinality;
+        if (input.has_value()) {
+            return Expr::TryApplySparseFilter(
+                context, std::move(input), max_cardinality);
+        }
+        if (seed_dense_) {
+            auto filtered = std::make_shared<TargetBitmap>(universe_, true);
+            for (const auto id : accepted_) {
+                (*filtered)[id] = false;
+            }
+            return SparseFilterResult{nullptr, std::move(filtered), universe_};
+        }
+        auto ids = std::make_shared<std::vector<int32_t>>();
+        ids->reserve(accepted_.size());
+        for (int64_t id = 0; id < universe_; ++id) {
+            if (accepted_.contains(static_cast<int32_t>(id))) {
+                ids->push_back(static_cast<int32_t>(id));
+            }
+        }
+        return SparseFilterResult{std::move(ids), nullptr, universe_};
+    }
+
+    bool
+    CanApplySparseFilter(EvalCtx&, bool, int64_t) override {
+        return true;
+    }
+
+    std::shared_ptr<const std::vector<int32_t>>
+    TryFilterNativeValidIds(
+        EvalCtx&,
+        const std::shared_ptr<const std::vector<int32_t>>& input) override {
+        ++filter_count_;
+        auto output = std::make_shared<std::vector<int32_t>>();
+        for (const auto id : *input) {
+            if (accepted_.contains(id)) {
+                output->push_back(id);
+            }
+        }
+        return output;
+    }
+
+    std::string
+    ToString() const override {
+        return "AdaptiveMembershipExpr";
+    }
+
+    std::optional<milvus::expr::ColumnInfo>
+    GetColumnInfo() const override {
+        return std::nullopt;
+    }
+
+    int apply_count_ = 0;
+    int eval_count_ = 0;
+    int filter_count_ = 0;
+    int64_t last_cap_ = -1;
+
+ private:
+    std::unordered_set<int32_t> accepted_;
+    int64_t universe_;
+    bool seed_dense_;
 };
 
 // Each row given as {data, valid}.
@@ -351,6 +513,87 @@ TEST(ConjunctExprTest, NullRejectingOrKeepsUnknownRowsActive) {
     EXPECT_TRUE(valid[0]);
 }
 
+TEST(ConjunctExprTest, AdaptiveSparseOutputIsAndOnlyInPhaseOne) {
+    std::vector<ExprPtr> and_inputs{FixedBool(true, true),
+                                    FixedBool(true, true)};
+    PhyConjunctFilterExpr conjunction(std::move(and_inputs), true, nullptr);
+    EXPECT_TRUE(conjunction.IsAnd());
+
+    std::vector<ExprPtr> or_inputs{FixedBool(false, true),
+                                   FixedBool(true, true)};
+    PhyConjunctFilterExpr disjunction(std::move(or_inputs), false, nullptr);
+    EXPECT_FALSE(disjunction.IsAnd());
+}
+
+TEST(ConjunctExprTest, AdaptiveRequestAndThresholdParsing) {
+    SearchInfo default_info;
+    EXPECT_FALSE(default_info.RequestsAdaptiveFilterRepresentation());
+    EXPECT_EQ(default_info.SparseResultMaxCardinality(1000), 1000);
+
+    SearchInfo adaptive_info;
+    adaptive_info.search_params_ = knowhere::Json{
+        {"filter_result_representation", "adaptive"},
+        {"sparse_result_max_cardinality", 4096},
+    };
+    EXPECT_TRUE(adaptive_info.RequestsAdaptiveFilterRepresentation());
+    EXPECT_TRUE(adaptive_info.UseSparseFilterRepresentation());
+    EXPECT_EQ(adaptive_info.SparseResultMaxCardinality(1000), 1000);
+    EXPECT_EQ(adaptive_info.SparseResultMaxCardinality(9000), 4096);
+
+    SearchInfo compatibility_info;
+    compatibility_info.search_params_ =
+        knowhere::Json{{"filter_result_representation", "sparse"}};
+    EXPECT_TRUE(compatibility_info.RequestsAdaptiveFilterRepresentation());
+
+    const auto invalid_cap =
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1;
+    SearchInfo invalid_request;
+    invalid_request.search_params_ = knowhere::Json{
+        {"filter_result_representation", "adaptive"},
+        {"sparse_result_max_cardinality", invalid_cap},
+    };
+    EXPECT_ANY_THROW(invalid_request.SparseResultMaxCardinality(1000));
+    EXPECT_ANY_THROW(default_info.SparseResultMaxCardinality(invalid_cap));
+    EXPECT_ANY_THROW(
+        SetSparseFilterResultConfig(true, invalid_cap, 50000, 0.009));
+}
+
+TEST(ConjunctExprTest, SparseSelectorUsesPerSegmentRatioAndAbsoluteCap) {
+    constexpr int64_t kAbsoluteCap = 6000;
+    constexpr int64_t kMinRows = 50000;
+    constexpr double kRatio = 0.006;
+
+    EXPECT_EQ(ComputeSparseFilterResultCap(
+                  kMinRows - 1, kAbsoluteCap, kMinRows, kRatio),
+              0);
+    EXPECT_EQ(ComputeSparseFilterResultCap(
+                  kMinRows, kAbsoluteCap, kMinRows, kRatio),
+              300);
+    EXPECT_EQ(ComputeSparseFilterResultCap(
+                  kMinRows + 1, kAbsoluteCap, kMinRows, kRatio),
+              300);
+    EXPECT_EQ(ComputeSparseFilterResultCap(
+                  100000, kAbsoluteCap, kMinRows, kRatio),
+              600);
+    EXPECT_EQ(ComputeSparseFilterResultCap(
+                  250000, kAbsoluteCap, kMinRows, kRatio),
+              1500);
+    EXPECT_EQ(ComputeSparseFilterResultCap(
+                  1000000, kAbsoluteCap, kMinRows, kRatio),
+              6000);
+    EXPECT_EQ(ComputeSparseFilterResultCap(
+                  10000000, kAbsoluteCap, kMinRows, kRatio),
+              kAbsoluteCap);
+
+    // A request-level absolute cap may make the selector more conservative,
+    // but it cannot bypass the global ratio or minimum-segment guards.
+    EXPECT_EQ(
+        ComputeSparseFilterResultCap(1000000, 4096, kMinRows, kRatio),
+        4096);
+    EXPECT_EQ(ComputeSparseFilterResultCap(49999, 4096, kMinRows, kRatio),
+              0);
+}
+
 TEST(ConjunctExprTest, OffsetInputErasesUnmaterializedReservedLikeSlot) {
     // ReorderConjunctExpr reserves index inputs_.size() for a runtime
     // PhyLikeConjunctExpr and records the LIKE positions via SetLikeIndices.
@@ -436,6 +679,78 @@ TEST(ConjunctExprTest, SparseAndPassesOnlyAcceptedOffsetsToSecondPredicate) {
     EXPECT_EQ(consumer->eval_count_, 0);
 }
 
+TEST(ConjunctExprTest, SparseAndDoesNotSearchLaterProducer) {
+    // Phase one must not evaluate children opportunistically until one happens
+    // to produce Sparse.  If the first child cannot produce the representation,
+    // the native chain declines and FilterBits uses the established Dense AND
+    // path before making the final adaptive representation decision.
+    auto first_consumer = std::make_shared<OffsetMembershipExpr>(
+        std::unordered_set<int32_t>{10, 25});
+    auto second_producer = std::make_shared<FixedSparseProducerExpr>(
+        std::vector<int32_t>{3, 10, 18, 25});
+    std::vector<ExprPtr> inputs{first_consumer, second_producer};
+    PhyConjunctFilterExpr conjunct(std::move(inputs), true, nullptr);
+
+    QueryContext query_context(
+        "sparse_conjunct_late_producer_test", nullptr, 32, 0);
+    ExecContext exec_context(&query_context);
+    EvalCtx eval_context(&exec_context);
+
+    const auto ids = conjunct.TryGetNativeValidIds(eval_context);
+    EXPECT_EQ(ids, nullptr);
+    EXPECT_EQ(first_consumer->seen_offsets_, 0);
+    EXPECT_EQ(first_consumer->eval_count_, 0);
+}
+
+TEST(ConjunctExprTest, SparseAndChainsAcceptedOffsetsAcrossPredicates) {
+    auto producer = std::make_shared<FixedSparseProducerExpr>(
+        std::vector<int32_t>{3, 10, 18, 25});
+    auto second = std::make_shared<OffsetMembershipExpr>(
+        std::unordered_set<int32_t>{3, 10, 25});
+    auto third = std::make_shared<OffsetMembershipExpr>(
+        std::unordered_set<int32_t>{10, 25});
+    std::vector<ExprPtr> inputs{producer, second, third};
+    PhyConjunctFilterExpr conjunct(std::move(inputs), true, nullptr);
+
+    QueryContext query_context("sparse_conjunct_chain_test", nullptr, 32, 0);
+    ExecContext exec_context(&query_context);
+    EvalCtx eval_context(&exec_context);
+
+    const auto ids = conjunct.TryGetNativeValidIds(eval_context);
+    ASSERT_NE(ids, nullptr);
+    EXPECT_EQ(*ids, (std::vector<int32_t>{10, 25}));
+    EXPECT_EQ(second->seen_offsets_, 4);
+    EXPECT_EQ(third->seen_offsets_, 3);
+    EXPECT_EQ(second->eval_count_, 0);
+    EXPECT_EQ(third->eval_count_, 0);
+}
+
+TEST(ConjunctExprTest, SparseApplyPreservesUniverseAcrossNestedAnd) {
+    auto producer = std::make_shared<FixedSparseProducerExpr>(
+        std::vector<int32_t>{3, 10, 18, 25});
+    auto inner_consumer = std::make_shared<OffsetMembershipExpr>(
+        std::unordered_set<int32_t>{3, 10, 25});
+    std::vector<ExprPtr> inner_inputs{producer, inner_consumer};
+    auto inner = std::make_shared<PhyConjunctFilterExpr>(
+        std::move(inner_inputs), true, nullptr);
+    auto outer_consumer = std::make_shared<OffsetMembershipExpr>(
+        std::unordered_set<int32_t>{10, 25});
+    std::vector<ExprPtr> outer_inputs{inner, outer_consumer};
+    PhyConjunctFilterExpr outer(std::move(outer_inputs), true, nullptr);
+
+    QueryContext query_context("sparse_apply_nested_test", nullptr, 32, 0);
+    ExecContext exec_context(&query_context);
+    EvalCtx eval_context(&exec_context);
+
+    const auto result =
+        outer.TryApplySparseFilter(eval_context, std::nullopt, 1000);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->universe, 32);
+    EXPECT_EQ(*result->accepted_ids, (std::vector<int32_t>{10, 25}));
+    EXPECT_EQ(inner_consumer->seen_offsets_, 4);
+    EXPECT_EQ(outer_consumer->seen_offsets_, 3);
+}
+
 TEST(ConjunctExprTest,
      SparseAndFallsBackWhenSecondPredicateHasNoSparseConsumer) {
     auto producer = std::make_shared<FixedSparseProducerExpr>(
@@ -450,6 +765,172 @@ TEST(ConjunctExprTest,
 
     EXPECT_EQ(conjunct.TryGetNativeValidIds(eval_context), nullptr);
     EXPECT_EQ(consumer->eval_count_, 0);
+}
+
+TEST(ConjunctExprTest,
+     SparsePreflightRunsUnsupportedAndChildrenOnceInEitherOrder) {
+    for (const bool native_first : {true, false}) {
+        auto native = std::make_shared<CountingAllTrueNativeExpr>(4);
+        auto unsupported = FixedRows(
+            {{true, true}, {false, true}, {true, true}, {false, true}});
+        std::vector<ExprPtr> inputs =
+            native_first ? std::vector<ExprPtr>{native, unsupported}
+                         : std::vector<ExprPtr>{unsupported, native};
+        PhyConjunctFilterExpr conjunct(std::move(inputs), true, nullptr);
+
+        QueryContext query_context("sparse_preflight_fallback", nullptr, 4, 0);
+        ExecContext exec_context(&query_context);
+        EvalCtx eval_context(&exec_context);
+
+        EXPECT_FALSE(conjunct.CanApplySparseFilter(
+            eval_context, /*has_sparse_input=*/false, /*cap=*/1000));
+        EXPECT_FALSE(
+            conjunct.TryApplySparseFilter(eval_context, std::nullopt, 1000)
+                .has_value());
+        EXPECT_EQ(native->apply_count_, 0);
+        EXPECT_EQ(native->eval_count_, 0);
+        EXPECT_EQ(unsupported->eval_count_, 0);
+
+        VectorPtr result;
+        conjunct.Eval(eval_context, result);
+        auto output = std::dynamic_pointer_cast<ColumnVector>(result);
+        ASSERT_NE(output, nullptr);
+        ASSERT_EQ(output->size(), 4);
+        TargetBitmapView data(output->GetRawData(), output->size());
+        TargetBitmapView valid(output->GetValidRawData(), output->size());
+        EXPECT_TRUE(data[0]);
+        EXPECT_FALSE(data[1]);
+        EXPECT_TRUE(data[2]);
+        EXPECT_FALSE(data[3]);
+        EXPECT_TRUE(valid.all());
+        EXPECT_EQ(native->apply_count_, 0);
+        EXPECT_EQ(native->eval_count_, 1);
+        EXPECT_EQ(unsupported->eval_count_, 1);
+    }
+}
+
+TEST(ConjunctExprTest, AdaptiveDenseIntermediateMergesNextPredicateOnce) {
+    auto first = std::make_shared<AdaptiveMembershipExpr>(
+        std::vector<int32_t>{0, 1, 2, 4}, 6, true);
+    auto second = std::make_shared<AdaptiveMembershipExpr>(
+        std::vector<int32_t>{1, 2, 3}, 6, false);
+    std::vector<ExprPtr> inputs{first, second};
+    PhyConjunctFilterExpr conjunct(std::move(inputs), true, nullptr);
+
+    QueryContext query_context("adaptive_dense_chain", nullptr, 6, 0);
+    ExecContext exec_context(&query_context);
+    EvalCtx eval_context(&exec_context);
+    auto result =
+        conjunct.TryApplySparseFilter(eval_context, std::nullopt, 1000);
+
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result->IsSparse());
+    EXPECT_EQ(result->universe, 6);
+    EXPECT_EQ(*result->accepted_ids, (std::vector<int32_t>{1, 2}));
+    EXPECT_EQ(first->apply_count_, 1);
+    EXPECT_EQ(first->eval_count_, 0);
+    EXPECT_EQ(second->apply_count_, 1);
+    EXPECT_EQ(second->eval_count_, 0);
+}
+
+TEST(ConjunctExprTest, AdaptiveAndIsCorrectInEitherPredicateOrder) {
+    const auto evaluate = [](bool reverse, bool first_is_dense) {
+        auto a = std::make_shared<AdaptiveMembershipExpr>(
+            std::vector<int32_t>{0, 1, 2, 4}, 6, first_is_dense && !reverse);
+        auto b = std::make_shared<AdaptiveMembershipExpr>(
+            std::vector<int32_t>{1, 2, 3}, 6, first_is_dense && reverse);
+        std::vector<ExprPtr> inputs =
+            reverse ? std::vector<ExprPtr>{b, a} : std::vector<ExprPtr>{a, b};
+        PhyConjunctFilterExpr conjunct(std::move(inputs), true, nullptr);
+        QueryContext query_context("adaptive_order", nullptr, 6, 0);
+        ExecContext exec_context(&query_context);
+        EvalCtx eval_context(&exec_context);
+        auto result =
+            conjunct.TryApplySparseFilter(eval_context, std::nullopt, 1000);
+        EXPECT_EQ(a->apply_count_, 1);
+        EXPECT_EQ(b->apply_count_, 1);
+        EXPECT_EQ(a->eval_count_, 0);
+        EXPECT_EQ(b->eval_count_, 0);
+        return result;
+    };
+
+    for (const bool first_is_dense : {false, true}) {
+        const auto ab = evaluate(false, first_is_dense);
+        const auto ba = evaluate(true, first_is_dense);
+        ASSERT_TRUE(ab.has_value() && ab->IsSparse());
+        ASSERT_TRUE(ba.has_value() && ba->IsSparse());
+        EXPECT_EQ(*ab->accepted_ids, (std::vector<int32_t>{1, 2}));
+        EXPECT_EQ(*ab->accepted_ids, *ba->accepted_ids);
+    }
+}
+
+TEST(ConjunctExprTest, AdaptiveAndEvaluatesEachChildOnceAtEveryTestedDepth) {
+    for (const size_t depth : {size_t{2}, size_t{4}, size_t{8}}) {
+        std::vector<std::shared_ptr<AdaptiveMembershipExpr>> predicates;
+        std::vector<ExprPtr> inputs;
+        predicates.reserve(depth);
+        inputs.reserve(depth);
+        for (size_t i = 0; i < depth; ++i) {
+            auto predicate = std::make_shared<AdaptiveMembershipExpr>(
+                std::vector<int32_t>{1, 2, 3}, 6, false);
+            predicates.push_back(predicate);
+            inputs.push_back(predicate);
+        }
+        PhyConjunctFilterExpr conjunct(std::move(inputs), true, nullptr);
+        QueryContext query_context("adaptive_depth", nullptr, 6, 0);
+        ExecContext exec_context(&query_context);
+        EvalCtx eval_context(&exec_context);
+
+        const auto result =
+            conjunct.TryApplySparseFilter(eval_context, std::nullopt, 1000);
+        ASSERT_TRUE(result.has_value() && result->IsSparse());
+        EXPECT_EQ(*result->accepted_ids, (std::vector<int32_t>{1, 2, 3}));
+        for (const auto& predicate : predicates) {
+            EXPECT_EQ(predicate->apply_count_, 1) << "depth=" << depth;
+            EXPECT_EQ(predicate->eval_count_, 0) << "depth=" << depth;
+        }
+    }
+}
+
+TEST(ConjunctExprTest, AdaptiveExecutionKeepsPreflightCapAcrossEntireChain) {
+    auto first = std::make_shared<AdaptiveMembershipExpr>(
+        std::vector<int32_t>{1, 2, 3}, 6, false);
+    auto second = std::make_shared<AdaptiveMembershipExpr>(
+        std::vector<int32_t>{2, 3}, 6, false);
+    std::vector<ExprPtr> inputs{first, second};
+    PhyConjunctFilterExpr conjunct(std::move(inputs), true, nullptr);
+    QueryContext query_context("adaptive_cap_propagation", nullptr, 6, 0);
+    ExecContext exec_context(&query_context);
+    EvalCtx eval_context(&exec_context);
+
+    constexpr int64_t kRequestCap = 37;
+    ASSERT_TRUE(conjunct.CanApplySparseFilter(
+        eval_context, /*has_sparse_input=*/false, kRequestCap));
+    const auto result = conjunct.TryApplySparseFilter(
+        eval_context, std::nullopt, kRequestCap);
+
+    ASSERT_TRUE(result.has_value() && result->IsSparse());
+    EXPECT_EQ(*result->accepted_ids, (std::vector<int32_t>{2, 3}));
+    EXPECT_EQ(first->last_cap_, kRequestCap);
+    EXPECT_EQ(second->last_cap_, kRequestCap);
+}
+
+TEST(ConjunctExprTest, AdaptiveOrAlwaysDeclinesSparseExecution) {
+    auto first = std::make_shared<AdaptiveMembershipExpr>(
+        std::vector<int32_t>{0}, 4, false);
+    auto second = std::make_shared<AdaptiveMembershipExpr>(
+        std::vector<int32_t>{1}, 4, false);
+    std::vector<ExprPtr> inputs{first, second};
+    PhyConjunctFilterExpr disjunction(std::move(inputs), false, nullptr);
+    QueryContext query_context("adaptive_or", nullptr, 4, 0);
+    ExecContext exec_context(&query_context);
+    EvalCtx eval_context(&exec_context);
+
+    EXPECT_FALSE(
+        disjunction.TryApplySparseFilter(eval_context, std::nullopt, 1000)
+            .has_value());
+    EXPECT_EQ(first->apply_count_, 0);
+    EXPECT_EQ(second->apply_count_, 0);
 }
 
 }  // namespace milvus::exec

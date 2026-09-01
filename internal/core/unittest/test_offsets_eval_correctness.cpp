@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -26,9 +27,11 @@
 #include "common/Types.h"
 #include "exec/expression/ConjunctExpr.h"
 #include "exec/expression/Expr.h"
+#include "exec/expression/UnaryExpr.h"
 #include "expr/ITypeExpr.h"
 #include "index/ScalarIndexSort.h"
 #include "knowhere/comp/index_param.h"
+#include "segcore/ChunkedSegmentSealedImpl.h"
 #include "segcore/SegmentGrowingImpl.h"
 #include "segcore/SegcoreConfig.h"
 #include "test_utils/DataGen.h"
@@ -43,10 +46,41 @@ using namespace milvus::segcore;
 
 namespace {
 
+class PrefetchCountingSealedSegment final
+    : public ChunkedSegmentSealedImpl {
+ public:
+    using ChunkedSegmentSealedImpl::ChunkedSegmentSealedImpl;
+
+    void
+    prefetch_chunks(milvus::OpContext* op_ctx,
+                    FieldId field_id,
+                    const std::vector<int64_t>& chunk_ids) const override {
+        ++prefetch_calls_;
+        last_prefetched_chunks_ = chunk_ids;
+        ChunkedSegmentSealedImpl::prefetch_chunks(
+            op_ctx, field_id, chunk_ids);
+    }
+
+    int64_t
+    prefetch_calls() const {
+        return prefetch_calls_;
+    }
+
+    const std::vector<int64_t>&
+    last_prefetched_chunks() const {
+        return last_prefetched_chunks_;
+    }
+
+ private:
+    mutable int64_t prefetch_calls_ = 0;
+    mutable std::vector<int64_t> last_prefetched_chunks_;
+};
+
 std::unique_ptr<SegmentSealed>
 CreateTwoChunkSealed(const SchemaPtr& schema,
                      const GeneratedData& first,
-                     const GeneratedData& second) {
+                     const GeneratedData& second,
+                     std::unique_ptr<SegmentSealed> segment = nullptr) {
     std::unordered_map<int64_t, std::vector<FieldDataPtr>> field_chunks;
 
     auto append_dataset = [&](const GeneratedData& dataset) {
@@ -86,7 +120,9 @@ CreateTwoChunkSealed(const SchemaPtr& schema,
         combined_load_info.field_infos.merge(field_load_info.field_infos);
     }
 
-    auto segment = CreateSealedSegment(schema, empty_index_meta);
+    if (segment == nullptr) {
+        segment = CreateSealedSegment(schema, empty_index_meta);
+    }
     const auto status = LoadFieldData(segment.get(), &combined_load_info);
     AssertInfo(status.error_code == Success,
                "Failed to load two-chunk sealed data: {}",
@@ -472,6 +508,135 @@ TEST_F(OffsetsEvalCorrectnessTest, SkipBranchDrivesCallbackPerCandidate) {
         << "skipped rows must still reach the callback as null batches";
     EXPECT_EQ(null_rows, expected_skipped);
     EXPECT_EQ(data_rows, int64_t(input.size()) - expected_skipped);
+}
+
+TEST_F(OffsetsEvalCorrectnessTest,
+       SparseRawConsumerAcceptsUnorderedSingleAndMultiChunkIds) {
+    auto query_context = std::make_shared<QueryContext>(
+        DEAFULT_QUERY_ID, sealed_.get(), N, MAX_TIMESTAMP);
+    auto seg_expr = MakeDirectSegmentExpr(
+        sealed_.get(), i64_fid_, DataType::INT64, *query_context);
+    const auto match_all = [](int64_t) { return true; };
+    const auto skip_none = [](int64_t) { return false; };
+
+    auto single_chunk = std::make_shared<const std::vector<int32_t>>(
+        std::vector<int32_t>{9, 1, 3});
+    auto single_result = seg_expr->FilterNativeIdsByRawData<int64_t>(
+        single_chunk, match_all, skip_none);
+    ASSERT_NE(single_result, nullptr);
+    EXPECT_EQ(*single_result, *single_chunk)
+        << "the single-chunk fast path must not impose row-ID order";
+
+    auto multi_chunk = std::make_shared<const std::vector<int32_t>>(
+        std::vector<int32_t>{17, 1, 25, 9, 3});
+    auto multi_result = seg_expr->FilterNativeIdsByRawData<int64_t>(
+        multi_chunk, match_all, skip_none);
+    ASSERT_NE(multi_result, nullptr);
+    EXPECT_EQ(*multi_result, *multi_chunk)
+        << "chunk grouping must preserve canonical producer order";
+
+    auto out_of_range = std::make_shared<const std::vector<int32_t>>(
+        std::vector<int32_t>{17, static_cast<int32_t>(N)});
+    EXPECT_EQ(seg_expr->FilterNativeIdsByRawData<int64_t>(
+                  out_of_range, match_all, skip_none),
+              nullptr);
+}
+
+TEST_F(OffsetsEvalCorrectnessTest,
+       RawAdaptiveProducerPrefetchesAndMatchesDenseAcrossSwitch) {
+    auto first = DataGen(schema_, N / 2, 101, 0, 1, 1);
+    auto second = DataGen(schema_, N / 2, 102, 0, 1, 1);
+    std::vector<int64_t> first_values(N / 2);
+    std::vector<int64_t> second_values(N / 2);
+    std::iota(first_values.begin(), first_values.end(), 0);
+    std::iota(second_values.begin(), second_values.end(), N / 2);
+    SetInt64FieldData(first, i64_fid_, first_values);
+    SetInt64FieldData(second, i64_fid_, second_values);
+
+    auto counting_segment = std::make_unique<PrefetchCountingSealedSegment>(
+        schema_,
+        empty_index_meta,
+        SegcoreConfig::default_config(),
+        /*segment_id=*/0);
+    auto* prefetch_probe = counting_segment.get();
+    auto segment = CreateTwoChunkSealed(
+        schema_, first, second, std::move(counting_segment));
+    ASSERT_EQ(segment->num_chunk_data(i64_fid_), 2);
+    auto skip_index = segment->GetSkipIndex();
+    ASSERT_FALSE(skip_index->CanSkipUnaryRange<int64_t>(
+        i64_fid_, 0, proto::plan::OpType::LessThan, 16));
+    ASSERT_TRUE(skip_index->CanSkipUnaryRange<int64_t>(
+        i64_fid_, 1, proto::plan::OpType::LessThan, 16));
+
+    proto::plan::GenericValue upper_bound;
+    // Chunk 0 contains 0..15 and chunk 1 contains 16..31.  `< 16` therefore
+    // accepts exactly T rows and lets SkipIndex prune the complete tail chunk.
+    upper_bound.set_int64_val(16);
+    auto logical = std::make_shared<expr::UnaryRangeFilterExpr>(
+        expr::ColumnInfo(i64_fid_, DataType::INT64),
+        proto::plan::OpType::LessThan,
+        upper_bound,
+        std::vector<proto::plan::GenericValue>{});
+
+    // Invoke the native producer directly: no ExprSet::PrefetchAsync future is
+    // scheduled, so the raw path itself must perform the same lazy prefetch as
+    // the established Dense evaluator.
+    auto query_context = std::make_shared<QueryContext>(
+        DEAFULT_QUERY_ID, segment.get(), N, MAX_TIMESTAMP);
+    ExecContext exec_context(query_context.get());
+    ExprSet expr_set({logical}, &exec_context);
+    ASSERT_EQ(expr_set.size(), 1);
+    EvalCtx eval_context(&exec_context);
+    auto physical = expr_set.expr(0);
+    constexpr int64_t kCap = 16;
+    ASSERT_TRUE(physical->CanApplySparseFilter(
+        eval_context, /*has_sparse_input=*/false, kCap));
+    auto adaptive = physical->TryApplySparseFilter(
+        eval_context, std::nullopt, kCap);
+
+    ASSERT_TRUE(adaptive.has_value());
+    ASSERT_TRUE(adaptive->IsSparse());
+    ASSERT_EQ(adaptive->universe, N);
+    EXPECT_EQ(prefetch_probe->prefetch_calls(), 1);
+    EXPECT_EQ(prefetch_probe->last_prefetched_chunks(),
+              (std::vector<int64_t>{0, 1}));
+
+    // The same truth set at cap=T-1 must switch in chunk 0, then consume the
+    // skipped chunk 1 into the final Dense bitmap without leaking the scratch
+    // mask that WriteDenseBatch flipped in the triggering batch.
+    auto threshold_dense = physical->TryApplySparseFilter(
+        eval_context, std::nullopt, kCap - 1);
+    ASSERT_TRUE(threshold_dense.has_value());
+    ASSERT_TRUE(threshold_dense->IsDense());
+    ASSERT_EQ(threshold_dense->filtered->size(), N);
+    EXPECT_EQ(prefetch_probe->prefetch_calls(), 1)
+        << "one expression instance must not prefetch its chunks twice";
+
+    auto filter_node =
+        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, logical);
+    auto dense = milvus::test::gen_filter_res(
+        filter_node.get(), segment.get(), N, MAX_TIMESTAMP);
+    ASSERT_EQ(dense->size(), N);
+
+    TargetBitmap sparse_accepted(N, false);
+    for (const auto id : *adaptive->accepted_ids) {
+        ASSERT_GE(id, 0);
+        ASSERT_LT(id, N);
+        sparse_accepted.set(static_cast<size_t>(id));
+    }
+    TargetBitmapView dense_data(dense->GetRawData(), dense->size());
+    TargetBitmapView dense_valid(dense->GetValidRawData(), dense->size());
+    for (size_t id = 0; id < N; ++id) {
+        const auto expected = dense_data[id] && dense_valid[id];
+        EXPECT_EQ(sparse_accepted[id], expected) << "Sparse row " << id;
+        EXPECT_EQ(!(*threshold_dense->filtered)[id], expected)
+            << "row " << id;
+    }
+    // The independent Dense evaluation also takes its one lazy prefetch path;
+    // both modes therefore enumerate the same two chunks exactly once.
+    EXPECT_EQ(prefetch_probe->prefetch_calls(), 2);
+    EXPECT_EQ(prefetch_probe->last_prefetched_chunks(),
+              (std::vector<int64_t>{0, 1}));
 }
 
 // The user-visible consequence: emulate the exact cursor-tracking pattern the

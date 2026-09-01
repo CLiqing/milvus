@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 
@@ -93,21 +96,68 @@ struct SearchInfo {
     }
 
     // The filter-result representation the search wants the scalar filter to
-    // produce.  `sparse` means the filter emits a query-owned valid-ID list
-    // (consumed by the Cardinal BF valid-ID path) instead of the Dense
-    // filtered bitmap.  The legacy `bf_filter_scan_mode == "valid_ids_per_query"`
-    // experiment knob implies the same representation, kept for compatibility.
+    // produce.  `sparse` means the filter emits a query-owned sparse result
+    // instead of the Dense filtered bitmap.  Search dispatch is independent:
+    // the downstream consumer decides whether to enumerate it (BF) or use a
+    // membership adapter (Graph/IVF).  The legacy
+    // `bf_filter_scan_mode == "valid_ids_per_query"` experiment knob implies
+    // the same representation, kept for compatibility.
     bool
-    UseSparseFilterRepresentation() const {
+    RequestsAdaptiveFilterRepresentation() const {
         if (!search_params_.is_object()) {
             return false;
         }
-        if (search_params_.value("filter_result_representation",
-                                 std::string{"auto"}) == "sparse") {
+        const auto representation = search_params_.value(
+            "filter_result_representation", std::string{"dense"});
+        if (representation == "sparse" || representation == "adaptive") {
             return true;
+        }
+        return false;
+    }
+
+    bool
+    UseSparseFilterRepresentation() const {
+        if (RequestsAdaptiveFilterRepresentation()) {
+            return true;
+        }
+        if (!search_params_.is_object()) {
+            return false;
         }
         return search_params_.value("bf_filter_scan_mode", std::string{"auto"}) ==
                "valid_ids_per_query";
+    }
+
+    int64_t
+    SparseResultMaxCardinality(int64_t configured_default) const {
+        AssertInfo(configured_default > 0,
+                   "configured sparse_result_max_cardinality must be positive, got {}",
+                   configured_default);
+        AssertInfo(
+            configured_default <= std::numeric_limits<int32_t>::max(),
+            "configured sparse_result_max_cardinality {} exceeds the int32 "
+            "row-ID limit {}",
+            configured_default,
+            std::numeric_limits<int32_t>::max());
+        auto value = configured_default;
+        if (search_params_.is_object() &&
+            search_params_.contains("sparse_result_max_cardinality")) {
+            const auto requested =
+                search_params_.at("sparse_result_max_cardinality")
+                    .get<int64_t>();
+            AssertInfo(requested > 0,
+                       "sparse_result_max_cardinality must be positive, got {}",
+                       requested);
+            AssertInfo(
+                requested <= std::numeric_limits<int32_t>::max(),
+                "sparse_result_max_cardinality {} exceeds the int32 row-ID "
+                "limit {}",
+                requested,
+                std::numeric_limits<int32_t>::max());
+            // A request may make the experiment more conservative, but must
+            // never enlarge the instance-wide absolute safety bound.
+            value = std::min(configured_default, requested);
+        }
+        return value;
     }
 };
 

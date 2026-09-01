@@ -3,6 +3,10 @@
 日期：2026-08-17
 目标：定位 Direct Sparse 复合过滤（A→B→Cardinal BF）相对 Dense 基线在 P90 上劣化（mean/median 显著更优、P90 却 +15%~+38%）的根本原因。
 
+> **状态更新（2026-08-21）**：第 1--7 节保留的是归因逐步收敛的实验记录，
+> 其中“1,000 个随机读取发生 TLB/EPT 重尾”的结论已被请求级操作量观测否定。
+> 当前有效根因、修复与回归结果以第 8.6--8.7 节为准。
+
 ## 1. 背景与现象
 
 已接受的 E2E 结论（见 `sparse-compound-filter-milvus-e2e-plan.md`）：
@@ -216,3 +220,326 @@ A 生产者仍无尾，scalar 的 p99 尾部（~3.9ms）依然由 B 消费者引
 - 连续 ID（`a[i]=i`）集合的早期实验存在 skip-index 使 A 跳 chunk 的混淆，未能在同一打点版本下复测；如需彻底排除"散布 vs 顺序"的对比，应在打点版本下重建连续集合重测 `b_read`。
 - Fix 2（huge page）受阻于环境（内核仅 madvise 模式 THP、jemalloc `thp:always` 无效），未落地。
 - `b_read` 慢模式仍有 ~1ms（prefetch 后），是 endpoint P90 残留尾的主要可修项；若要继续收敛，可尝试更大的 prefetch 距离、或按 chunk 预取整块列 B 数据。
+
+## 8. 2026-08-21 归因修正与下一轮验证计划
+
+### 8.1 对现有结论的修正
+
+现有打点可以确认：Sparse 的慢请求发生在第二个 predicate 的
+`FilterSortedNativeIdsByRawData` 调用期间，且 wall-clock 尾部主要落在
+`b_read` 区间；但它**尚不能证明** 1--2ms 全部来自 scattered read 的 CPU/TLB
+成本。当前 `steady_clock` 会把线程被抢占、阻塞和 page fault 等 off-CPU 时间一并
+记入所在区间，进程级 `perf stat` 的 dTLB 数据也混合了 A 全列扫描、向量搜索和
+其他线程，不能与单个慢请求建立因果关系。
+
+下列现象与“纯 O(V) 随机读取成本”不完全一致：
+
+- `b_read` 呈约 25us / 1--1.5ms 的双峰，而不是随 V 平滑增长；
+- V=100/1000/10000 时慢模式延迟基本固定；
+- 只遍历几十至一千个整数的 `b_validate` / `b_group` 也能记录数百 us 尾部；
+- 旧单核实验将整个多线程 Milvus 进程限制在一个 CPU，不能排除调度竞争。
+
+因此第 5 节“TLB/EPT miss 是最终根因”降级为**待验证假设**。目前可靠结论仅为：
+尾部发生在 Sparse B consumer 的 wall-clock 区间，pin、skip-index 和 vector search
+不是已观测到的主要尾部来源。
+
+### 8.2 固定复现场景
+
+首轮使用原始稳定复现点，不以 V=64、B 全通过的特殊 case 作为主归因样本：
+
+| 项 | 固定值 |
+|---|---|
+| 数据 | 1M x 128D synthetic，单 sealed segment，collection 稳定且无 build/compaction |
+| predicate | `a < 1000 and b < 500000`；B 输入 V=1000，最终约 500 valid |
+| 路由 | Cardinal Tiered explicit BF；由 route counter / perf 栈确认 BF |
+| 请求 | NQ=1、C1、topK=10、ef=64；固定 50 query |
+| 运行 | 30s warmup；Sparse A-only、Sparse A+B、Dense；每模式至少 5,000 请求 |
+| closure | 计时前比较 Dense/Sparse topK `(ID,distance)`；binary、index 和 segment 状态固定 |
+
+### 8.3 请求级联合观测
+
+在同一次 `b_read` 调用中记录：
+
+| 指标 | 用途 |
+|---|---|
+| `wall_us` | 保留现有 endpoint 可见延迟 |
+| `thread_cpu_us` | `CLOCK_THREAD_CPUTIME_ID`，只统计该线程实际运行时间 |
+| `wall_us - thread_cpu_us` | 近似 off-CPU / 阻塞时间 |
+| `ru_nvcsw` / `ru_nivcsw` | 主动切换 / 被抢占证据 |
+| `ru_minflt` / `ru_majflt` | minor / major page-fault 证据 |
+| V、chunk 数、近似 unique 4K pages、TID | 工作量闭环和调度 trace 关联 |
+
+慢于 300us 的调用输出一条结构化诊断记录；日志发生在被测区间之后，只用于归因 run，
+不将该 run 的 endpoint latency 当作正式性能结果。另以 histogram/counter 汇总所有请求，
+避免只观察慢样本。
+
+### 8.4 决策分流
+
+| 观测 | 判断 | 后续实验 / 优化 |
+|---|---|---|
+| wall 高、thread CPU 低，context switch 增加 | 调度/off-CPU | `perf sched timehist`/`sched_switch` 对齐 TID；检查线程池和 CPU oversubscription |
+| wall 高、thread CPU 低，page fault 增加 | 缺页 | page-fault trace；prefault / `MADV_WILLNEED` A/B |
+| wall 约等于 thread CPU，且无 fault/switch | 真 CPU/内存层级成本 | 分开采集 cycles、instructions、cache miss、dTLB miss，并按 V/unique pages 归一化 |
+| `b_read` 正常但 endpoint 仍慢 | 残差在其他阶段 | 扩展 FilterBits、MVCC、payload handoff、vector result 收尾的请求级打点 |
+
+若确认是 CPU/内存成本，再执行 V=64/100/1000/10000 与
+random/clustered/continuous 的 scale sweep，拟合：
+
+```text
+thread CPU cost = fixed cost + V * per-ID cost
+wall cost = thread CPU cost + off-CPU stall
+```
+
+### 8.5 优化候选与准入条件
+
+1. **Chunk all-match**：min/max 与 null 信息证明 predicate 对整个 chunk 全通过时，
+   直接复用输入 IDs；优先覆盖 V=64、`b < 1000000` case。
+2. **可信 Sparse 不变量**：payload 携带 ascending/unique/universe/chunk spans，移除
+   consumer 重复 validation/grouping；先以 thread CPU 数据确认实际收益上限。
+3. **Index/cache membership**：B 已有 Bitmap posting、scalar index 或 cached Dense
+   result 时，对 V IDs 做 membership，避免 raw scalar scattered read。
+4. **内存层级优化**：只有请求级数据证明 TLB/page residency 是根因后，才尝试
+   huge page、prefault、page-aware grouping 或 gather kernel。
+
+最终优化验收回到完整 Milvus E2E：30s warmup、固定 query、12-window ABBA，报告
+mean/median/P90，并保持正确性和 Dense/Sparse route closure。
+
+### 8.6 首轮联合观测结果与计划收敛
+
+按 8.2 的固定场景完成 30s 预热并连续执行 8,908 个 Sparse 请求后，新加入的
+`CLOCK_THREAD_CPUTIME_ID`、thread `rusage` 与慢调用日志得到以下结果：
+
+| 观测 | 结果 |
+|---|---:|
+| `b_read` 调用数 | 8,908 |
+| `b_read` mean wall | 148.9 us |
+| `b_validate` mean | 48.6 us |
+| `b_group` mean | 27.3 us |
+| `b_read` 快簇 | 7,826 次，`<=64us` |
+| `b_read` 慢簇 | 约 1,070 次，`512--2048us` |
+| 慢簇输入规模 | **全部为 V=500,000** |
+| 慢簇 thread state | wall 约等于 thread CPU；通常 0 context switch、0 major fault，minor fault 0--2 |
+
+这组证据否定了“同样遍历约 1,000 IDs，但约 12% 请求因调度/TLB 变慢”的当前主假设。
+慢簇实际执行了约 500 倍的逻辑工作：它符合先由 `b < 500000` 生产 500,000 IDs、
+再由 `a < 1000` 消费的反向顺序；预期快路径则是 A 先产出 1,000 IDs、B 再消费。
+因而旧实验中看似固定概率的 1ms 尾部，首先应按**复合谓词物理执行顺序分叉**调查，
+不能继续归因为 1,000 次 scattered read 的固有重尾。
+
+当前 CPU/off-CPU 双时钟的包围顺序还会给 `thread_cpu_us` 多计约 3--6us，使很小的
+`offcpu_us` 被裁成 0；下一轮会同时修正时钟顺序。该测量误差不影响上述结论，因为
+V=500,000、无 context switch/page fault 且 wall 约等于 CPU 的数量级证据已经闭合。
+
+下一轮按下列顺序执行：
+
+1. 低扰动统计全部 `b_read` 的 `V<=1000` / `V>1000` 调用数，并对两类各采样少量
+   expression-chain 日志，记录 child index、child `ToString()`、输入/输出 cardinality
+   和 expression 实例标识；不使用全请求日志污染计时。
+2. 用同一 collection、同一 filter 连续执行至少 2,000 请求，证明快簇是否严格对应
+   `A -> B, V=1000`，慢簇是否严格对应 `B -> A, V=500000`，并确认是否与不同物理
+   expression 实例、plan cache 或构建顺序相关。
+3. 检查 `PhyConjunctFilterExpr::TryApplySparseFilter` 与 Dense `input_order_` 的关系。
+   当前 Sparse 明确沿 `inputs_`，而 optimizer 只写 `input_order_`；若该差异是根因，
+   修复为一套稳定且 Sparse-safe 的完整执行顺序，并增加 `a<1000 AND b<500000`
+   单测，禁止选择 500k producer。
+4. 修复后重建并执行至少 5,000 个请求：要求 B consumer 输入恒为约 1,000、1ms
+   双峰消失、Dense/Sparse topK 一致、Cardinal BF route 不变；随后再按 12-window
+   ABBA 报告 endpoint mean/median/P90。
+
+只有第 2 步否定执行顺序分叉时，才回到 8.4 的调度/page-fault/PMU 分流；避免用
+聚合 PMU 数据解释一个已经改变了 500 倍操作量的混合样本。
+
+### 8.7 根因闭环、修复与回归结果
+
+#### 8.7.1 根因
+
+低扰动 cardinality counter 与每档前 16 条 expression-chain 采样证明，同一逻辑
+filter 在运行时存在两条物理链：
+
+```text
+快路径：a < 1000 生产 1,000 IDs
+        -> b < 500000 消费 1,000 IDs，输出约 503 IDs
+
+慢路径：b < 500000 生产 500,000 IDs
+        -> a < 1000 消费 500,000 IDs，输出约 503 IDs
+```
+
+修复前一次 7,687 次 `b_read` 的复现中，6,717 次输入 `V<=1000`，970 次输入
+`V>1000`；后者约占 12.6%，并与 512--2048us 慢簇一一对应。慢样本中
+`wall≈thread CPU≈1ms`，context switch、major fault 均为 0。由此可确认：旧 P90
+双峰来自谓词物理顺序变化造成约 500 倍的逻辑工作，而非 1,000 个 scattered IDs
+发生概率性调度、缺页或 TLB/EPT 停顿。
+
+原始联合观测日志：
+
+- `/tmp/milvus-sparse-fix-20260820/p90-order-diagnostic-workload.log`
+- `/tmp/milvus.ip-10-15-6-115.ubuntu.log.INFO.20260821-074154.3216245`
+
+#### 8.7.2 修复
+
+修复包含两个缺一不可的部分：
+
+1. raw-data range producer 与 BitmapIndex、ScalarIndexSort producer 使用相同的
+   `DEFAULT_SPARSE_LIST_CAP=1000`；发现第 1,001 个命中后立即返回 `nullptr`，禁止
+   `b < 500000` 生成 500k-ID payload。
+2. conjunction 不再只消费所选 producer 后方的 child。它先寻找任意可用 producer，
+   再将 producer 之外的**全部** conjunct 作为 consumer；因此 B 位于 producer 前方且
+   因 cap 放弃生产时，后续选择 A 也不会漏掉 B 条件。
+
+新增 `SparseAndAppliesConsumerBeforeSelectedProducer` 单测固化“consumer first、producer
+second”语义，同时与已有 chained/nested/fallback Sparse conjunction 测试共同回归。
+
+#### 8.7.3 验证配置
+
+| 项 | 固定值 |
+|---|---|
+| collection | `cardinal_sparse_param_perf_1m_20260820` |
+| 数据与 topology | 1M x 128D synthetic，单 sealed segment |
+| predicate | `a < 1000 and b < 500000`，最终约 500 valid |
+| route | legacy `valid_ids_per_query` + explicit Cardinal BF |
+| query | NQ=1、C1、topK=10、ef=64、固定 50 query |
+| warmup | 正式 ABBA 前已连续执行 5,000 个 Sparse 请求；脚本另执行 10 query/mode |
+| correctness | 计时前比较前 10 query 的 Dense/Sparse topK `(ID,distance)` |
+| 正式统计 | 12-window ABBA；每个 mode 每窗口 100 请求，共 1,200 请求/mode |
+
+修复后的 `libmilvus_core.so` 加载路径已由 `/proc/<pid>/maps` 核实；Cardinal BF metrics
+的请求数与 endpoint 请求数闭合，排除 ANN route 混入。
+
+#### 8.7.4 正确性、操作量与性能回归
+
+- `ConjunctExprTest.Sparse*`：5/5 通过。
+- Dense/Sparse 前 10 个固定 query 的 topK ID 与 distance 完全一致。
+- 连续 5,000 个 Sparse 请求后，counter 增量为：`V<=1000` 5,010 次（含 10 次
+  warmup），`V>1000` 0 次；不再出现 `V=500000` 的 `sparse_b_read_slow`。
+- 5,000 请求的 Sparse 分布为 mean 2.753ms、median 2.706ms、P90 3.021ms。
+  其中有 1 次 23.4ms endpoint 异常，但没有对应的 `b_read` 慢日志，属于本次根因之外
+  的系统/endpoint 偶发残差，不形成旧有约 12% 的双峰。
+
+正式 12-window ABBA 结果：
+
+| 指标 | Dense | Sparse | Sparse 相对 Dense |
+|---|---:|---:|---:|
+| mean | 3.831 ms | 2.716 ms | **-29.09%** |
+| median | 3.819 ms | 2.698 ms | **-29.36%** |
+| P90 | 4.011 ms | 2.907 ms | **-27.54%** |
+
+Sparse 在 12/12 个 paired windows 中更快，paired-window mean improvement 为 29.08%。
+因此本复现场景原有“mean/median 改善但 P90 劣化”的矛盾已经消失；修复后的三项延迟
+指标方向一致。
+
+原始回归产物：
+
+- `/tmp/milvus-sparse-fix-20260820/p90-order-fixed-smoke.log`
+- `/tmp/milvus-sparse-fix-20260820/p90-order-fixed-5000.log`
+- `/tmp/milvus-sparse-fix-20260820/p90-order-fixed-5000-before.metrics`
+- `/tmp/milvus-sparse-fix-20260820/p90-order-fixed-5000-after.metrics`
+- `/tmp/milvus-sparse-fix-20260820/p90-order-fixed-abba12.log`
+- `/tmp/milvus-sparse-fix-20260820/launch-p90-order-fixed-20260821.log`
+
+#### 8.7.5 当前结论与剩余边界
+
+本轮已经完成从操作量、物理调用链、正确性到 endpoint 回归的因果闭环。旧 P90 问题
+不需要继续投入 huge page、prefetch 或 TLB 调优；这些方向建立在错误的混合样本归因上。
+
+当前修复解决的是“某个宽谓词意外成为 Sparse producer”及“晚出现 producer 漏消费前置
+conjunct”两个问题。后续若扩大 cap 或增加新的 producer，必须继续满足：producer 在达到
+cap 后可早停、任意 child 顺序语义等价、实际 consumer 操作量有 counter 闭环。单次
+23.4ms endpoint 残差未与 `b_read` 相关，不应重新算入该根因；只有它形成可重复分布时，
+才按 8.4 对其他 endpoint 阶段另立实验定位。
+
+### 8.8 Adaptive Dense|Sparse 链复测与最终修正（2026-08-25）
+
+> 本节采用当前确定的产品语义：开启 Adaptive 后，每个 AND predicate 都允许接收
+> Dense/Sparse，并在本 predicate 后重新产生 Dense|Sparse。它取代 8.7 中“寻找另一个
+> Sparse producer”的临时实现，但保留 8.7 关于物理 predicate 顺序会改变工作量的证据。
+
+#### 8.8.1 Cache 假设被计数器推翻
+
+5,000 请求诊断中，Adaptive output 与 cache path 均为 5,010 次（含 10 warmup），但
+cache path 全部为 `disabled`，hit/miss/put 均为 0。因此约 12% 慢簇与 expression cache
+无关。修复前 scalar histogram 少约 13%，代码唯一对应分支为 conjunction 先得到 Dense，
+FilterBits 最后再扫描 N-bit Dense 转回 Sparse。
+
+#### 8.8.2 Dense intermediate 可以被后续 Sparse predicate 收缩
+
+AND 链现在按以下规则逐 predicate 组合，不固定 A/B 顺序，也不重复执行 predicate：
+
+1. 当前为 Dense、下一 predicate 为 Sparse：枚举下一 predicate 的 IDs，并用当前 Dense
+   filtered bit 做 membership，直接输出交集 Sparse；
+2. 当前与下一 predicate 都为 Dense：两个 filtered bitmap 做 OR，继续 Dense；
+3. 下一 predicate 不支持 Adaptive：才走既有 Dense Eval fallback。
+
+`ConjunctExprTest.*` 18/18 通过；新增断言覆盖 Dense -> Sparse 收缩、每个 child 只执行一次，
+以及 Dense/Sparse 混合链在 A -> B、B -> A 两种顺序下结果一致。生产 E2E 的前 10 个固定
+query 也闭合了 Dense/Adaptive topK ID 与 distance。修复后另重跑 visibility E2E，
+sealed multi-segment + nullable、current delete、TTL expiry、growing + nullable 均通过；
+当前 pymilvus historical timestamp API 未恢复 deleted IDs，因此该项仍由既有 MVCC 单测固化。
+
+#### 8.8.3 真正的尾部成本：超阈值后仍逐 ID 写 Dense
+
+仅修 conjunction 后，V=64 的 5,010 请求已全部记录 scalar、全部输出 Sparse，但只有
+4,368 次进入 `b_read`；其余约 12.8% 是宽谓词先产生 Dense、窄谓词后产生 Sparse 的合法
+顺序。此时 P90 仍为 5.388ms。V=1001 更暴露出实现问题：raw producer 在第 1,001 个命中
+后虽然创建 Dense，却仍枚举其余所有命中并逐 ID 清 bit；`b < N` 因而执行约 1M 次单 bit
+写入，正式 ABBA 中 Adaptive 比 Dense 慢 34.5%。
+
+修复后，producer 只枚举阈值内前缀；超阈值的当前 chunk 及后续 chunk 直接把 SIMD compare
+mask 以 32K-row 块写入 Dense（accepted mask 与 `1=filtered` Dense 用批量 XOR 转换），只把
+此前已完成 chunk 中至多 T 个 ID 回填。总过程保持单趟，不重扫 N，也不再对剩余命中做
+O(matches) 单 bit 写入。
+
+#### 8.8.4 计数闭环与 E2E 结果
+
+固定 1M x 128D、单 loaded sealed segment、L2/topK10/NQ1/C1、50 queries、每模式 10 次
+加 30 秒 warmup、12-window `Dense -> Adaptive -> Adaptive -> Dense`，每模式 1,200 timed
+requests。predicate 为 `a < V AND b < 1000000`，Cardinal 保持 auto route。
+
+| V | Route | Adaptive 最终表示 | 指标 | Dense | Adaptive | Delta |
+|---:|---|---|---|---:|---:|---:|
+| 64 | BF | Sparse | mean | 3.600ms | 2.992ms | **-16.90%** |
+|  |  |  | median | 3.560ms | 2.951ms | **-17.09%** |
+|  |  |  | P90 | 3.935ms | 3.356ms | **-14.72%** |
+|  |  |  | QPS | 275.96 | 331.73 | **+20.21%** |
+| 1001 | IVF | Dense threshold fallback | mean | 4.857ms | 4.470ms | **-7.97%** |
+|  |  |  | median | 4.829ms | 4.442ms | **-8.02%** |
+|  |  |  | P90 | 5.151ms | 4.716ms | **-8.45%** |
+|  |  |  | QPS | 204.80 | 222.47 | **+8.63%** |
+
+两个点均为 12/12 paired windows Adaptive 更快。另一次当前代码的 5,000-request V=64
+run 得到 mean/median/P90 = 3.035/2.998/3.388ms；计数为 5,010 BF、5,010 Sparse output、
+5,010 scalar、5,010 cache-disabled，说明路径闭合。`b_read` 仍为 4,366 次，证明执行顺序
+分叉仍存在，但批量 Dense fallback 后不再形成旧的 P90 双峰；因此问题不是“必须固定
+predicate 顺序”，而是宽 predicate 的 Dense fallback 实现不应退化为逐 ID 写入。
+
+原始产物位于：
+
+- `/home/ubuntu/workspace/SparseProject/artifacts/sparse-dense-intermediate-fix-20260825/`
+- `v64-bulk-5000.jsonl` 与对应 before/after metrics；
+- `v64-bulk-fallback-abba12.jsonl`；
+- `v1001-bulk-fallback-abba12.jsonl`。
+- `visibility-regression.jsonl`。
+
+### 8.9 修复后高维与并发 P90 回归（2026-08-26）
+
+使用当前 Adaptive 实现补测真实 Milvus E2E：Cohere 1M x 768D、两个 sealed segment
+（330K + 670K）、COSINE/topK10/NQ1、最终总 V=64，Dense/Adaptive 均为 Cardinal
+Tiered auto-BF。固定 50 query、每模式 10 次加 30 秒 warmup、12-window ABBA；C1/C8/C60
+每模式分别完成 1,200/9,600/72,000 requests。route counter 和 Sparse output counter
+均闭合，12/12 paired windows 在三个并发点全部为 Adaptive 更快。
+
+| Concurrency | Dense P90 | Adaptive P90 | Delta |
+|---:|---:|---:|---:|
+| 1 | 3.729 ms | 3.316 ms | **-11.07%** |
+| 8 | 9.151 ms | 7.989 ms | **-12.70%** |
+| 60 | 73.671 ms | 66.311 ms | **-9.99%** |
+
+另在 128D homogeneous multi-segment 补测 4x50K 与 8x50K，P90 分别改善 4.51% 和
+2.76%，也均为 12/12 windows 更快。由此，8.1--8.7 所记录的旧 P90 重尾在修正
+predicate 链执行和 bulk Dense fallback 后，没有在高维、高并发或 8 segment 范围内
+重新出现。现阶段不再把 P90 视为 T=1000 的独立阻塞项；若未来扩大 cap、支持 OR/Graph
+或改变 producer，再按请求级 route/representation/阶段 counter 重新做 closure，不能
+沿用旧的 `b_read/TLB` 推断。
+
+原始数据位于
+`/home/ubuntu/workspace/SparseProject/artifacts/sparse-next-stage-20260826/`；完整配置和
+mean/QPS 结果见 `sparse-filter-landing-roadmap.md` 13.7。

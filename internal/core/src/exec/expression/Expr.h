@@ -20,11 +20,13 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "common/Array.h"
 #include "common/ArrayOffsets.h"
@@ -34,6 +36,7 @@
 #include "common/Types.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/ExprCacheHelper.h"
+#include "exec/expression/FilterResult.h"
 #include "exec/expression/Utils.h"
 #include "exec/QueryContext.h"
 #include "expr/ITypeExpr.h"
@@ -49,6 +52,12 @@ namespace milvus {
 namespace exec {
 
 enum class FilterType { sequential = 0, random = 1 };
+
+enum class SparseFilterPreflight : uint8_t {
+    Unsupported = 0,
+    Sparse = 1,
+    Dense = 2,
+};
 
 // Execution path for expression evaluation.
 // Determines how the expression result bitmap is produced.
@@ -167,15 +176,84 @@ class Expr : public std::enable_shared_from_this<Expr> {
         return TryGetNativeValidIds();
     }
 
-    // Consume an ascending, unique Sparse row-ID list and return the subset
-    // accepted by this expression.  Implementations must keep the result
-    // Sparse end to end; returning nullptr asks the caller to retain the
-    // established Dense executor.
+    // Cap-aware producer hook used by the Adaptive path.  Unsupported legacy
+    // producers inherit the old behavior, but native producers that can emit
+    // a threshold-bounded list override this method so preflight and execution
+    // consume the same request-frozen cap.
+    virtual std::shared_ptr<const std::vector<int32_t>>
+    TryGetNativeValidIds(EvalCtx& context, int64_t /* max_cardinality */) {
+        return TryGetNativeValidIds(context);
+    }
+
+    // Consume a unique Sparse row-ID list in arbitrary producer order and
+    // return the subset accepted by this expression. Implementations must
+    // keep the result Sparse end to end; returning nullptr asks the caller to
+    // retain the established Dense executor.
     virtual std::shared_ptr<const std::vector<int32_t>>
     TryFilterNativeValidIds(
         EvalCtx& /* context */,
         const std::shared_ptr<const std::vector<int32_t>>& /* input */) {
         return nullptr;
+    }
+
+    // Side-effect-free routing preflight for TryApplySparseFilter.  Returning
+    // true is a contract that the corresponding TryApply call can complete
+    // without returning nullopt.  It must not evaluate the predicate, advance
+    // a cursor, or materialize an output payload.  `has_sparse_input` selects
+    // between the producer and Sparse-consumer roles; max_cardinality is the
+    // final representation cap for cheap cardinality-only capability checks.
+    virtual bool
+    CanApplySparseFilter(EvalCtx& /* context */,
+                         bool /* has_sparse_input */,
+                         int64_t /* max_cardinality */) {
+        return false;
+    }
+
+    // Tri-state companion to CanApplySparseFilter. Dense is returned only
+    // when a native producer has proved that its result exceeds the cap, so
+    // FilterBits can use the ordinary Dense evaluator without first feeding
+    // the same accepted bitmap through AdaptiveFilterSink.
+    virtual SparseFilterPreflight
+    PreflightSparseFilter(EvalCtx& context,
+                          bool has_sparse_input,
+                          int64_t max_cardinality) {
+        return CanApplySparseFilter(
+                   context, has_sparse_input, max_cardinality)
+                   ? SparseFilterPreflight::Sparse
+                   : SparseFilterPreflight::Unsupported;
+    }
+
+    // Transitional predicate-level contract.  Leaf expressions retain their
+    // existing producer/consumer implementations behind this adapter;
+    // compound expressions override it to compose children through one
+    // representation instead of calling leaf-specific hooks directly.
+    virtual std::optional<SparseFilterResult>
+    TryApplySparseFilter(EvalCtx& context,
+                         std::optional<SparseFilterResult> input,
+                         int64_t max_cardinality) {
+        if (max_cardinality < 0) {
+            return std::nullopt;
+        }
+        std::shared_ptr<const std::vector<int32_t>> ids;
+        int64_t universe = 0;
+        if (input.has_value()) {
+            if (!input->IsSparse()) {
+                return std::nullopt;
+            }
+            ids = TryFilterNativeValidIds(context, input->accepted_ids);
+            universe = input->universe;
+        } else {
+            ids = TryGetNativeValidIds(context, max_cardinality);
+            auto* exec_context = context.get_exec_context();
+            universe =
+                exec_context == nullptr
+                    ? 0
+                    : exec_context->get_query_context()->get_active_count();
+        }
+        if (ids == nullptr) {
+            return std::nullopt;
+        }
+        return SparseFilterResult{std::move(ids), nullptr, universe};
     }
 
     // Only move cursor to next batch
@@ -493,15 +571,28 @@ class SegmentExpr : public Expr {
         ApplyValidMask(valid_data, res, valid_res, size);
     }
 
+    // Side-effect-free capability predicate paired with
+    // FilterNativeIdsByRawData().  Sparse consumers bypass the expression's
+    // selected producer path and read scalar field data directly, so every
+    // prerequisite of that direct read must be checked before a compound
+    // expression commits to native execution.
+    bool
+    CanFilterNativeIdsByRawData() const {
+        constexpr auto kMaxSparseId =
+            static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+        return segment_ != nullptr && segment_->type() == SegmentType::Sealed &&
+               segment_->HasFieldData(field_id_) && active_count_ >= 0 &&
+               active_count_ <= kMaxSparseId &&
+               segment_->GetSkipIndex() != nullptr;
+    }
+
     template <typename T, typename Match, typename CanSkip>
     std::shared_ptr<const std::vector<int32_t>>
-    FilterSortedNativeIdsByRawData(
+    FilterNativeIdsByRawData(
         const std::shared_ptr<const std::vector<int32_t>>& input,
         Match&& match,
         CanSkip&& can_skip) {
-        if (input == nullptr || segment_ == nullptr ||
-            segment_->type() != SegmentType::Sealed ||
-            !segment_->HasFieldData(field_id_)) {
+        if (input == nullptr || !CanFilterNativeIdsByRawData()) {
             return nullptr;
         }
 
@@ -511,84 +602,138 @@ class SegmentExpr : public Expr {
             return output;
         }
 
-        // Per-phase timing to attribute the Sparse B-consumer P90 tail.
-        // Observed in microseconds; the bucket boundaries of the shared
-        // internal_core_search_latency family (1,2,4,...,65536) give ~us
-        // resolution up to ~65ms.
-        using clock = std::chrono::steady_clock;
-        const auto elapsed_us = [](clock::time_point from,
-                                   clock::time_point to) {
-            return std::chrono::duration<double, std::micro>(to - from).count();
+        // Storage-v2 columns already provide a batched offset reader.  It
+        // captures the published segment state once, resolves all row IDs to
+        // chunks in one pass, and pins every touched chunk once.  Use it when
+        // the skip index cannot discard an entire chunk; the per-chunk path
+        // below remains useful when chunk pruning can avoid raw reads.
+        const int64_t available_chunk_count =
+            std::max<int64_t>(1, segment_->num_chunk_data(field_id_));
+        bool has_skippable_chunk = false;
+        for (int64_t chunk_id = 0; chunk_id < available_chunk_count;
+             ++chunk_id) {
+            if (can_skip(chunk_id)) {
+                has_skippable_chunk = true;
+                break;
+            }
+        }
+        if (segment_->is_chunked() && !has_skippable_chunk) {
+            std::vector<int64_t> offsets;
+            offsets.reserve(input->size());
+            for (const auto id : *input) {
+                if (id < 0 || id >= active_count_) {
+                    return nullptr;
+                }
+                offsets.push_back(id);
+            }
+
+            std::vector<T> values(input->size());
+            TargetBitmap valid(input->size(), true);
+            segment_->bulk_subscript(op_ctx_,
+                                     field_id_,
+                                     field_type_,
+                                     offsets.data(),
+                                     static_cast<int64_t>(offsets.size()),
+                                     values.data(),
+                                     valid);
+            for (size_t i = 0; i < input->size(); ++i) {
+                if (valid[i] && match(values[i])) {
+                    output->push_back((*input)[i]);
+                }
+            }
+            return output;
+        }
+
+        // Uniqueness is a producer invariant and every predicate only emits a
+        // subset. Validate the row range while resolving chunk locations so a
+        // malformed internal payload cannot become an out-of-bounds read;
+        // this adds no separate O(V) validation pass.
+
+        struct ResolvedCandidate {
+            int32_t row_id;
+            int64_t local_offset;
+            int64_t chunk_id;
+            size_t input_position;
         };
 
-        const auto t_validate_begin = clock::now();
-        int32_t previous = -1;
-        for (const auto id : *input) {
-            if (id < 0 || id >= active_count_ || id <= previous) {
+        std::vector<ResolvedCandidate> resolved;
+        resolved.reserve(input->size());
+        const bool known_single_chunk =
+            !segment_->is_chunked() || available_chunk_count == 1;
+        int64_t first_chunk_id = -1;
+        bool all_in_one_chunk = true;
+        for (size_t input_position = 0; input_position < input->size();
+            ++input_position) {
+            const auto id = (*input)[input_position];
+            if (id < 0 || id >= active_count_) {
                 return nullptr;
             }
-            previous = id;
-        }
-        const auto t_validate_end = clock::now();
-        milvus::monitor::internal_core_search_latency_b_validate.Observe(
-            elapsed_us(t_validate_begin, t_validate_end));
-
-        double group_us = 0;
-        double skip_us = 0;
-        double pin_us = 0;
-        double read_us = 0;
-
-        size_t begin = 0;
-        while (begin < input->size()) {
-            const auto t_group_begin = clock::now();
-            const int64_t first_id = (*input)[begin];
             int64_t chunk_id = 0;
-            int64_t chunk_begin = 0;
-            int64_t chunk_end = active_count_;
-            if (segment_->is_chunked()) {
-                const auto [located_chunk, offset_in_chunk] =
-                    segment_->get_chunk_by_offset(field_id_, first_id);
-                chunk_id = located_chunk;
-                chunk_begin = first_id - offset_in_chunk;
-                chunk_end = std::min<int64_t>(
-                    active_count_,
-                    chunk_begin + segment_->chunk_size(field_id_, chunk_id));
+            int64_t local_offset = id;
+            if (!known_single_chunk) {
+                const auto located =
+                    segment_->get_chunk_by_offset(field_id_, id);
+                chunk_id = located.first;
+                local_offset = located.second;
             }
-
-            size_t end = begin + 1;
-            while (end < input->size() && (*input)[end] < chunk_end) {
-                ++end;
+            if (first_chunk_id < 0) {
+                first_chunk_id = chunk_id;
+            } else if (chunk_id != first_chunk_id) {
+                all_in_one_chunk = false;
             }
-            const auto t_group_end = clock::now();
-            group_us += elapsed_us(t_group_begin, t_group_end);
+            resolved.push_back(
+                ResolvedCandidate{id, local_offset, chunk_id, input_position});
+        }
 
-            const auto t_skip_begin = clock::now();
-            const bool skip = can_skip(chunk_id);
-            const auto t_skip_end = clock::now();
-            skip_us += elapsed_us(t_skip_begin, t_skip_end);
+        std::vector<size_t> group_offsets;
+        std::vector<ResolvedCandidate> grouped;
+        if (!all_in_one_chunk) {
+            std::vector<size_t> counts(
+                static_cast<size_t>(available_chunk_count), 0);
+            for (const auto& candidate : resolved) {
+                if (candidate.chunk_id < 0 ||
+                    candidate.chunk_id >= available_chunk_count) {
+                    return nullptr;
+                }
+                ++counts[static_cast<size_t>(candidate.chunk_id)];
+            }
+            group_offsets.resize(counts.size() + 1, 0);
+            for (size_t chunk_id = 0; chunk_id < counts.size(); ++chunk_id) {
+                group_offsets[chunk_id + 1] =
+                    group_offsets[chunk_id] + counts[chunk_id];
+            }
+            auto scatter_positions = group_offsets;
+            scatter_positions.pop_back();
+            grouped.resize(resolved.size());
+            for (const auto& candidate : resolved) {
+                grouped[scatter_positions[static_cast<size_t>(
+                    candidate.chunk_id)]++] = candidate;
+            }
+        }
 
-            if (!skip) {
-                const auto t_pin_begin = clock::now();
+        auto process_chunk =
+            [&](int64_t chunk_id,
+                const std::vector<ResolvedCandidate>& candidates,
+                size_t begin,
+                size_t end,
+                std::vector<uint8_t>* accepted) {
+                if (can_skip(chunk_id)) {
+                    return;
+                }
+
                 auto pinned =
                     segment_->chunk_data<T>(op_ctx_, field_id_, chunk_id);
-                const auto t_pin_end = clock::now();
-                pin_us += elapsed_us(t_pin_begin, t_pin_end);
 
                 const auto chunk = pinned.get();
                 const T* data = chunk.data();
                 const bool* valid = chunk.valid_data();
 
-                const auto t_read_begin = clock::now();
-                // Software prefetch for the scattered scalar reads.  The
-                // candidate offsets within a chunk are ascending but sparse,
-                // so the data[local_offset] and valid[local_offset] loads are
-                // latency-bound DRAM/TLB misses.  Issue a non-blocking prefetch
-                // for the candidate kPrefetchAhead positions ahead to overlap
-                // those latencies.
+                // Candidate order is arbitrary. Prefetch the next scattered
+                // scalar reads within this pinned chunk to overlap DRAM/TLB
+                // latency without imposing a sort on the canonical payload.
                 constexpr size_t kPrefetchAhead = 16;
                 auto prefetch_for = [&](size_t idx) {
-                    const auto off = static_cast<int64_t>((*input)[idx]) -
-                                     chunk_begin;
+                    const auto off = candidates[idx].local_offset;
                     __builtin_prefetch(data + off, 0, 1);
                     if (valid != nullptr) {
                         __builtin_prefetch(valid + off, 0, 1);
@@ -603,23 +748,37 @@ class SegmentExpr : public Expr {
                     if (pf < end) {
                         prefetch_for(pf);
                     }
-                    const auto local_offset =
-                        static_cast<int64_t>((*input)[i]) - chunk_begin;
+                    const auto local_offset = candidates[i].local_offset;
                     if ((valid == nullptr || valid[local_offset]) &&
                         match(data[local_offset])) {
-                        output->push_back((*input)[i]);
+                        if (accepted == nullptr) {
+                            output->push_back(candidates[i].row_id);
+                        } else {
+                            (*accepted)[candidates[i].input_position] = 1;
+                        }
                     }
                 }
-                const auto t_read_end = clock::now();
-                read_us += elapsed_us(t_read_begin, t_read_end);
-            }
-            begin = end;
-        }
+            };
 
-        milvus::monitor::internal_core_search_latency_b_group.Observe(group_us);
-        milvus::monitor::internal_core_search_latency_b_skip.Observe(skip_us);
-        milvus::monitor::internal_core_search_latency_b_pin.Observe(pin_us);
-        milvus::monitor::internal_core_search_latency_b_read.Observe(read_us);
+        if (all_in_one_chunk) {
+            process_chunk(
+                first_chunk_id, resolved, 0, resolved.size(), nullptr);
+        } else {
+            std::vector<uint8_t> accepted(input->size(), 0);
+            for (int64_t chunk_id = 0; chunk_id < available_chunk_count;
+                 ++chunk_id) {
+                const auto begin = group_offsets[chunk_id];
+                const auto end = group_offsets[chunk_id + 1];
+                if (begin != end) {
+                    process_chunk(chunk_id, grouped, begin, end, &accepted);
+                }
+            }
+            for (size_t i = 0; i < accepted.size(); ++i) {
+                if (accepted[i]) {
+                    output->push_back((*input)[i]);
+                }
+            }
+        }
         return output;
     }
 

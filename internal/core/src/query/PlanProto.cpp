@@ -63,6 +63,10 @@ ProtoParser::PlanOptionsFromProto(
     const proto::plan::PlanOption& plan_option_proto,
     PlanOptions& plan_options) {
     plan_options.expr_use_json_stats = plan_option_proto.expr_use_json_stats();
+    plan_options.filter_result_representation =
+        plan_option_proto.filter_result_representation();
+    plan_options.sparse_result_max_cardinality =
+        plan_option_proto.sparse_result_max_cardinality();
     LOG_TRACE("plan_options.expr_use_json_stats: {}",
               plan_options.expr_use_json_stats);
 }

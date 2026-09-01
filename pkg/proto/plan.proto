@@ -413,6 +413,10 @@ message ScoreOption{
 
 message PlanOption {
    bool expr_use_json_stats = 1;
+   // Request-scoped experiment controls for adaptive scalar-filter output.
+   // Empty/zero preserve the established Dense behavior.
+   string filter_result_representation = 2;
+   int64 sparse_result_max_cardinality = 3;
 };
 
 message PlanNode {

@@ -138,6 +138,11 @@ func doInitQueryNodeOnce(ctx context.Context) error {
 
 	cExprBatchSize := C.int64_t(paramtable.Get().QueryNodeCfg.ExprEvalBatchSize.GetAsInt64())
 	C.SetDefaultExprEvalBatchSize(cExprBatchSize)
+	C.SetSparseFilterResultConfig(
+		C.bool(paramtable.Get().QueryNodeCfg.EnableSparseFilterResult.GetAsBool()),
+		C.int64_t(paramtable.Get().QueryNodeCfg.SparseResultMaxCardinality.GetAsInt64()),
+		C.int64_t(paramtable.Get().QueryNodeCfg.SparseResultMinSegmentRows.GetAsInt64()),
+		C.double(paramtable.Get().QueryNodeCfg.SparseResultMaxRatio.GetAsFloat()))
 
 	cDeleteDumpBatchSize := C.int64_t(paramtable.Get().QueryNodeCfg.DeleteDumpBatchSize.GetAsInt64())
 	C.SetDefaultDeleteDumpBatchSize(cDeleteDumpBatchSize)

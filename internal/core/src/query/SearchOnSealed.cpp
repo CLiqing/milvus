@@ -48,6 +48,27 @@
 
 namespace milvus::query {
 
+namespace {
+
+// ValidIdList is accepted-ID storage for Cardinal-aware consumers.  Generic
+// Knowhere BF consumes only the legacy dense filtered-ID convention.
+TargetBitmap
+MaterializeValidIdListForLegacyKnowhere(const BitsetView& bitset) {
+    AssertInfo(bitset.is_valid_id_list(),
+               "valid-ID-list materialization requires a ValidIdList bitset");
+    TargetBitmap dense(bitset.size(), true);
+    for (const auto id : bitset.valid_ids()) {
+        AssertInfo(id >= 0 && static_cast<size_t>(id) < dense.size(),
+                   "valid ID {} is outside sparse payload universe {}",
+                   id,
+                   dense.size());
+        dense.set(static_cast<size_t>(id), false);
+    }
+    return dense;
+}
+
+}  // namespace
+
 void
 SearchOnSealedIndex(const Schema& schema,
                     const segcore::SealedIndexingEntry& entry,
@@ -198,8 +219,18 @@ SearchOnSealedColumn(const Schema& schema,
         field.get_data_type() == DataType::VECTOR_ARRAY &&
         search_info.array_offsets_ != nullptr;
     result.element_level_ = is_element_level_search;
+    // This function is the raw sealed-column fallback and ultimately calls
+    // generic Knowhere BF.  Convert Sparse only here; indexed/Cardinal paths
+    // retain the native ValidIdList handoff.
+    TargetBitmap sparse_compat_bitset;
+    BitsetView effective_bitview = bitview;
+    if (bitview.is_valid_id_list()) {
+        sparse_compat_bitset = MaterializeValidIdListForLegacyKnowhere(bitview);
+        effective_bitview = BitsetView(sparse_compat_bitset);
+    }
+
     TargetBitmap transformed_bitset;
-    BitsetView search_bitview = bitview;
+    BitsetView search_bitview = effective_bitview;
     const auto has_offset_mapping =
         needs_offset_mapping && offset_mapping.IsEnabled();
     if (has_offset_mapping) {
@@ -208,9 +239,9 @@ SearchOnSealedColumn(const Schema& schema,
             FillEmptySearchResult(result, num_queries, search_info.topk_);
             return;
         }
-        if (!bitview.empty()) {
+        if (!effective_bitview.empty()) {
             auto status =
-                offset_mapping.TransformBitset(bitview, transformed_bitset);
+                offset_mapping.TransformBitset(effective_bitview, transformed_bitset);
             if (status == OffsetMapping::BitsetTransformStatus::AllFiltered) {
                 FillEmptySearchResult(result, num_queries, search_info.topk_);
                 return;

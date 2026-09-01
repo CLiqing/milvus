@@ -248,21 +248,25 @@ ExprResCacheManager::GetCapacityBytes() const {
 size_t
 ExprResCacheManager::GetCurrentBytes() const {
     std::shared_lock state_lock(state_mutex_);
+    std::shared_lock sparse_lock(sparse_entries_mutex_);
+    const auto sparse_bytes = sparse_entries_bytes_;
     if (config_.mode == CacheMode::Memory && entry_pool_) {
-        return entry_pool_->GetCurrentBytes();
+        return entry_pool_->GetCurrentBytes() + sparse_bytes;
     }
     if (config_.mode == CacheMode::Disk) {
         std::shared_lock lock(disk_files_mutex_);
-        return GetDiskCurrentBytesLocked();
+        return GetDiskCurrentBytesLocked() + sparse_bytes;
     }
-    return 0;
+    return sparse_bytes;
 }
 
 size_t
 ExprResCacheManager::GetEntryCount() const {
     std::shared_lock state_lock(state_mutex_);
+    std::shared_lock sparse_lock(sparse_entries_mutex_);
+    const auto sparse_count = sparse_entries_.size();
     if (config_.mode == CacheMode::Memory && entry_pool_) {
-        return entry_pool_->GetEntryCount();
+        return entry_pool_->GetEntryCount() + sparse_count;
     }
     if (config_.mode == CacheMode::Disk) {
         std::shared_lock lock(disk_files_mutex_);
@@ -272,9 +276,9 @@ ExprResCacheManager::GetEntryCount() const {
                 total += file->GetUsedCount();
             }
         }
-        return total;
+        return total + sparse_count;
     }
-    return 0;
+    return sparse_count;
 }
 
 bool
@@ -431,6 +435,58 @@ ExprResCacheManager::Put(const Key& key, const Value& value) {
     }
 }
 
+bool
+ExprResCacheManager::GetSparse(const Key& key, SparseValue& out_value) {
+    if (!IsEnabled()) {
+        return false;
+    }
+    std::shared_lock state_lock(state_mutex_);
+    if (!IsEnabled()) {
+        return false;
+    }
+    std::shared_lock lock(sparse_entries_mutex_);
+    const auto it = sparse_entries_.find(key);
+    if (it == sparse_entries_.end() ||
+        it->second.active_count != out_value.active_count ||
+        it->second.accepted_ids == nullptr) {
+        return false;
+    }
+    out_value = it->second;
+    return true;
+}
+
+void
+ExprResCacheManager::PutSparse(const Key& key, const SparseValue& value) {
+    if (!IsEnabled() || value.accepted_ids == nullptr) {
+        return;
+    }
+    std::shared_lock state_lock(state_mutex_);
+    if (!IsEnabled()) {
+        return;
+    }
+    const size_t entry_bytes = key.signature.size() +
+                               value.accepted_ids->size() * sizeof(int32_t);
+    if (entry_bytes > kSparseSidecarMaxBytes) {
+        return;
+    }
+    std::unique_lock lock(sparse_entries_mutex_);
+    if (const auto it = sparse_entries_.find(key); it != sparse_entries_.end()) {
+        sparse_entries_bytes_ -=
+            it->first.signature.size() +
+            it->second.accepted_ids->size() * sizeof(int32_t);
+        sparse_entries_.erase(it);
+    }
+    if (sparse_entries_bytes_ + entry_bytes > kSparseSidecarMaxBytes) {
+        // Sparse entries are tiny and cheap to reproduce.  A full sidecar
+        // recycle is preferable to adding an independent eviction policy
+        // whose lifetime could diverge from the authoritative Dense cache.
+        sparse_entries_.clear();
+        sparse_entries_bytes_ = 0;
+    }
+    sparse_entries_.emplace(key, value);
+    sparse_entries_bytes_ += entry_bytes;
+}
+
 void
 ExprResCacheManager::Clear() {
     std::unique_lock state_lock(state_mutex_);
@@ -438,6 +494,11 @@ ExprResCacheManager::Clear() {
         entry_pool_->Clear();
     }
     frequency_tracker_.Reset();
+    {
+        std::unique_lock lock(sparse_entries_mutex_);
+        sparse_entries_.clear();
+        sparse_entries_bytes_ = 0;
+    }
     {
         std::unique_lock lock(disk_files_mutex_);
         disk_files_.clear();
@@ -459,20 +520,35 @@ ExprResCacheManager::Clear() {
 size_t
 ExprResCacheManager::EraseSegment(int64_t segment_id) {
     std::unique_lock state_lock(state_mutex_);
+    size_t sparse_erased = 0;
+    {
+        std::unique_lock lock(sparse_entries_mutex_);
+        for (auto it = sparse_entries_.begin(); it != sparse_entries_.end();) {
+            if (it->first.segment_id != segment_id) {
+                ++it;
+                continue;
+            }
+            sparse_entries_bytes_ -=
+                it->first.signature.size() +
+                it->second.accepted_ids->size() * sizeof(int32_t);
+            it = sparse_entries_.erase(it);
+            ++sparse_erased;
+        }
+    }
     if (config_.mode == CacheMode::Memory) {
         size_t erased = entry_pool_ ? entry_pool_->EraseSegment(segment_id) : 0;
         SyncUsageMetrics(entry_pool_ ? entry_pool_->GetCurrentBytes() : 0, 0);
-        return erased;
+        return erased + sparse_erased;
     } else {
         std::unique_lock lock(disk_files_mutex_);
         if (disk_files_.find(segment_id) == disk_files_.end()) {
             disk_ineligible_segments_.erase(segment_id);
             RemoveDiskClockSegment(segment_id);
-            return 0;
+            return sparse_erased;
         }
         RemoveDiskSegmentFile(segment_id);
         SyncUsageMetrics(0, GetDiskCurrentBytesLocked());
-        return 1;
+        return 1 + sparse_erased;
     }
 }
 

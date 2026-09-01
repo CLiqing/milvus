@@ -122,6 +122,15 @@ SetEnableLatestDeleteSnapshotOptimization(bool val) {
 }
 
 void
+SetSparseFilterResultConfig(bool enabled,
+                            int64_t max_cardinality,
+                            int64_t min_segment_rows,
+                            double max_ratio) {
+    milvus::SetSparseFilterResultConfig(
+        enabled, max_cardinality, min_segment_rows, max_ratio);
+}
+
+void
 SetLogLevel(const char* level) {
     milvus::SetLogLevel(level);
 }

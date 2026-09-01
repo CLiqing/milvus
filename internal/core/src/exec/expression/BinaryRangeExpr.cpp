@@ -25,6 +25,7 @@
 #include <variant>
 
 #include "common/EasyAssert.h"
+#include "common/Common.h"
 #include "common/Tracer.h"
 #include "common/bson_view.h"
 #include "common/type_c.h"
@@ -52,6 +53,27 @@ namespace exec {
 
 std::shared_ptr<const std::vector<int32_t>>
 PhyBinaryRangeFilterExpr::TryGetNativeValidIds() {
+    const auto configured_cap = SPARSE_FILTER_RESULT_MAX_CARDINALITY.load();
+    if (configured_cap < 0) {
+        return nullptr;
+    }
+    return TryGetNativeValidIdsWithCap(
+        static_cast<size_t>(configured_cap));
+}
+
+std::shared_ptr<const std::vector<int32_t>>
+PhyBinaryRangeFilterExpr::TryGetNativeValidIds(EvalCtx&,
+                                               int64_t max_cardinality) {
+    if (max_cardinality < 0) {
+        return nullptr;
+    }
+    return TryGetNativeValidIdsWithCap(
+        static_cast<size_t>(max_cardinality));
+}
+
+std::shared_ptr<const std::vector<int32_t>>
+PhyBinaryRangeFilterExpr::TryGetNativeValidIdsWithCap(
+    size_t max_cardinality) {
     if (expr_->column_.element_level_ ||
         expr_->column_.data_type_ != DataType::INT64) {
         return nullptr;
@@ -69,7 +91,78 @@ PhyBinaryRangeFilterExpr::TryGetNativeValidIds() {
                      GetValueFromProto<int64_t>(expr_->lower_val_),
                      expr_->lower_inclusive_,
                      GetValueFromProto<int64_t>(expr_->upper_val_),
-                     expr_->upper_inclusive_);
+                     expr_->upper_inclusive_,
+                     max_cardinality);
+}
+
+bool
+PhyBinaryRangeFilterExpr::CanApplySparseFilter(EvalCtx& context,
+                                               bool has_sparse_input,
+                                               int64_t max_cardinality) {
+    if (max_cardinality < 0 || expr_->column_.element_level_ ||
+        expr_->column_.data_type_ != DataType::INT64) {
+        return false;
+    }
+    if (has_sparse_input) {
+        return CanFilterNativeIdsByRawData();
+    }
+    const auto* exec_context = context.get_exec_context();
+    if (exec_context == nullptr ||
+        exec_context->get_query_context() == nullptr) {
+        return false;
+    }
+
+    EnsureExecPathDetermined();
+    if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
+        pinned_index_.empty()) {
+        return false;
+    }
+    auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
+        pinned_index_[0].get());
+    if (scalar_index == nullptr) {
+        return false;
+    }
+    return scalar_index->CanGetValidIdRange(
+        GetValueFromProto<int64_t>(expr_->lower_val_),
+        expr_->lower_inclusive_,
+        GetValueFromProto<int64_t>(expr_->upper_val_),
+        expr_->upper_inclusive_,
+        static_cast<size_t>(max_cardinality));
+}
+
+SparseFilterPreflight
+PhyBinaryRangeFilterExpr::PreflightSparseFilter(EvalCtx& context,
+                                                bool has_sparse_input,
+                                                int64_t max_cardinality) {
+    if (CanApplySparseFilter(
+            context, has_sparse_input, max_cardinality)) {
+        return SparseFilterPreflight::Sparse;
+    }
+    if (has_sparse_input || max_cardinality < 0 ||
+        expr_->column_.element_level_ ||
+        expr_->column_.data_type_ != DataType::INT64) {
+        return SparseFilterPreflight::Unsupported;
+    }
+
+    EnsureExecPathDetermined();
+    if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
+        pinned_index_.empty()) {
+        return SparseFilterPreflight::Unsupported;
+    }
+    auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
+        pinned_index_[0].get());
+    if (scalar_index == nullptr) {
+        return SparseFilterPreflight::Unsupported;
+    }
+    const auto preflight = scalar_index->PreflightValidIdRange(
+        GetValueFromProto<int64_t>(expr_->lower_val_),
+        expr_->lower_inclusive_,
+        GetValueFromProto<int64_t>(expr_->upper_val_),
+        expr_->upper_inclusive_,
+        static_cast<size_t>(max_cardinality));
+    return preflight == index::NativeValidIdPreflight::Exceeds
+               ? SparseFilterPreflight::Dense
+               : SparseFilterPreflight::Unsupported;
 }
 
 std::shared_ptr<const std::vector<int32_t>>
@@ -80,8 +173,12 @@ PhyBinaryRangeFilterExpr::TryFilterNativeValidIds(
         return nullptr;
     }
 
+    if (!CanFilterNativeIdsByRawData()) {
+        return nullptr;
+    }
+
     // The Sparse consumer reads raw scalar data directly
-    // (FilterSortedNativeIdsByRawData -> chunk_data), so it works regardless
+    // (FilterNativeIdsByRawData -> chunk_data), so it works regardless
     // of whether this expression would have chosen the RawData or ScalarIndex
     // execution path as a producer.  The execution path is irrelevant here and
     // must not gate the consumer; doing so breaks compound filters whose
@@ -111,7 +208,7 @@ PhyBinaryRangeFilterExpr::TryFilterNativeValidIds(
                                                            lower_inclusive,
                                                            upper_inclusive);
         };
-    return FilterSortedNativeIdsByRawData<int64_t>(
+    return FilterNativeIdsByRawData<int64_t>(
         input, std::move(match), std::move(can_skip));
 }
 
@@ -319,63 +416,63 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJsonPreciseNumeric(
 
     size_t processed_cursor = 0;
     auto execute_sub_batch =
-        [
-            pointer,
-            lower_bound,
-            upper_bound,
-            lower_inclusive,
-            upper_inclusive,
-            &bitmap_input,
-            &processed_cursor
-        ]<FilterType filter_type = FilterType::sequential>(
+        [pointer,
+         lower_bound,
+         upper_bound,
+         lower_inclusive,
+         upper_inclusive,
+         &bitmap_input,
+         &processed_cursor]<FilterType filter_type = FilterType::sequential>(
             const milvus::Json* data,
             const bool* valid_data,
             const int32_t* offsets,
             const int size,
             TargetBitmapView res,
             TargetBitmapView valid_res) {
-        if (data == nullptr) {
-            processed_cursor += size;
-            return;
-        }
-        const bool has_bitmap_input = !bitmap_input.empty();
-        for (int i = 0; i < size; ++i) {
-            auto offset = i;
-            if constexpr (filter_type == FilterType::random) {
-                offset = offsets ? offsets[i] : i;
+            if (data == nullptr) {
+                processed_cursor += size;
+                return;
             }
-            if (valid_data != nullptr && !valid_data[offset]) {
-                res[i] = valid_res[i] = false;
-                continue;
-            }
-            if (has_bitmap_input && !bitmap_input[processed_cursor + i]) {
-                continue;
-            }
+            const bool has_bitmap_input = !bitmap_input.empty();
+            for (int i = 0; i < size; ++i) {
+                auto offset = i;
+                if constexpr (filter_type == FilterType::random) {
+                    offset = offsets ? offsets[i] : i;
+                }
+                if (valid_data != nullptr && !valid_data[offset]) {
+                    res[i] = valid_res[i] = false;
+                    continue;
+                }
+                if (has_bitmap_input && !bitmap_input[processed_cursor + i]) {
+                    continue;
+                }
 
-            auto number = data[offset].at_numeric(pointer);
-            if (number.error()) {
-                res[i] = valid_res[i] = false;
-                continue;
+                auto number = data[offset].at_numeric(pointer);
+                if (number.error()) {
+                    res[i] = valid_res[i] = false;
+                    continue;
+                }
+                auto lower_comparison =
+                    CompareJsonNumberToBoundWithUint64DoubleFallback(
+                        number.value(), lower_bound);
+                auto upper_comparison =
+                    CompareJsonNumberToBoundWithUint64DoubleFallback(
+                        number.value(), upper_bound);
+                if (!lower_comparison.has_value() ||
+                    !upper_comparison.has_value()) {
+                    res[i] = false;
+                    continue;
+                }
+                const auto lower_matches = lower_inclusive
+                                               ? *lower_comparison >= 0
+                                               : *lower_comparison > 0;
+                const auto upper_matches = upper_inclusive
+                                               ? *upper_comparison <= 0
+                                               : *upper_comparison < 0;
+                res[i] = lower_matches && upper_matches;
             }
-            auto lower_comparison =
-                CompareJsonNumberToBoundWithUint64DoubleFallback(number.value(),
-                                                                 lower_bound);
-            auto upper_comparison =
-                CompareJsonNumberToBoundWithUint64DoubleFallback(number.value(),
-                                                                 upper_bound);
-            if (!lower_comparison.has_value() ||
-                !upper_comparison.has_value()) {
-                res[i] = false;
-                continue;
-            }
-            const auto lower_matches = lower_inclusive ? *lower_comparison >= 0
-                                                       : *lower_comparison > 0;
-            const auto upper_matches = upper_inclusive ? *upper_comparison <= 0
-                                                       : *upper_comparison < 0;
-            res[i] = lower_matches && upper_matches;
-        }
-        processed_cursor += size;
-    };
+            processed_cursor += size;
+        };
 
     int64_t processed_size;
     if (has_offset_input_) {
@@ -575,17 +672,19 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForData(EvalCtx& context) {
     TargetBitmapView valid_res(res_vec->GetValidRawData(), real_batch_size);
 
     size_t processed_cursor = 0;
-    auto execute_sub_batch =
-        [ lower_inclusive, upper_inclusive, &processed_cursor, &
-          bitmap_input ]<FilterType filter_type = FilterType::sequential>(
-            const T* data,
-            const bool* valid_data,
-            const int32_t* offsets,
-            const int size,
-            TargetBitmapView res,
-            TargetBitmapView valid_res,
-            HighPrecisionType val1,
-            HighPrecisionType val2) {
+    auto execute_sub_batch = [lower_inclusive,
+                              upper_inclusive,
+                              &processed_cursor,
+                              &bitmap_input]<FilterType filter_type =
+                                                 FilterType::sequential>(
+                                 const T* data,
+                                 const bool* valid_data,
+                                 const int32_t* offsets,
+                                 const int size,
+                                 TargetBitmapView res,
+                                 TargetBitmapView valid_res,
+                                 HighPrecisionType val1,
+                                 HighPrecisionType val2) {
         // If data is nullptr, this chunk was skipped by SkipIndex.
         // We only need to update processed_cursor for bitmap_input indexing.
         if (data == nullptr) {
@@ -747,22 +846,20 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForJson(EvalCtx& context) {
     auto pointer = milvus::Json::pointer(expr_->column_.nested_path_);
 
     size_t processed_cursor = 0;
-    auto execute_sub_batch =
-        [
-            lower_inclusive,
-            upper_inclusive,
-            pointer,
-            &bitmap_input,
-            &processed_cursor
-        ]<FilterType filter_type = FilterType::sequential>(
-            const milvus::Json* data,
-            const bool* valid_data,
-            const int32_t* offsets,
-            const int size,
-            TargetBitmapView res,
-            TargetBitmapView valid_res,
-            ValueType val1,
-            ValueType val2) {
+    auto execute_sub_batch = [lower_inclusive,
+                              upper_inclusive,
+                              pointer,
+                              &bitmap_input,
+                              &processed_cursor]<FilterType filter_type =
+                                                     FilterType::sequential>(
+                                 const milvus::Json* data,
+                                 const bool* valid_data,
+                                 const int32_t* offsets,
+                                 const int size,
+                                 TargetBitmapView res,
+                                 TargetBitmapView valid_res,
+                                 ValueType val1,
+                                 ValueType val2) {
         // If data is nullptr, this chunk was skipped by SkipIndex.
         // We only need to update processed_cursor for bitmap_input indexing.
         if (data == nullptr) {
@@ -1103,18 +1200,20 @@ PhyBinaryRangeFilterExpr::ExecRangeVisitorImplForArray(EvalCtx& context) {
     }
 
     size_t processed_cursor = 0;
-    auto execute_sub_batch =
-        [ lower_inclusive, upper_inclusive, &processed_cursor, &
-          bitmap_input ]<FilterType filter_type = FilterType::sequential>(
-            const milvus::ArrayView* data,
-            const bool* valid_data,
-            const int32_t* offsets,
-            const int size,
-            TargetBitmapView res,
-            TargetBitmapView valid_res,
-            ValueType val1,
-            ValueType val2,
-            int index) {
+    auto execute_sub_batch = [lower_inclusive,
+                              upper_inclusive,
+                              &processed_cursor,
+                              &bitmap_input]<FilterType filter_type =
+                                                 FilterType::sequential>(
+                                 const milvus::ArrayView* data,
+                                 const bool* valid_data,
+                                 const int32_t* offsets,
+                                 const int size,
+                                 TargetBitmapView res,
+                                 TargetBitmapView valid_res,
+                                 ValueType val1,
+                                 ValueType val2,
+                                 int index) {
         AssertInfo(index >= 0,
                    "array element range predicate requires nested path");
         // If data is nullptr, this chunk was skipped by SkipIndex.

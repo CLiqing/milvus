@@ -19,7 +19,6 @@
 #include <boost/dynamic_bitset.hpp>
 #include <map>
 #include <memory>
-#include <roaring/roaring.h>
 #include <string>
 
 #include "common/Types.h"
@@ -36,6 +35,16 @@ using MemFileManagerImplPtr = std::shared_ptr<MemFileManagerImpl>;
 }  // namespace milvus::storage
 
 namespace milvus::index {
+
+// Tri-state result for native accepted-row-ID producer preflight.  `Exceeds`
+// is distinct from `Unsupported`: callers may bypass an AdaptiveSink and use
+// the already-required Dense index result only when the index has proved that
+// the native posting/range exists but is larger than the request cap.
+enum class NativeValidIdPreflight : uint8_t {
+    Unsupported = 0,
+    Fits = 1,
+    Exceeds = 2,
+};
 
 enum class ScalarIndexType {
     NONE = 0,
@@ -161,26 +170,14 @@ class ScalarIndex : public IndexBase {
           const T& upper_bound_value,
           bool ub_inclusive) = 0;
 
-    // Optional native valid-ID producer for callers that can consume a
-    // Roaring bitmap directly.  nullptr means that this index does not
-    // provide the representation; a non-null empty bitmap is a supported
-    // range with no matches.
-    virtual std::shared_ptr<const roaring_bitmap_t>
-    TryGetRoaringRange(const T& value, OpType op) const {
-        return nullptr;
-    }
-
-    virtual std::shared_ptr<const roaring_bitmap_t>
-    TryGetRoaringRange(const T& lower_bound_value,
-                       bool lb_inclusive,
-                       const T& upper_bound_value,
-                       bool ub_inclusive) const {
+    virtual std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdEqual(const T& value) const {
         return nullptr;
     }
 
     virtual std::shared_ptr<const std::vector<int32_t>>
-    TryGetValidIdEqual(const T& value) const {
-        return nullptr;
+    TryGetValidIdEqual(const T& value, size_t /* max_cardinality */) const {
+        return TryGetValidIdEqual(value);
     }
 
     virtual std::shared_ptr<const std::vector<int32_t>>
@@ -189,11 +186,85 @@ class ScalarIndex : public IndexBase {
     }
 
     virtual std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdRange(const T& value,
+                       OpType op,
+                       size_t /* max_cardinality */) const {
+        return TryGetValidIdRange(value, op);
+    }
+
+    virtual std::shared_ptr<const std::vector<int32_t>>
     TryGetValidIdRange(const T& lower_bound_value,
                        bool lb_inclusive,
                        const T& upper_bound_value,
                        bool ub_inclusive) const {
         return nullptr;
+    }
+
+    virtual std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdRange(const T& lower_bound_value,
+                       bool lb_inclusive,
+                       const T& upper_bound_value,
+                       bool ub_inclusive,
+                       size_t /* max_cardinality */) const {
+        return TryGetValidIdRange(
+            lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
+    }
+
+    // Non-materializing capability checks paired with TryGetValidId*.  A true
+    // result guarantees that the corresponding producer can return a list no
+    // larger than max_cardinality.  These are used to choose a native Sparse
+    // route before any predicate is executed.
+    virtual bool
+    CanGetValidIdEqual(const T& /* value */,
+                       size_t /* max_cardinality */) const {
+        return false;
+    }
+
+    virtual bool
+    CanGetValidIdRange(const T& /* value */,
+                       OpType /* op */,
+                       size_t /* max_cardinality */) const {
+        return false;
+    }
+
+    virtual bool
+    CanGetValidIdRange(const T& /* lower_bound_value */,
+                       bool /* lb_inclusive */,
+                       const T& /* upper_bound_value */,
+                       bool /* ub_inclusive */,
+                       size_t /* max_cardinality */) const {
+        return false;
+    }
+
+    virtual NativeValidIdPreflight
+    PreflightValidIdEqual(const T& value, size_t max_cardinality) const {
+        return CanGetValidIdEqual(value, max_cardinality)
+                   ? NativeValidIdPreflight::Fits
+                   : NativeValidIdPreflight::Unsupported;
+    }
+
+    virtual NativeValidIdPreflight
+    PreflightValidIdRange(const T& value,
+                          OpType op,
+                          size_t max_cardinality) const {
+        return CanGetValidIdRange(value, op, max_cardinality)
+                   ? NativeValidIdPreflight::Fits
+                   : NativeValidIdPreflight::Unsupported;
+    }
+
+    virtual NativeValidIdPreflight
+    PreflightValidIdRange(const T& lower_bound_value,
+                          bool lb_inclusive,
+                          const T& upper_bound_value,
+                          bool ub_inclusive,
+                          size_t max_cardinality) const {
+        return CanGetValidIdRange(lower_bound_value,
+                                  lb_inclusive,
+                                  upper_bound_value,
+                                  ub_inclusive,
+                                  max_cardinality)
+                   ? NativeValidIdPreflight::Fits
+                   : NativeValidIdPreflight::Unsupported;
     }
 
     virtual std::optional<T>

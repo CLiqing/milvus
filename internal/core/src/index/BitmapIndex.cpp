@@ -425,7 +425,8 @@ BitmapIndex<T>::CopyRoaringPosting(const roaring::Roaring& values) const {
 
 template <typename T>
 std::shared_ptr<const std::vector<int32_t>>
-BitmapIndex<T>::MaterializeValidIds(const roaring_bitmap_t* values) const {
+BitmapIndex<T>::MaterializeValidIds(const roaring_bitmap_t* values,
+                                    size_t max_cardinality) const {
     constexpr size_t kMaxCardinalRows =
         static_cast<size_t>(std::numeric_limits<int32_t>::max());
     if (values == nullptr || total_num_rows_ > kMaxCardinalRows) {
@@ -434,7 +435,7 @@ BitmapIndex<T>::MaterializeValidIds(const roaring_bitmap_t* values) const {
 
     // The exact posting cardinality is known for free.  If it exceeds the
     // sparse-list cap, keep the Dense path instead of decoding a large list.
-    if (roaring_bitmap_get_cardinality(values) > DEFAULT_SPARSE_LIST_CAP) {
+    if (roaring_bitmap_get_cardinality(values) > max_cardinality) {
         return nullptr;
     }
 
@@ -475,39 +476,19 @@ BitmapIndex<T>::NativeRoaringSidecarByteSize() const {
 }
 
 template <typename T>
-std::shared_ptr<const roaring_bitmap_t>
-BitmapIndex<T>::TryGetRoaringEqual(const T& value) const {
-    constexpr size_t kMaxRoaringUniverse =
-        static_cast<size_t>(std::numeric_limits<uint32_t>::max()) + 1;
-    if (!is_built_ || total_num_rows_ > kMaxRoaringUniverse) {
+std::shared_ptr<const std::vector<int32_t>>
+BitmapIndex<T>::TryGetValidIdEqual(const T& value) const {
+    const auto configured_cap = SPARSE_FILTER_RESULT_MAX_CARDINALITY.load();
+    if (configured_cap < 0) {
         return nullptr;
     }
-
-    if (build_mode_ == BitmapIndexBuildMode::BITSET) {
-        const auto it = native_roaring_postings_.find(value);
-        if (it != native_roaring_postings_.end()) {
-            return it->second;
-        }
-
-        // Preserve tri-state semantics: null is unsupported, while an empty
-        // posting is a valid equality result that simply has no matches.
-        return CopyRoaringPosting(roaring::Roaring{});
-    }
-
-    const auto& postings = is_mmap_ ? bitmap_info_map_ : data_;
-    const auto it = postings.find(value);
-    if (it == postings.end()) {
-        // Missing equality is a supported empty result in every Bitmap build
-        // mode.  Do not make the native route depend on cardinality/mmap.
-        return CopyRoaringPosting(roaring::Roaring{});
-    }
-
-    return CopyRoaringPosting(it->second);
+    return TryGetValidIdEqual(value, static_cast<size_t>(configured_cap));
 }
 
 template <typename T>
 std::shared_ptr<const std::vector<int32_t>>
-BitmapIndex<T>::TryGetValidIdEqual(const T& value) const {
+BitmapIndex<T>::TryGetValidIdEqual(const T& value,
+                                   size_t max_cardinality) const {
     constexpr size_t kMaxCardinalRows =
         static_cast<size_t>(std::numeric_limits<int32_t>::max());
     if (!is_built_ || total_num_rows_ > kMaxCardinalRows) {
@@ -517,7 +498,7 @@ BitmapIndex<T>::TryGetValidIdEqual(const T& value) const {
     if (build_mode_ == BitmapIndexBuildMode::BITSET) {
         const auto posting = native_roaring_postings_.find(value);
         if (posting != native_roaring_postings_.end()) {
-            return MaterializeValidIds(posting->second.get());
+            return MaterializeValidIds(posting->second.get(), max_cardinality);
         }
         // No value is a supported empty equality.  A value with no sidecar is
         // an unsupported native producer so it falls back to Dense instead of
@@ -532,9 +513,62 @@ BitmapIndex<T>::TryGetValidIdEqual(const T& value) const {
     if (posting == postings.end()) {
         return std::make_shared<std::vector<int32_t>>();
     }
-    // Unlike TryGetRoaringEqual(), do not first copy a high-cardinality/mmap
-    // Roaring posting merely to decode it into the final list.
-    return MaterializeValidIds(&posting->second.roaring);
+    // Decode the index-owned posting directly; do not first copy a
+    // high-cardinality or mmap-backed Roaring bitmap.
+    return MaterializeValidIds(&posting->second.roaring, max_cardinality);
+}
+
+template <typename T>
+bool
+BitmapIndex<T>::CanGetValidIdEqual(const T& value,
+                                   size_t max_cardinality) const {
+    return PreflightValidIdEqual(value, max_cardinality) ==
+           NativeValidIdPreflight::Fits;
+}
+
+template <typename T>
+NativeValidIdPreflight
+BitmapIndex<T>::PreflightValidIdEqual(const T& value,
+                                      size_t max_cardinality) const {
+    constexpr size_t kMaxCardinalRows =
+        static_cast<size_t>(std::numeric_limits<int32_t>::max());
+    if (!is_built_ || total_num_rows_ > kMaxCardinalRows) {
+        return NativeValidIdPreflight::Unsupported;
+    }
+
+    const auto posting_status =
+        [this, max_cardinality](const roaring_bitmap_t* posting) {
+            if (posting == nullptr) {
+                return NativeValidIdPreflight::Unsupported;
+            }
+            const auto cardinality = roaring_bitmap_get_cardinality(posting);
+            if (cardinality != 0 &&
+                roaring_bitmap_maximum(posting) >= total_num_rows_) {
+                return NativeValidIdPreflight::Unsupported;
+            }
+            return cardinality <= max_cardinality
+                       ? NativeValidIdPreflight::Fits
+                       : NativeValidIdPreflight::Exceeds;
+        };
+
+    if (build_mode_ == BitmapIndexBuildMode::BITSET) {
+        const auto posting = native_roaring_postings_.find(value);
+        if (posting != native_roaring_postings_.end()) {
+            return posting_status(posting->second.get());
+        }
+        // A missing value is a supported empty result.  An existing bitset
+        // without its native sidecar cannot produce Sparse without first
+        // materializing Dense.
+        return bitsets_.find(value) == bitsets_.end()
+                   ? NativeValidIdPreflight::Fits
+                   : NativeValidIdPreflight::Unsupported;
+    }
+
+    const auto& postings = is_mmap_ ? bitmap_info_map_ : data_;
+    const auto posting = postings.find(value);
+    return posting == postings.end()
+               ? NativeValidIdPreflight::Fits
+               : posting_status(&posting->second.roaring);
 }
 
 template <typename T>

@@ -3823,7 +3823,11 @@ type queryNodeConfig struct {
 
 	EnableWorkerSQCostMetrics ParamItem `refreshable:"true"`
 
-	ExprEvalBatchSize ParamItem `refreshable:"false"`
+	ExprEvalBatchSize          ParamItem `refreshable:"false"`
+	EnableSparseFilterResult   ParamItem `refreshable:"true"`
+	SparseResultMaxCardinality ParamItem `refreshable:"true"`
+	SparseResultMinSegmentRows ParamItem `refreshable:"true"`
+	SparseResultMaxRatio       ParamItem `refreshable:"true"`
 
 	// delete snapshot dump batch size
 	DeleteDumpBatchSize ParamItem `refreshable:"false"`
@@ -5105,6 +5109,62 @@ user-task-polling:
 		Doc:          "expr eval batch size for getnext interface",
 	}
 	p.ExprEvalBatchSize.Init(base.mgr)
+
+	p.EnableSparseFilterResult = ParamItem{
+		Key:          "queryNode.segcore.enableSparseFilterResult",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "Enable the experimental adaptive Dense/Sparse scalar-filter result representation.",
+		Export:       true,
+	}
+	p.EnableSparseFilterResult.Init(base.mgr)
+
+	p.SparseResultMaxCardinality = ParamItem{
+		Key:          "queryNode.segcore.sparseResultMaxCardinality",
+		Version:      "3.0.0",
+		DefaultValue: "6000",
+		Doc:          "Maximum accepted-ID cardinality retained as Sparse before switching to Dense.",
+		Export:       true,
+		Formatter: func(v string) string {
+			value := getAsInt64(v)
+			if value <= 0 || value > int64(1<<31-1) {
+				return "6000"
+			}
+			return v
+		},
+	}
+	p.SparseResultMaxCardinality.Init(base.mgr)
+
+	p.SparseResultMinSegmentRows = ParamItem{
+		Key:          "queryNode.segcore.sparseResultMinSegmentRows",
+		Version:      "3.0.0",
+		DefaultValue: "50000",
+		Doc:          "Minimum per-segment row count eligible for Sparse filter output.",
+		Export:       true,
+		Formatter: func(v string) string {
+			if getAsInt64(v) <= 0 {
+				return "50000"
+			}
+			return v
+		},
+	}
+	p.SparseResultMinSegmentRows.Init(base.mgr)
+
+	p.SparseResultMaxRatio = ParamItem{
+		Key:          "queryNode.segcore.sparseResultMaxRatio",
+		Version:      "3.0.0",
+		DefaultValue: "0.006",
+		Doc:          "Maximum accepted-ID ratio retained as Sparse per segment.",
+		Export:       true,
+		Formatter: func(v string) string {
+			ratio := getAsFloat(v)
+			if math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio <= 0 || ratio > 1 {
+				return "0.006"
+			}
+			return v
+		},
+	}
+	p.SparseResultMaxRatio.Init(base.mgr)
 
 	p.DeleteDumpBatchSize = ParamItem{
 		Key:          "queryNode.segcore.deleteDumpBatchSize",

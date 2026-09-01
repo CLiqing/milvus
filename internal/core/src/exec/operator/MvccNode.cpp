@@ -76,55 +76,63 @@ PhyMvccNode::GetOutput() {
     tracer::AddEvent(fmt::format("input_rows: {}", active_count_));
     WaitPrefetch();
 
-    // A native valid-ID list is the scalar predicate's candidate set, not an
-    // assertion that every candidate is visible at this snapshot.  Preserve
+    // A Sparse accepted-ID list is the scalar predicate's candidate set, not
+    // an assertion that every candidate is visible at this snapshot.  Preserve
     // the regular MVCC semantics by compacting it against the same invalid
-    // timestamp/delete mask used by the Dense path.  In the immutable sealed
-    // case no mask is needed and the original query-owned list is forwarded.
-    if (auto payload = query_context->get_valid_id_payload(); payload != nullptr) {
-        AssertInfo(!is_source_node_ && segment_->type() == SegmentType::Sealed,
-                   "native valid IDs require a sealed FilterBits input");
-        AssertInfo(payload->universe == active_count_,
-                   "valid-ID payload universe {} does not match active row count {}",
-                   payload->universe,
-                   active_count_);
+    // timestamp/delete mask used by the Dense path.  This deliberately also
+    // covers growing segments: active_count_ is the query snapshot boundary,
+    // and the normal masks exclude rows that are not visible at that snapshot.
+    if (auto payload = query_context->get_sparse_id_payload();
+        payload != nullptr) {
+        AssertInfo(!is_source_node_, "sparse IDs require a FilterBits input");
+        AssertInfo(
+            payload->universe == active_count_,
+            "valid-ID payload universe {} does not match active row count {}",
+            payload->universe,
+            active_count_);
         const auto& native_ids = payload->ids;
         if (native_ids->empty()) {
             is_finished_ = true;
             return input_;
         }
 
-        const bool all_rows_visible =
+        TargetBitmap invalid(active_count_);
+        TargetBitmapView invalid_view(invalid.data(), invalid.size());
+
+        // Match the Dense visibility path's safe sealed-segment fast path:
+        // timestamp masking is redundant only when this immutable segment has
+        // no TTL and the query snapshot covers every insert.  Delete masking,
+        // however, must always run.  get_deleted_count() is only an
+        // observation made before mask_with_delete() acquires its own snapshot;
+        // using a zero count as a correctness gate races with delete
+        // publication and can leak a deleted Sparse candidate.
+        const bool can_skip_timestamp_mask =
+            segment_->type() == SegmentType::Sealed &&
             collection_ttl_timestamp_ == 0 &&
-            query_timestamp_ >= segment_->get_max_timestamp() &&
-            segment_->get_deleted_count() == 0;
-        if (!all_rows_visible) {
-            TargetBitmap invalid(active_count_);
-            TargetBitmapView invalid_view(invalid.data(), invalid.size());
+            query_timestamp_ >= segment_->get_max_timestamp();
+        if (!can_skip_timestamp_mask) {
             segment_->mask_with_timestamps(
                 invalid_view, query_timestamp_, collection_ttl_timestamp_);
-            segment_->mask_with_delete(
-                invalid_view, active_count_, query_timestamp_);
+        }
+        segment_->mask_with_delete(
+            invalid_view, active_count_, query_timestamp_);
 
-            if (!invalid_view.none()) {
-                auto surviving_ids =
-                    std::make_shared<std::vector<int32_t>>();
-                surviving_ids->reserve(native_ids->size());
-                for (const auto id : *native_ids) {
-                    AssertInfo(id >= 0 && id < active_count_,
-                               "native valid ID {} is outside active row "
-                               "range {}",
-                               id,
-                               active_count_);
-                    if (!invalid_view[id]) {
-                        surviving_ids->push_back(id);
-                    }
+        if (!invalid_view.none()) {
+            auto surviving_ids = std::make_shared<std::vector<int32_t>>();
+            surviving_ids->reserve(native_ids->size());
+            for (const auto id : *native_ids) {
+                AssertInfo(id >= 0 && id < active_count_,
+                           "native valid ID {} is outside active row range {}",
+                           id,
+                           active_count_);
+                if (!invalid_view[id]) {
+                    surviving_ids->push_back(id);
                 }
-                query_context->set_valid_id_payload(
-                    std::shared_ptr<const std::vector<int32_t>>(
-                        std::move(surviving_ids)),
-                    payload->universe);
             }
+            query_context->set_sparse_id_payload(
+                std::shared_ptr<const std::vector<int32_t>>(
+                    std::move(surviving_ids)),
+                payload->universe);
         }
         is_finished_ = true;
         return input_;

@@ -720,6 +720,15 @@ func SetupCoreConfigChangelCallback() {
 			return nil
 		})
 
+		updateSparseFilterResultConfig := func(ctx context.Context, key, oldValue, newValue string) error {
+			UpdateSparseFilterResultConfig()
+			return nil
+		}
+		paramtable.Get().QueryNodeCfg.EnableSparseFilterResult.RegisterCallback(updateSparseFilterResultConfig)
+		paramtable.Get().QueryNodeCfg.SparseResultMaxCardinality.RegisterCallback(updateSparseFilterResultConfig)
+		paramtable.Get().QueryNodeCfg.SparseResultMinSegmentRows.RegisterCallback(updateSparseFilterResultConfig)
+		paramtable.Get().QueryNodeCfg.SparseResultMaxRatio.RegisterCallback(updateSparseFilterResultConfig)
+
 		paramtable.Get().QueryNodeCfg.DeleteDumpBatchSize.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
 			size, err := strconv.Atoi(newValue)
 			if err != nil {

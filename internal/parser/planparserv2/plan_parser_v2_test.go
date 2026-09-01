@@ -1982,6 +1982,18 @@ func TestCreateRetrievePlan(t *testing.T) {
 
 	_, err = CreateRetrievePlan(schema, "id > -9223372036854775808", nil)
 	assert.NoError(t, err)
+
+	plan, err := CreateRetrievePlan(schema, "Int64Field > 0", map[string]*schemapb.TemplateValue{
+		common.FilterResultRepresentationKey: {
+			Val: &schemapb.TemplateValue_StringVal{StringVal: "adaptive"},
+		},
+		common.SparseResultMaxCardinalityKey: {
+			Val: &schemapb.TemplateValue_Int64Val{Int64Val: 4000},
+		},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "adaptive", plan.GetPlanOptions().GetFilterResultRepresentation())
+	assert.Equal(t, int64(4000), plan.GetPlanOptions().GetSparseResultMaxCardinality())
 }
 
 func TestCreateSearchPlan(t *testing.T) {

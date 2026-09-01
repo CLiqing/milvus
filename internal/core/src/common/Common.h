@@ -35,6 +35,10 @@ extern std::atomic<bool> JSON_KEY_STATS_ENABLED;
 extern std::atomic<bool> GROWING_JSON_KEY_STATS_ENABLED;
 extern std::atomic<bool> CONFIG_PARAM_TYPE_CHECK_ENABLED;
 extern std::atomic<bool> ENABLE_PARQUET_STATS_SKIP_INDEX;
+extern std::atomic<bool> ENABLE_SPARSE_FILTER_RESULT;
+extern std::atomic<int64_t> SPARSE_FILTER_RESULT_MAX_CARDINALITY;
+extern std::atomic<int64_t> SPARSE_FILTER_RESULT_MIN_SEGMENT_ROWS;
+extern std::atomic<double> SPARSE_FILTER_RESULT_MAX_RATIO;
 
 void
 SetIndexSliceSize(const int64_t size);
@@ -68,6 +72,22 @@ SetDefaultEnableParquetStatsSkipIndex(bool val);
 
 void
 SetEnableLatestDeleteSnapshotOptimization(bool val);
+
+void
+SetSparseFilterResultConfig(bool enabled,
+                            int64_t max_cardinality,
+                            int64_t min_segment_rows,
+                            double max_ratio);
+
+// Returns the per-segment Sparse cap.  Zero means that the segment must keep
+// the Dense representation.  The absolute cap may already contain a
+// request-level override; the segment-size and ratio guards remain global
+// safety bounds.
+int64_t
+ComputeSparseFilterResultCap(int64_t segment_rows,
+                             int64_t max_cardinality,
+                             int64_t min_segment_rows,
+                             double max_ratio);
 
 void
 SetLogLevel(const char* level);

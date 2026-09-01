@@ -119,18 +119,21 @@ class BitmapIndex : public ScalarIndex<T> {
           const T& upper_bound_value,
           bool ub_inclusive) override;
 
-    // Experimental Cardinal BF producer. Low-cardinality indexes retain an
-    // index-owned C Roaring copy of each serialized posting while the normal
-    // expression path keeps using bitsets_. Null means unsupported; an empty
-    // bitmap means a supported equality with no matches.
-    std::shared_ptr<const roaring_bitmap_t>
-    TryGetRoaringEqual(const T& value) const;
-
     // Cardinal BF runtime producer.  Roaring remains the index-owned posting
     // representation; this materializes the accepted row IDs exactly once at
     // the FilterBits boundary.
     std::shared_ptr<const std::vector<int32_t>>
     TryGetValidIdEqual(const T& value) const override;
+
+    std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdEqual(const T& value, size_t max_cardinality) const override;
+
+    bool
+    CanGetValidIdEqual(const T& value, size_t max_cardinality) const override;
+
+    NativeValidIdPreflight
+    PreflightValidIdEqual(const T& value,
+                          size_t max_cardinality) const override;
 
     std::optional<T>
     Reverse_Lookup(size_t offset) const override;
@@ -421,7 +424,8 @@ class BitmapIndex : public ScalarIndex<T> {
     CopyRoaringPosting(const roaring::Roaring& values) const;
 
     std::shared_ptr<const std::vector<int32_t>>
-    MaterializeValidIds(const roaring_bitmap_t* values) const;
+    MaterializeValidIds(const roaring_bitmap_t* values,
+                        size_t max_cardinality) const;
 
     size_t
     NativeRoaringSidecarByteSize() const;

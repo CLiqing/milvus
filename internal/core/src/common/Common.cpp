@@ -16,9 +16,13 @@
 
 #include "common/Common.h"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <string.h>
 
 #include "common/Consts.h"
+#include "common/EasyAssert.h"
 #include "gflags/gflags.h"
 #include "glog/logging.h"
 #include "log/Log.h"
@@ -44,6 +48,10 @@ std::atomic<bool> CONFIG_PARAM_TYPE_CHECK_ENABLED(
     DEFAULT_CONFIG_PARAM_TYPE_CHECK_ENABLED);
 std::atomic<bool> ENABLE_PARQUET_STATS_SKIP_INDEX(
     DEFAULT_ENABLE_PARQUET_STATS_SKIP_INDEX);
+std::atomic<bool> ENABLE_SPARSE_FILTER_RESULT(false);
+std::atomic<int64_t> SPARSE_FILTER_RESULT_MAX_CARDINALITY(6000);
+std::atomic<int64_t> SPARSE_FILTER_RESULT_MIN_SEGMENT_ROWS(50000);
+std::atomic<double> SPARSE_FILTER_RESULT_MAX_RATIO(0.006);
 
 void
 SetIndexSliceSize(const int64_t size) {
@@ -123,6 +131,75 @@ SetEnableLatestDeleteSnapshotOptimization(bool val) {
     ENABLE_LATEST_DELETE_SNAPSHOT_OPTIMIZATION.store(val);
     LOG_INFO("set default enable latest delete snapshot optimization: {}",
              ENABLE_LATEST_DELETE_SNAPSHOT_OPTIMIZATION.load());
+}
+
+void
+SetSparseFilterResultConfig(bool enabled,
+                            int64_t max_cardinality,
+                            int64_t min_segment_rows,
+                            double max_ratio) {
+    AssertInfo(max_cardinality > 0,
+               "sparse filter result max cardinality must be positive, got {}",
+               max_cardinality);
+    AssertInfo(
+        max_cardinality <= std::numeric_limits<int32_t>::max(),
+        "sparse filter result max cardinality {} exceeds the int32 row-ID "
+        "limit {}",
+        max_cardinality,
+        std::numeric_limits<int32_t>::max());
+    AssertInfo(min_segment_rows > 0,
+               "sparse filter result minimum segment rows must be positive, "
+               "got {}",
+               min_segment_rows);
+    AssertInfo(std::isfinite(max_ratio) && max_ratio > 0.0 &&
+                   max_ratio <= 1.0,
+               "sparse filter result maximum ratio must be in (0, 1], got {}",
+               max_ratio);
+    ENABLE_SPARSE_FILTER_RESULT.store(enabled);
+    SPARSE_FILTER_RESULT_MAX_CARDINALITY.store(max_cardinality);
+    SPARSE_FILTER_RESULT_MIN_SEGMENT_ROWS.store(min_segment_rows);
+    SPARSE_FILTER_RESULT_MAX_RATIO.store(max_ratio);
+    LOG_INFO("set sparse filter result config: enabled={}, "
+             "max_cardinality={}, min_segment_rows={}, max_ratio={}",
+             enabled,
+             max_cardinality,
+             min_segment_rows,
+             max_ratio);
+}
+
+int64_t
+ComputeSparseFilterResultCap(int64_t segment_rows,
+                             int64_t max_cardinality,
+                             int64_t min_segment_rows,
+                             double max_ratio) {
+    AssertInfo(segment_rows >= 0,
+               "sparse filter segment rows must be non-negative, got {}",
+               segment_rows);
+    AssertInfo(max_cardinality > 0,
+               "sparse filter result max cardinality must be positive, got {}",
+               max_cardinality);
+    AssertInfo(min_segment_rows > 0,
+               "sparse filter result minimum segment rows must be positive, "
+               "got {}",
+               min_segment_rows);
+    AssertInfo(std::isfinite(max_ratio) && max_ratio > 0.0 &&
+                   max_ratio <= 1.0,
+               "sparse filter result maximum ratio must be in (0, 1], got {}",
+               max_ratio);
+    if (segment_rows < min_segment_rows) {
+        return 0;
+    }
+
+    const long double scaled = static_cast<long double>(segment_rows) *
+                               static_cast<long double>(max_ratio);
+    // Decimal configuration such as 0.006 can land infinitesimally below an
+    // integer after binary conversion.  The relative epsilon only repairs
+    // that representation error; it is far below one row.
+    const long double epsilon =
+        std::max(1.0L, std::abs(scaled)) * 1e-12L;
+    const auto ratio_cap =
+        static_cast<int64_t>(std::floor(scaled + epsilon));
+    return std::min(max_cardinality, ratio_cap);
 }
 
 void

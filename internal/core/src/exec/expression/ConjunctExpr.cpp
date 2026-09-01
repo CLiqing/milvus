@@ -21,6 +21,7 @@
 
 #include "LikeConjunctExpr.h"
 #include "UnaryExpr.h"
+#include "common/Common.h"
 #include "common/EasyAssert.h"
 #include "common/Tracer.h"
 #include "common/ValueOp.h"
@@ -31,6 +32,94 @@
 
 namespace milvus {
 namespace exec {
+
+namespace {
+
+bool
+ApplyPredicateToDenseResult(const ExprPtr& predicate,
+                            EvalCtx& context,
+                            SparseFilterResult& result) {
+    AssertInfo(result.IsDense(), "expected a Dense adaptive filter result");
+    TargetBitmap predicate_filtered;
+    int64_t processed = 0;
+    while (processed < result.universe) {
+        VectorPtr value;
+        predicate->Eval(context, value);
+        auto column = std::dynamic_pointer_cast<ColumnVector>(value);
+        if (column == nullptr || !column->IsBitmap() || column->size() == 0) {
+            return false;
+        }
+        const auto rows = static_cast<int64_t>(column->size());
+        if (processed + rows > result.universe) {
+            return false;
+        }
+        TargetBitmap accepted(
+            TargetBitmapView(column->GetRawData(), column->size()));
+        TargetBitmapView valid(column->GetValidRawData(), column->size());
+        accepted.inplace_and(valid, column->size());
+        accepted.flip();
+        predicate_filtered.append(accepted);
+        processed += rows;
+    }
+    result.filtered->inplace_or(TargetBitmapView(predicate_filtered),
+                                result.universe);
+    return true;
+}
+
+std::optional<SparseFilterResult>
+IntersectDenseWithAdaptivePredicate(const ExprPtr& predicate,
+                                    EvalCtx& context,
+                                    int64_t max_cardinality,
+                                    SparseFilterResult current) {
+    AssertInfo(current.IsDense(), "expected a Dense adaptive filter result");
+
+    // Do not speculatively call a native producer and then re-run the same
+    // predicate through Eval when it declines. Capability is a side-effect-
+    // free commitment; unsupported predicates enter the ordinary batched path
+    // directly and execute exactly once.
+    if (!predicate->CanApplySparseFilter(
+            context, /*has_sparse_input=*/false, max_cardinality)) {
+        if (!ApplyPredicateToDenseResult(predicate, context, current)) {
+            return std::nullopt;
+        }
+        return current;
+    }
+
+    auto next = predicate->TryApplySparseFilter(
+        context, std::nullopt, max_cardinality);
+    AssertInfo(next.has_value(),
+               "Sparse capability preflight succeeded but predicate {} "
+               "declined execution",
+               predicate->name());
+    if (next->universe != current.universe) {
+        return std::nullopt;
+    }
+    if (next->IsDense()) {
+        if (next->filtered->size() != current.filtered->size()) {
+            return std::nullopt;
+        }
+        current.filtered->inplace_or(TargetBitmapView(*next->filtered),
+                                     current.universe);
+        return current;
+    }
+    if (!next->IsSparse()) {
+        return std::nullopt;
+    }
+
+    auto accepted = std::make_shared<std::vector<int32_t>>();
+    accepted->reserve(next->accepted_ids->size());
+    for (const auto id : *next->accepted_ids) {
+        if (id < 0 || id >= current.universe) {
+            return std::nullopt;
+        }
+        if (!(*current.filtered)[id]) {
+            accepted->push_back(id);
+        }
+    }
+    return SparseFilterResult{std::move(accepted), nullptr, current.universe};
+}
+
+}  // namespace
 
 DataType
 PhyConjunctFilterExpr::ResolveType(const std::vector<DataType>& inputs) {
@@ -83,36 +172,105 @@ PhyConjunctFilterExpr::BuildActiveBitmap(const ColumnVectorPtr& vec) {
 
 std::shared_ptr<const std::vector<int32_t>>
 PhyConjunctFilterExpr::TryGetNativeValidIds(EvalCtx& context) {
-    // Keep the prototype deliberately constrained.  OR/NULL three-valued
-    // logic and longer conjunctions need a general sparse-result contract;
-    // returning nullptr here preserves the established Dense behaviour.
-    if (!is_and_ || inputs_.size() != 2 ||
-        context.get_offset_input() != nullptr) {
-        return nullptr;
+    auto max_cardinality = SPARSE_FILTER_RESULT_MAX_CARDINALITY.load();
+    if (auto* exec_context = context.get_exec_context();
+        exec_context != nullptr &&
+        exec_context->get_query_context() != nullptr) {
+        max_cardinality = exec_context->get_query_context()
+                              ->get_search_info()
+                              .SparseResultMaxCardinality(max_cardinality);
     }
-    if (input_order_.empty()) {
-        input_order_.resize(inputs_.size());
-        std::iota(input_order_.begin(), input_order_.end(), 0);
-    }
-    if (input_order_.size() != 2 || input_order_[0] >= inputs_.size() ||
-        input_order_[1] >= inputs_.size()) {
-        return nullptr;
+    const auto result =
+        TryApplySparseFilter(context, std::nullopt, max_cardinality);
+    return result.has_value() ? result->accepted_ids : nullptr;
+}
+
+bool
+PhyConjunctFilterExpr::CanApplySparseFilter(EvalCtx& context,
+                                            bool has_sparse_input,
+                                            int64_t max_cardinality) {
+    if (!is_and_ || inputs_.empty() || context.get_offset_input() != nullptr ||
+        max_cardinality < 0) {
+        return false;
     }
 
-    // A produces rows that are definitely TRUE.  Its producer already
-    // excludes nullable rows, so B only needs to retain rows that are also
-    // definitely TRUE; this is the AND result for the supported row-level
-    // scalar range subset.
-    auto first_ids = inputs_[input_order_[0]]->TryGetNativeValidIds(context);
-    if (first_ids == nullptr) {
-        return nullptr;
-    }
-    if (first_ids->empty()) {
-        return first_ids;
+    size_t next_child = 0;
+    if (!has_sparse_input) {
+        if (!inputs_[0]->CanApplySparseFilter(
+                context, /*has_sparse_input=*/false, max_cardinality)) {
+            return false;
+        }
+        next_child = 1;
     }
 
-    return inputs_[input_order_[1]]->TryFilterNativeValidIds(context,
-                                                             first_ids);
+    // A producer may choose Sparse or threshold-Dense at runtime. Dense can
+    // always consume the next ordinary bitmap once, while the possible Sparse
+    // branch requires every remaining child to commit to candidate filtering.
+    // This is deliberately conservative and never changes predicate order.
+    for (size_t i = next_child; i < inputs_.size(); ++i) {
+        if (!inputs_[i]->CanApplySparseFilter(
+                context, /*has_sparse_input=*/true, max_cardinality)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<SparseFilterResult>
+PhyConjunctFilterExpr::TryApplySparseFilter(
+    EvalCtx& context,
+    std::optional<SparseFilterResult> input,
+    int64_t max_cardinality) {
+    // AND is safe to evaluate as a chain of definite-TRUE candidate sets:
+    // every step only removes rows.  Do not use input_order_ here.  That is a
+    // Dense executor scheduling detail whose runtime LIKE/optimization slots
+    // need not be a complete Sparse-safe order.  `inputs_` is the actual
+    // expression tree and retains SQL conjunction semantics regardless of
+    // order.  OR/NOT/null-sensitive cases still use the Dense evaluator.
+    if (input.has_value() && !input->IsSparse()) {
+        return std::nullopt;
+    }
+
+    if (!CanApplySparseFilter(context,
+                              /*has_sparse_input=*/input.has_value(),
+                              max_cardinality)) {
+        return std::nullopt;
+    }
+
+    std::optional<SparseFilterResult> result = std::move(input);
+    size_t next_child = 0;
+    if (!result.has_value()) {
+        // Predicate order is an executor decision, not a request-by-request
+        // producer hunt. Evaluate the first child once as the first stage of
+        // the chain. If it cannot return an Adaptive result, let the
+        // established Dense conjunction execute instead.
+        result = inputs_[0]->TryApplySparseFilter(
+            context, std::nullopt, max_cardinality);
+        if (!result.has_value()) {
+            return std::nullopt;
+        }
+        next_child = 1;
+    }
+
+    for (size_t i = next_child; i < inputs_.size(); ++i) {
+        if (result->IsSparse() && result->accepted_ids->empty()) {
+            break;
+        }
+        if (result->IsDense()) {
+            result = IntersectDenseWithAdaptivePredicate(
+                inputs_[i], context, max_cardinality, std::move(*result));
+            if (!result.has_value()) {
+                return std::nullopt;
+            }
+            continue;
+        }
+        result = inputs_[i]->TryApplySparseFilter(
+            context, std::move(result), max_cardinality);
+        if (!result.has_value()) {
+            return std::nullopt;
+        }
+    }
+    return result;
 }
 
 void

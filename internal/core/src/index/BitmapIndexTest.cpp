@@ -605,29 +605,6 @@ TYPED_TEST_P(BitmapIndexTest, PatternMatchFuncTest) {
     this->TestPatternMatchFunc();
 }
 
-TYPED_TEST_P(BitmapIndexTest, NativeRoaringLowCardinalitySidecarTest) {
-    auto* index_ptr =
-        dynamic_cast<index::BitmapIndex<TypeParam>*>(this->index_.get());
-    ASSERT_NE(index_ptr, nullptr);
-
-    const auto value = this->data_[0];
-    const auto native = index_ptr->TryGetRoaringEqual(value);
-    const auto native_again = index_ptr->TryGetRoaringEqual(value);
-    ASSERT_NE(native, nullptr);
-    ASSERT_NE(native_again, nullptr);
-
-    // The low-cardinality load path must return the owned posting rather than
-    // build a fresh Roaring object from the Dense TargetBitmap per query.
-    EXPECT_EQ(native.get(), native_again.get());
-
-    const auto dense = index_ptr->In(1, &value);
-    for (size_t id = 0; id < dense.size(); ++id) {
-        EXPECT_EQ(
-            roaring_bitmap_contains(native.get(), static_cast<uint32_t>(id)),
-            dense[id]);
-    }
-}
-
 TYPED_TEST_P(BitmapIndexTest, NativeValidIdEqualMatchesDenseTest) {
     auto* index_ptr =
         dynamic_cast<index::BitmapIndex<TypeParam>*>(this->index_.get());
@@ -649,6 +626,26 @@ TYPED_TEST_P(BitmapIndexTest, NativeValidIdEqualMatchesDenseTest) {
     }
 }
 
+TYPED_TEST_P(BitmapIndexTest, NativeValidIdCapContractTest) {
+    auto* index_ptr =
+        dynamic_cast<index::BitmapIndex<TypeParam>*>(this->index_.get());
+    ASSERT_NE(index_ptr, nullptr);
+
+    const auto value = this->data_[0];
+    const auto dense = index_ptr->In(1, &value);
+    const auto cardinality = dense.count();
+    ASSERT_GT(cardinality, 0);
+
+    EXPECT_TRUE(index_ptr->CanGetValidIdEqual(value, cardinality));
+    EXPECT_EQ(index_ptr->PreflightValidIdEqual(value, cardinality),
+              index::NativeValidIdPreflight::Fits);
+    EXPECT_NE(index_ptr->TryGetValidIdEqual(value, cardinality), nullptr);
+    EXPECT_FALSE(index_ptr->CanGetValidIdEqual(value, cardinality - 1));
+    EXPECT_EQ(index_ptr->PreflightValidIdEqual(value, cardinality - 1),
+              index::NativeValidIdPreflight::Exceeds);
+    EXPECT_EQ(index_ptr->TryGetValidIdEqual(value, cardinality - 1), nullptr);
+}
+
 using BitmapType =
     testing::Types<int8_t, int16_t, int32_t, int64_t, std::string>;
 
@@ -660,8 +657,8 @@ REGISTER_TYPED_TEST_SUITE_P(BitmapIndexTest,
                             IsNullFuncTest,
                             IsNotNullFuncTest,
                             PatternMatchFuncTest,
-                            NativeRoaringLowCardinalitySidecarTest,
-                            NativeValidIdEqualMatchesDenseTest);
+                            NativeValidIdEqualMatchesDenseTest,
+                            NativeValidIdCapContractTest);
 
 INSTANTIATE_TYPED_TEST_SUITE_P(BitmapE2ECheck, BitmapIndexTest, BitmapType);
 
@@ -704,23 +701,6 @@ TYPED_TEST_P(BitmapIndexTestV2, TestRangeCompareFuncTest) {
     this->TestRangeCompareFunc();
 }
 
-TYPED_TEST_P(BitmapIndexTestV2, NativeRoaringEqualFuncTest) {
-    auto* index_ptr =
-        dynamic_cast<index::BitmapIndex<TypeParam>*>(this->index_.get());
-    ASSERT_NE(index_ptr, nullptr);
-
-    const auto value = this->data_[0];
-    const auto native = index_ptr->TryGetRoaringEqual(value);
-    ASSERT_NE(native, nullptr);
-
-    const auto dense = index_ptr->In(1, &value);
-    for (size_t id = 0; id < dense.size(); ++id) {
-        EXPECT_EQ(
-            roaring_bitmap_contains(native.get(), static_cast<uint32_t>(id)),
-            dense[id]);
-    }
-}
-
 TYPED_TEST_P(BitmapIndexTestV2, NativeValidIdEqualMatchesDenseTest) {
     auto* index_ptr =
         dynamic_cast<index::BitmapIndex<TypeParam>*>(this->index_.get());
@@ -740,6 +720,22 @@ TYPED_TEST_P(BitmapIndexTestV2, NativeValidIdEqualMatchesDenseTest) {
     for (size_t id = 0; id < dense.size(); ++id) {
         EXPECT_EQ(selected[id], dense[id]);
     }
+}
+
+TYPED_TEST_P(BitmapIndexTestV2, NativeValidIdCapContractTest) {
+    auto* index_ptr =
+        dynamic_cast<index::BitmapIndex<TypeParam>*>(this->index_.get());
+    ASSERT_NE(index_ptr, nullptr);
+
+    const auto value = this->data_[0];
+    const auto dense = index_ptr->In(1, &value);
+    const auto cardinality = dense.count();
+    ASSERT_GT(cardinality, 0);
+
+    EXPECT_TRUE(index_ptr->CanGetValidIdEqual(value, cardinality));
+    EXPECT_NE(index_ptr->TryGetValidIdEqual(value, cardinality), nullptr);
+    EXPECT_FALSE(index_ptr->CanGetValidIdEqual(value, cardinality - 1));
+    EXPECT_EQ(index_ptr->TryGetValidIdEqual(value, cardinality - 1), nullptr);
 }
 
 TYPED_TEST_P(BitmapIndexTestV2, IsNullFuncTest) {
@@ -763,8 +759,8 @@ REGISTER_TYPED_TEST_SUITE_P(BitmapIndexTestV2,
                             NotINFuncTest,
                             CompareValFuncTest,
                             TestRangeCompareFuncTest,
-                            NativeRoaringEqualFuncTest,
                             NativeValidIdEqualMatchesDenseTest,
+                            NativeValidIdCapContractTest,
                             IsNullFuncTest,
                             IsNotNullFuncTest,
                             PatternMatchFuncTest);

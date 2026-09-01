@@ -35,7 +35,9 @@ var (
 )
 
 type ExprParams struct {
-	UseJSONStats bool
+	UseJSONStats               bool
+	FilterResultRepresentation string
+	SparseResultMaxCardinality int64
 }
 
 func ParseExprParams(vals map[string]*schemapb.TemplateValue) *ExprParams {
@@ -46,6 +48,12 @@ func ParseExprParams(vals map[string]*schemapb.TemplateValue) *ExprParams {
 	if vals != nil {
 		if v, ok := vals[common.ExprUseJSONStatsKey]; ok && v != nil {
 			ep.UseJSONStats = v.GetBoolVal()
+		}
+		if v, ok := vals[common.FilterResultRepresentationKey]; ok && v != nil {
+			ep.FilterResultRepresentation = v.GetStringVal()
+		}
+		if v, ok := vals[common.SparseResultMaxCardinalityKey]; ok && v != nil {
+			ep.SparseResultMaxCardinality = v.GetInt64Val()
 		}
 	}
 	return ep
@@ -256,7 +264,9 @@ func CreateRetrievePlanArgs(schema *typeutil.SchemaHelper, exprStr string, exprT
 			},
 		},
 		PlanOptions: &planpb.PlanOption{
-			ExprUseJsonStats: exprParams.UseJSONStats,
+			ExprUseJsonStats:           exprParams.UseJSONStats,
+			FilterResultRepresentation: exprParams.FilterResultRepresentation,
+			SparseResultMaxCardinality: exprParams.SparseResultMaxCardinality,
 		},
 	}
 	return planNode, nil
@@ -353,7 +363,9 @@ func CreateSearchPlanArgs(schema *typeutil.SchemaHelper, exprStr string, vectorF
 		Scorers:     scorers,
 		ScoreOption: options,
 		PlanOptions: &planpb.PlanOption{
-			ExprUseJsonStats: exprParams.UseJSONStats,
+			ExprUseJsonStats:           exprParams.UseJSONStats,
+			FilterResultRepresentation: exprParams.FilterResultRepresentation,
+			SparseResultMaxCardinality: exprParams.SparseResultMaxCardinality,
 		},
 	}
 	return planNode, nil

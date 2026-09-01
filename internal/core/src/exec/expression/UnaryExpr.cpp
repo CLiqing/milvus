@@ -36,6 +36,7 @@
 #include "boost/container/vector.hpp"
 #include "boost/cstdint.hpp"
 #include "common/bson_view.h"
+#include "common/Common.h"
 #include "common/Consts.h"
 #include "common/EasyAssert.h"
 #include "common/Json.h"
@@ -47,6 +48,7 @@
 #include "exec/expression/ExprCache.h"
 #include "exec/expression/ExprCacheHelper.h"
 #include "exec/expression/JsonNumberComparison.h"
+#include "exec/operator/AdaptiveFilterSink.h"
 #include "fmt/core.h"
 #include "folly/FBVector.h"
 #include "glog/logging.h"
@@ -366,6 +368,24 @@ PhyUnaryRangeFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
 
 std::shared_ptr<const std::vector<int32_t>>
 PhyUnaryRangeFilterExpr::TryGetNativeValidIds() {
+    const auto configured_cap = SPARSE_FILTER_RESULT_MAX_CARDINALITY.load();
+    if (configured_cap < 0) {
+        return nullptr;
+    }
+    return TryGetNativeValidIdsWithCap(static_cast<size_t>(configured_cap));
+}
+
+std::shared_ptr<const std::vector<int32_t>>
+PhyUnaryRangeFilterExpr::TryGetNativeValidIds(EvalCtx&,
+                                              int64_t max_cardinality) {
+    if (max_cardinality < 0) {
+        return nullptr;
+    }
+    return TryGetNativeValidIdsWithCap(static_cast<size_t>(max_cardinality));
+}
+
+std::shared_ptr<const std::vector<int32_t>>
+PhyUnaryRangeFilterExpr::TryGetNativeValidIdsWithCap(size_t max_cardinality) {
     if (expr_->column_.element_level_ ||
         expr_->column_.data_type_ != DataType::INT64) {
         return nullptr;
@@ -396,95 +416,146 @@ PhyUnaryRangeFilterExpr::TryGetNativeValidIds() {
         return scalar_index == nullptr
                    ? nullptr
                    : scalar_index->TryGetValidIdEqual(
-                         GetValueFromProto<int64_t>(expr_->val_));
+                         GetValueFromProto<int64_t>(expr_->val_),
+                         max_cardinality);
     }
 
-    // Raw-data producer: perform the same predicate scan as the Dense path,
-    // but write accepted row offsets directly into the query-owned list.  Do
-    // not first materialize an N-bit result and then enumerate it.  This is
-    // intentionally limited to sealed, row-level single-column INT64 range
-    // expressions; growing/offset/compound paths retain the regular Dense
-    // evaluation until their row-ID semantics are covered explicitly.
-    if (exec_path_ == ExprExecPath::RawData &&
-        segment_->type() == SegmentType::Sealed && !has_offset_input_) {
-        constexpr uint64_t kMaxCardinalId =
-            static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
-        if (static_cast<uint64_t>(active_count_) > kMaxCardinalId) {
-            return nullptr;
+    // Raw ranges use TryApplySparseFilter below, whose adaptive sink can
+    // return either Sparse or threshold-Dense without rescanning a prefix.
+    // Keep this legacy list-only hook restricted to scalar-index producers.
+    if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
+        pinned_index_.empty()) {
+        return nullptr;
+    }
+    auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
+        pinned_index_[0].get());
+    return scalar_index == nullptr
+               ? nullptr
+               : scalar_index->TryGetValidIdRange(
+                     GetValueFromProto<int64_t>(expr_->val_),
+                     expr_->op_type_,
+                     max_cardinality);
+}
+
+std::optional<SparseFilterResult>
+PhyUnaryRangeFilterExpr::TryApplySparseFilter(
+    EvalCtx& context,
+    std::optional<SparseFilterResult> input,
+    int64_t max_cardinality) {
+    if (max_cardinality < 0) {
+        return std::nullopt;
+    }
+    if (input.has_value()) {
+        return Expr::TryApplySparseFilter(
+            context, std::move(input), max_cardinality);
+    }
+
+    EnsureExecPathDetermined();
+    const bool supported_range =
+        expr_->op_type_ == proto::plan::OpType::LessThan ||
+        expr_->op_type_ == proto::plan::OpType::LessEqual ||
+        expr_->op_type_ == proto::plan::OpType::GreaterThan ||
+        expr_->op_type_ == proto::plan::OpType::GreaterEqual;
+    if (!supported_range || exec_path_ != ExprExecPath::RawData ||
+        expr_->column_.element_level_ ||
+        expr_->column_.data_type_ != DataType::INT64 || has_offset_input_ ||
+        context.get_offset_input() != nullptr ||
+        !CanFilterNativeIdsByRawData()) {
+        return Expr::TryApplySparseFilter(
+            context, std::nullopt, max_cardinality);
+    }
+
+    constexpr uint64_t kMaxCardinalId =
+        static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+    if (static_cast<uint64_t>(active_count_) > kMaxCardinalId) {
+        return std::nullopt;
+    }
+    const auto value = GetValueFromProto<int64_t>(expr_->val_);
+    AdaptiveFilterSink sink(active_count_, max_cardinality);
+    constexpr int64_t kScratchRows = 32 * 1024;
+    TargetBitmap scratch(kScratchRows, false);
+    auto skip_index = segment_->GetSkipIndex();
+    int64_t global_offset = 0;
+    auto* query_context = context.get_exec_context()->get_query_context();
+    checkCancellation(query_context);
+
+    // PrefetchAsync normally warms raw chunks before FilterBits reaches this
+    // path.  Direct callers do not necessarily schedule that future, though,
+    // and the established Dense evaluator performs this same lazy fallback in
+    // ProcessDataChunksForMultipleChunk.  Keep both representations on the
+    // same I/O path so Adaptive does not turn a missing prefetch into part of
+    // the measured representation cost.
+    if (!prefetched_) {
+        std::vector<int64_t> chunk_ids;
+        chunk_ids.reserve(num_data_chunk_);
+        for (int64_t chunk_id = 0; chunk_id < num_data_chunk_; ++chunk_id) {
+            chunk_ids.push_back(chunk_id);
         }
-        const auto value = GetValueFromProto<int64_t>(expr_->val_);
-        auto ids = std::make_shared<std::vector<int32_t>>();
-        // Reuse a bounded scratch bitmap as a compare-mask producer.  This
-        // keeps the numeric range compare on the same vectorized bitset
-        // kernel as the Dense path without materializing an N-row bitmap.
-        constexpr int64_t kScratchRows = 32 * 1024;
-        TargetBitmap scratch(kScratchRows, false);
-        auto skip_index = segment_->GetSkipIndex();
-        int64_t global_offset = 0;
-        while (global_offset < active_count_) {
-            int64_t chunk_id = 0;
-            int64_t chunk_offset = global_offset;
-            int64_t rows =
-                std::min<int64_t>(batch_size_, active_count_ - global_offset);
-            rows = std::min<int64_t>(rows, kScratchRows);
-            if (segment_->is_chunked()) {
-                const auto chunk =
-                    segment_->get_chunk_by_offset(field_id_, global_offset);
-                chunk_id = chunk.first;
-                chunk_offset = chunk.second;
-                rows = std::min<int64_t>(
-                    rows,
-                    segment_->chunk_size(field_id_, chunk_id) - chunk_offset);
-            }
-            // The raw native-list producer is deliberately sealed-only.  The
-            // query view can be refreshed while this expression is alive, so
-            // re-check at the sealed-only view boundary instead of allowing a
-            // growing segment to reach get_batch_views().  Returning nullptr
-            // makes FilterBitsNode use the ordinary Dense executor.
-            if (segment_->type() != SegmentType::Sealed) {
-                return nullptr;
-            }
-            // chunk_data is the scalar executor's existing sealed-segment
-            // access primitive.  Unlike get_batch_views it does not carry a
-            // chunk-view-only contract into a query view transition.
-            if (skip_index->CanSkipUnaryRange<int64_t>(
-                    op_ctx_, field_id_, chunk_id, expr_->op_type_, value)) {
-                global_offset += rows;
-                continue;
-            }
-            auto pinned =
-                segment_->chunk_data<int64_t>(op_ctx_, field_id_, chunk_id);
-            const auto chunk = pinned.get();
-            const auto* data = chunk.data() + chunk_offset;
-            const auto* valid = chunk.valid_data();
-            if (valid != nullptr) {
-                valid += chunk_offset;
-            }
-            TargetBitmapView mask(scratch.data(), rows);
-            switch (expr_->op_type_) {
-                case proto::plan::OpType::LessThan:
-                    mask.inplace_compare_val<int64_t,
-                                             milvus::bitset::CompareOpType::LT>(
-                        data, rows, value);
-                    break;
-                case proto::plan::OpType::LessEqual:
-                    mask.inplace_compare_val<int64_t,
-                                             milvus::bitset::CompareOpType::LE>(
-                        data, rows, value);
-                    break;
-                case proto::plan::OpType::GreaterThan:
-                    mask.inplace_compare_val<int64_t,
-                                             milvus::bitset::CompareOpType::GT>(
-                        data, rows, value);
-                    break;
-                case proto::plan::OpType::GreaterEqual:
-                    mask.inplace_compare_val<int64_t,
-                                             milvus::bitset::CompareOpType::GE>(
-                        data, rows, value);
-                    break;
-                default:
-                    return nullptr;
-            }
+        segment_->prefetch_chunks(op_ctx_, field_id_, chunk_ids);
+        prefetched_ = true;
+    }
+
+    while (global_offset < active_count_) {
+        checkCancellation(query_context);
+        int64_t chunk_id = 0;
+        int64_t chunk_offset = global_offset;
+        int64_t rows =
+            std::min<int64_t>(batch_size_, active_count_ - global_offset);
+        rows = std::min<int64_t>(rows, kScratchRows);
+        if (segment_->is_chunked()) {
+            const auto chunk =
+                segment_->get_chunk_by_offset(field_id_, global_offset);
+            chunk_id = chunk.first;
+            chunk_offset = chunk.second;
+            rows = std::min<int64_t>(
+                rows, segment_->chunk_size(field_id_, chunk_id) - chunk_offset);
+        }
+        TargetBitmapView mask(scratch.data(), rows);
+        if (skip_index->CanSkipUnaryRange<int64_t>(
+                op_ctx_, field_id_, chunk_id, expr_->op_type_, value)) {
+            mask.reset();
+            sink.ConsumeBatch(mask, global_offset);
+            global_offset += rows;
+            continue;
+        }
+        auto pinned =
+            segment_->chunk_data<int64_t>(op_ctx_, field_id_, chunk_id);
+        const auto chunk = pinned.get();
+        const auto* data = chunk.data() + chunk_offset;
+        const auto* valid = chunk.valid_data();
+        if (valid != nullptr) {
+            valid += chunk_offset;
+        }
+        switch (expr_->op_type_) {
+            case proto::plan::OpType::LessThan:
+                mask.inplace_compare_val<int64_t,
+                                         milvus::bitset::CompareOpType::LT>(
+                    data, rows, value);
+                break;
+            case proto::plan::OpType::LessEqual:
+                mask.inplace_compare_val<int64_t,
+                                         milvus::bitset::CompareOpType::LE>(
+                    data, rows, value);
+                break;
+            case proto::plan::OpType::GreaterThan:
+                mask.inplace_compare_val<int64_t,
+                                         milvus::bitset::CompareOpType::GT>(
+                    data, rows, value);
+                break;
+            case proto::plan::OpType::GreaterEqual:
+                mask.inplace_compare_val<int64_t,
+                                         milvus::bitset::CompareOpType::GE>(
+                    data, rows, value);
+                break;
+            default:
+                return std::nullopt;
+        }
+
+        // Raw nullable columns expose one validity byte per row, while the
+        // common sink accepts an already packed truth mask. Clear only NULL
+        // matches before handing the batch to the same T+1 state machine used
+        // by generic evaluators.
+        if (valid != nullptr) {
             const auto* words =
                 reinterpret_cast<const uint64_t*>(scratch.data());
             const int64_t word_count = (rows + 63) / 64;
@@ -495,36 +566,136 @@ PhyUnaryRangeFilterExpr::TryGetNativeValidIds() {
                     const auto bit =
                         static_cast<int64_t>(__builtin_ctzll(matches));
                     const auto local_id = word_index * 64 + bit;
-                    if (local_id < rows &&
-                        (valid == nullptr || valid[local_id])) {
-                        ids->push_back(
-                            static_cast<int32_t>(global_offset + local_id));
-                        // Early-break the Sparse representation once the list
-                        // exceeds the cap.  Returning nullptr asks the caller
-                        // to keep the Dense filtered bitmap; the scan stops
-                        // here so the wasted work is bounded by the cap.
-                        if (ids->size() > DEFAULT_SPARSE_LIST_CAP) {
-                            return nullptr;
-                        }
+                    if (local_id < rows && !valid[local_id]) {
+                        mask.reset(local_id);
                     }
                     matches &= matches - 1;
                 }
             }
-            global_offset += rows;
         }
-        return ids;
+
+        sink.ConsumeBatch(mask, global_offset);
+        global_offset += rows;
+    }
+    return sink.Finish();
+}
+
+bool
+PhyUnaryRangeFilterExpr::CanApplySparseFilter(EvalCtx& context,
+                                              bool has_sparse_input,
+                                              int64_t max_cardinality) {
+    if (max_cardinality < 0 || expr_->column_.element_level_ ||
+        expr_->column_.data_type_ != DataType::INT64) {
+        return false;
+    }
+    switch (expr_->op_type_) {
+        case proto::plan::OpType::Equal:
+        case proto::plan::OpType::LessThan:
+        case proto::plan::OpType::LessEqual:
+        case proto::plan::OpType::GreaterThan:
+        case proto::plan::OpType::GreaterEqual:
+            break;
+        default:
+            return false;
+    }
+
+    // Every supported INT64 comparison has a raw-data Sparse consumer when
+    // the sealed segment still owns the field data needed by that consumer.
+    // Keep this check aligned with FilterNativeIdsByRawData so a successful
+    // preflight cannot decline after an earlier AND child has executed.
+    if (has_sparse_input) {
+        return CanFilterNativeIdsByRawData();
+    }
+
+    const auto* exec_context = context.get_exec_context();
+    if (exec_context == nullptr ||
+        exec_context->get_query_context() == nullptr) {
+        return false;
+    }
+
+    EnsureExecPathDetermined();
+    constexpr uint64_t kMaxCardinalId =
+        static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+    if (static_cast<uint64_t>(active_count_) > kMaxCardinalId) {
+        return false;
+    }
+
+    const bool supported_raw_range =
+        expr_->op_type_ == proto::plan::OpType::LessThan ||
+        expr_->op_type_ == proto::plan::OpType::LessEqual ||
+        expr_->op_type_ == proto::plan::OpType::GreaterThan ||
+        expr_->op_type_ == proto::plan::OpType::GreaterEqual;
+    if (exec_path_ == ExprExecPath::RawData) {
+        return supported_raw_range && !has_offset_input_ &&
+               context.get_offset_input() == nullptr && segment_ != nullptr &&
+               segment_->type() == SegmentType::Sealed &&
+               segment_->HasFieldData(field_id_) &&
+               segment_->GetSkipIndex() != nullptr;
     }
 
     if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
         pinned_index_.empty()) {
-        return nullptr;
+        return false;
     }
     auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
         pinned_index_[0].get());
-    return scalar_index == nullptr
-               ? nullptr
-               : scalar_index->TryGetValidIdRange(
-                     GetValueFromProto<int64_t>(expr_->val_), expr_->op_type_);
+    if (scalar_index == nullptr) {
+        return false;
+    }
+    const auto cap = static_cast<size_t>(max_cardinality);
+    const auto value = GetValueFromProto<int64_t>(expr_->val_);
+    if (expr_->op_type_ == proto::plan::OpType::Equal) {
+        return scalar_index->CanGetValidIdEqual(value, cap);
+    }
+    return scalar_index->CanGetValidIdRange(value, expr_->op_type_, cap);
+}
+
+SparseFilterPreflight
+PhyUnaryRangeFilterExpr::PreflightSparseFilter(EvalCtx& context,
+                                               bool has_sparse_input,
+                                               int64_t max_cardinality) {
+    if (CanApplySparseFilter(
+            context, has_sparse_input, max_cardinality)) {
+        return SparseFilterPreflight::Sparse;
+    }
+    if (has_sparse_input || max_cardinality < 0 ||
+        expr_->column_.element_level_ ||
+        expr_->column_.data_type_ != DataType::INT64) {
+        return SparseFilterPreflight::Unsupported;
+    }
+
+    EnsureExecPathDetermined();
+    if (exec_path_ != ExprExecPath::ScalarIndex || num_index_chunk_ != 1 ||
+        pinned_index_.empty()) {
+        return SparseFilterPreflight::Unsupported;
+    }
+    auto* scalar_index = dynamic_cast<const index::ScalarIndex<int64_t>*>(
+        pinned_index_[0].get());
+    if (scalar_index == nullptr) {
+        return SparseFilterPreflight::Unsupported;
+    }
+
+    const auto cap = static_cast<size_t>(max_cardinality);
+    const auto value = GetValueFromProto<int64_t>(expr_->val_);
+    index::NativeValidIdPreflight preflight;
+    if (expr_->op_type_ == proto::plan::OpType::Equal) {
+        preflight = scalar_index->PreflightValidIdEqual(value, cap);
+    } else {
+        switch (expr_->op_type_) {
+            case proto::plan::OpType::LessThan:
+            case proto::plan::OpType::LessEqual:
+            case proto::plan::OpType::GreaterThan:
+            case proto::plan::OpType::GreaterEqual:
+                preflight = scalar_index->PreflightValidIdRange(
+                    value, expr_->op_type_, cap);
+                break;
+            default:
+                return SparseFilterPreflight::Unsupported;
+        }
+    }
+    return preflight == index::NativeValidIdPreflight::Exceeds
+               ? SparseFilterPreflight::Dense
+               : SparseFilterPreflight::Unsupported;
 }
 
 std::shared_ptr<const std::vector<int32_t>>
@@ -545,8 +716,12 @@ PhyUnaryRangeFilterExpr::TryFilterNativeValidIds(
             return nullptr;
     }
 
+    if (!CanFilterNativeIdsByRawData()) {
+        return nullptr;
+    }
+
     // The Sparse consumer reads raw scalar data directly
-    // (FilterSortedNativeIdsByRawData -> chunk_data), so it works regardless
+    // (FilterNativeIdsByRawData -> chunk_data), so it works regardless
     // of whether this expression would have chosen the RawData or ScalarIndex
     // execution path as a producer.  The execution path must not gate the
     // consumer; doing so breaks compound filters whose reordered second
@@ -575,7 +750,7 @@ PhyUnaryRangeFilterExpr::TryFilterNativeValidIds(
         return skip_index->CanSkipUnaryRange<int64_t>(
             op_ctx_, field_id_, chunk_id, op_type, value);
     };
-    return FilterSortedNativeIdsByRawData<int64_t>(
+    return FilterNativeIdsByRawData<int64_t>(
         input, std::move(match), std::move(can_skip));
 }
 
@@ -601,43 +776,47 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJsonPreciseNumeric(
 
     size_t processed_cursor = 0;
     auto execute_sub_batch =
-        [ pointer, bound, op_type, &bitmap_input, &
-          processed_cursor ]<FilterType filter_type = FilterType::sequential>(
+        [pointer,
+         bound,
+         op_type,
+         &bitmap_input,
+         &processed_cursor]<FilterType filter_type = FilterType::sequential>(
             const milvus::Json* data,
             const bool* valid_data,
             const int32_t* offsets,
             const int size,
             TargetBitmapView res,
             TargetBitmapView valid_res) {
-        if (data == nullptr) {
-            processed_cursor += size;
-            return;
-        }
-        const bool has_bitmap_input = !bitmap_input.empty();
-        for (int i = 0; i < size; ++i) {
-            auto offset = i;
-            if constexpr (filter_type == FilterType::random) {
-                offset = offsets ? offsets[i] : i;
+            if (data == nullptr) {
+                processed_cursor += size;
+                return;
             }
-            if (valid_data != nullptr && !valid_data[offset]) {
-                res[i] = valid_res[i] = false;
-                continue;
-            }
-            if (has_bitmap_input && !bitmap_input[processed_cursor + i]) {
-                continue;
-            }
+            const bool has_bitmap_input = !bitmap_input.empty();
+            for (int i = 0; i < size; ++i) {
+                auto offset = i;
+                if constexpr (filter_type == FilterType::random) {
+                    offset = offsets ? offsets[i] : i;
+                }
+                if (valid_data != nullptr && !valid_data[offset]) {
+                    res[i] = valid_res[i] = false;
+                    continue;
+                }
+                if (has_bitmap_input && !bitmap_input[processed_cursor + i]) {
+                    continue;
+                }
 
-            auto number = data[offset].at_numeric(pointer);
-            if (number.error()) {
-                res[i] = valid_res[i] = false;
-                continue;
+                auto number = data[offset].at_numeric(pointer);
+                if (number.error()) {
+                    res[i] = valid_res[i] = false;
+                    continue;
+                }
+                auto comparison =
+                    CompareJsonNumberToBound(number.value(), bound);
+                res[i] = comparison.has_value() &&
+                         JsonNumberMatchesOp(*comparison, op_type);
             }
-            auto comparison = CompareJsonNumberToBound(number.value(), bound);
-            res[i] = comparison.has_value() &&
-                     JsonNumberMatchesOp(*comparison, op_type);
-        }
-        processed_cursor += size;
-    };
+            processed_cursor += size;
+        };
 
     int64_t processed_size;
     if (has_offset_input_) {
@@ -683,8 +862,9 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplArray(EvalCtx& context) {
     }
     int processed_cursor = 0;
     auto execute_sub_batch =
-        [ op_type, &processed_cursor, &
-          bitmap_input ]<FilterType filter_type = FilterType::sequential>(
+        [op_type,
+         &processed_cursor,
+         &bitmap_input]<FilterType filter_type = FilterType::sequential>(
             const milvus::ArrayView* data,
             const bool* valid_data,
             const int32_t* offsets,
@@ -693,206 +873,207 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplArray(EvalCtx& context) {
             TargetBitmapView valid_res,
             ValueType val,
             int index) {
-        if (data == nullptr) {
+            if (data == nullptr) {
+                processed_cursor += size;
+                return;
+            }
+            switch (op_type) {
+                case proto::plan::GreaterThan: {
+                    UnaryElementFuncForArray<ValueType,
+                                             proto::plan::GreaterThan,
+                                             filter_type>
+                        func;
+                    func(data,
+                         valid_data,
+                         size,
+                         val,
+                         index,
+                         res,
+                         valid_res,
+                         bitmap_input,
+                         processed_cursor,
+                         offsets);
+                    break;
+                }
+                case proto::plan::GreaterEqual: {
+                    UnaryElementFuncForArray<ValueType,
+                                             proto::plan::GreaterEqual,
+                                             filter_type>
+                        func;
+                    func(data,
+                         valid_data,
+                         size,
+                         val,
+                         index,
+                         res,
+                         valid_res,
+                         bitmap_input,
+                         processed_cursor,
+                         offsets);
+                    break;
+                }
+                case proto::plan::LessThan: {
+                    UnaryElementFuncForArray<ValueType,
+                                             proto::plan::LessThan,
+                                             filter_type>
+                        func;
+                    func(data,
+                         valid_data,
+                         size,
+                         val,
+                         index,
+                         res,
+                         valid_res,
+                         bitmap_input,
+                         processed_cursor,
+                         offsets);
+                    break;
+                }
+                case proto::plan::LessEqual: {
+                    UnaryElementFuncForArray<ValueType,
+                                             proto::plan::LessEqual,
+                                             filter_type>
+                        func;
+                    func(data,
+                         valid_data,
+                         size,
+                         val,
+                         index,
+                         res,
+                         valid_res,
+                         bitmap_input,
+                         processed_cursor,
+                         offsets);
+                    break;
+                }
+                case proto::plan::Equal: {
+                    UnaryElementFuncForArray<ValueType,
+                                             proto::plan::Equal,
+                                             filter_type>
+                        func;
+                    func(data,
+                         valid_data,
+                         size,
+                         val,
+                         index,
+                         res,
+                         valid_res,
+                         bitmap_input,
+                         processed_cursor,
+                         offsets);
+                    break;
+                }
+                case proto::plan::NotEqual: {
+                    UnaryElementFuncForArray<ValueType,
+                                             proto::plan::NotEqual,
+                                             filter_type>
+                        func;
+                    func(data,
+                         valid_data,
+                         size,
+                         val,
+                         index,
+                         res,
+                         valid_res,
+                         bitmap_input,
+                         processed_cursor,
+                         offsets);
+                    break;
+                }
+                case proto::plan::PrefixMatch: {
+                    UnaryElementFuncForArray<ValueType,
+                                             proto::plan::PrefixMatch,
+                                             filter_type>
+                        func;
+                    func(data,
+                         valid_data,
+                         size,
+                         val,
+                         index,
+                         res,
+                         valid_res,
+                         bitmap_input,
+                         processed_cursor,
+                         offsets);
+                    break;
+                }
+                case proto::plan::Match: {
+                    UnaryElementFuncForArray<ValueType,
+                                             proto::plan::Match,
+                                             filter_type>
+                        func;
+                    func(data,
+                         valid_data,
+                         size,
+                         val,
+                         index,
+                         res,
+                         valid_res,
+                         bitmap_input,
+                         processed_cursor,
+                         offsets);
+                    break;
+                }
+                case proto::plan::RegexMatch: {
+                    UnaryElementFuncForArray<ValueType,
+                                             proto::plan::RegexMatch,
+                                             filter_type>
+                        func;
+                    func(data,
+                         valid_data,
+                         size,
+                         val,
+                         index,
+                         res,
+                         valid_res,
+                         bitmap_input,
+                         processed_cursor,
+                         offsets);
+                    break;
+                }
+                case proto::plan::PostfixMatch: {
+                    UnaryElementFuncForArray<ValueType,
+                                             proto::plan::PostfixMatch,
+                                             filter_type>
+                        func;
+                    func(data,
+                         valid_data,
+                         size,
+                         val,
+                         index,
+                         res,
+                         valid_res,
+                         bitmap_input,
+                         processed_cursor,
+                         offsets);
+                    break;
+                }
+                case proto::plan::InnerMatch: {
+                    UnaryElementFuncForArray<ValueType,
+                                             proto::plan::InnerMatch,
+                                             filter_type>
+                        func;
+                    func(data,
+                         valid_data,
+                         size,
+                         val,
+                         index,
+                         res,
+                         valid_res,
+                         bitmap_input,
+                         processed_cursor,
+                         offsets);
+                    break;
+                }
+                default:
+                    ThrowInfo(
+                        UnexpectedError,
+                        fmt::format(
+                            "unsupported operator type for unary expr: {}",
+                            op_type));
+            }
             processed_cursor += size;
-            return;
-        }
-        switch (op_type) {
-            case proto::plan::GreaterThan: {
-                UnaryElementFuncForArray<ValueType,
-                                         proto::plan::GreaterThan,
-                                         filter_type>
-                    func;
-                func(data,
-                     valid_data,
-                     size,
-                     val,
-                     index,
-                     res,
-                     valid_res,
-                     bitmap_input,
-                     processed_cursor,
-                     offsets);
-                break;
-            }
-            case proto::plan::GreaterEqual: {
-                UnaryElementFuncForArray<ValueType,
-                                         proto::plan::GreaterEqual,
-                                         filter_type>
-                    func;
-                func(data,
-                     valid_data,
-                     size,
-                     val,
-                     index,
-                     res,
-                     valid_res,
-                     bitmap_input,
-                     processed_cursor,
-                     offsets);
-                break;
-            }
-            case proto::plan::LessThan: {
-                UnaryElementFuncForArray<ValueType,
-                                         proto::plan::LessThan,
-                                         filter_type>
-                    func;
-                func(data,
-                     valid_data,
-                     size,
-                     val,
-                     index,
-                     res,
-                     valid_res,
-                     bitmap_input,
-                     processed_cursor,
-                     offsets);
-                break;
-            }
-            case proto::plan::LessEqual: {
-                UnaryElementFuncForArray<ValueType,
-                                         proto::plan::LessEqual,
-                                         filter_type>
-                    func;
-                func(data,
-                     valid_data,
-                     size,
-                     val,
-                     index,
-                     res,
-                     valid_res,
-                     bitmap_input,
-                     processed_cursor,
-                     offsets);
-                break;
-            }
-            case proto::plan::Equal: {
-                UnaryElementFuncForArray<ValueType,
-                                         proto::plan::Equal,
-                                         filter_type>
-                    func;
-                func(data,
-                     valid_data,
-                     size,
-                     val,
-                     index,
-                     res,
-                     valid_res,
-                     bitmap_input,
-                     processed_cursor,
-                     offsets);
-                break;
-            }
-            case proto::plan::NotEqual: {
-                UnaryElementFuncForArray<ValueType,
-                                         proto::plan::NotEqual,
-                                         filter_type>
-                    func;
-                func(data,
-                     valid_data,
-                     size,
-                     val,
-                     index,
-                     res,
-                     valid_res,
-                     bitmap_input,
-                     processed_cursor,
-                     offsets);
-                break;
-            }
-            case proto::plan::PrefixMatch: {
-                UnaryElementFuncForArray<ValueType,
-                                         proto::plan::PrefixMatch,
-                                         filter_type>
-                    func;
-                func(data,
-                     valid_data,
-                     size,
-                     val,
-                     index,
-                     res,
-                     valid_res,
-                     bitmap_input,
-                     processed_cursor,
-                     offsets);
-                break;
-            }
-            case proto::plan::Match: {
-                UnaryElementFuncForArray<ValueType,
-                                         proto::plan::Match,
-                                         filter_type>
-                    func;
-                func(data,
-                     valid_data,
-                     size,
-                     val,
-                     index,
-                     res,
-                     valid_res,
-                     bitmap_input,
-                     processed_cursor,
-                     offsets);
-                break;
-            }
-            case proto::plan::RegexMatch: {
-                UnaryElementFuncForArray<ValueType,
-                                         proto::plan::RegexMatch,
-                                         filter_type>
-                    func;
-                func(data,
-                     valid_data,
-                     size,
-                     val,
-                     index,
-                     res,
-                     valid_res,
-                     bitmap_input,
-                     processed_cursor,
-                     offsets);
-                break;
-            }
-            case proto::plan::PostfixMatch: {
-                UnaryElementFuncForArray<ValueType,
-                                         proto::plan::PostfixMatch,
-                                         filter_type>
-                    func;
-                func(data,
-                     valid_data,
-                     size,
-                     val,
-                     index,
-                     res,
-                     valid_res,
-                     bitmap_input,
-                     processed_cursor,
-                     offsets);
-                break;
-            }
-            case proto::plan::InnerMatch: {
-                UnaryElementFuncForArray<ValueType,
-                                         proto::plan::InnerMatch,
-                                         filter_type>
-                    func;
-                func(data,
-                     valid_data,
-                     size,
-                     val,
-                     index,
-                     res,
-                     valid_res,
-                     bitmap_input,
-                     processed_cursor,
-                     offsets);
-                break;
-            }
-            default:
-                ThrowInfo(
-                    UnexpectedError,
-                    fmt::format("unsupported operator type for unary expr: {}",
-                                op_type));
-        }
-        processed_cursor += size;
-    };
+        };
     int64_t processed_size;
     if (has_offset_input_) {
         processed_size =
@@ -1131,16 +1312,18 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplJson(EvalCtx& context) {
     } while (false)
 
     int processed_cursor = 0;
-    auto execute_sub_batch =
-        [ op_type, pointer, &processed_cursor, &
-          bitmap_input ]<FilterType filter_type = FilterType::sequential>(
-            const milvus::Json* data,
-            const bool* valid_data,
-            const int32_t* offsets,
-            const int size,
-            TargetBitmapView res,
-            TargetBitmapView valid_res,
-            ExprValueType val) {
+    auto execute_sub_batch = [op_type,
+                              pointer,
+                              &processed_cursor,
+                              &bitmap_input]<FilterType filter_type =
+                                                 FilterType::sequential>(
+                                 const milvus::Json* data,
+                                 const bool* valid_data,
+                                 const int32_t* offsets,
+                                 const int size,
+                                 TargetBitmapView res,
+                                 TargetBitmapView valid_res,
+                                 ExprValueType val) {
         if (data == nullptr) {
             processed_cursor += size;
             return;
@@ -2009,22 +2192,20 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplForData(EvalCtx& context) {
     const LikePatternMatcher* like_matcher_ptr = cached_like_matcher_.get();
 
     size_t processed_cursor = 0;
-    auto execute_sub_batch =
-        [
-            expr_type,
-            &processed_cursor,
-            &bitmap_input,
-            regex_matcher_ptr,
-            volnitsky_ptr,
-            like_matcher_ptr
-        ]<FilterType filter_type = FilterType::sequential>(
-            const T* data,
-            const bool* valid_data,
-            const int32_t* offsets,
-            const int size,
-            TargetBitmapView res,
-            TargetBitmapView valid_res,
-            IndexInnerType val) {
+    auto execute_sub_batch = [expr_type,
+                              &processed_cursor,
+                              &bitmap_input,
+                              regex_matcher_ptr,
+                              volnitsky_ptr,
+                              like_matcher_ptr]<FilterType filter_type =
+                                                    FilterType::sequential>(
+                                 const T* data,
+                                 const bool* valid_data,
+                                 const int32_t* offsets,
+                                 const int size,
+                                 TargetBitmapView res,
+                                 TargetBitmapView valid_res,
+                                 IndexInnerType val) {
         // If data is nullptr, this chunk was skipped by SkipIndex.
         // We only need to update processed_cursor for bitmap_input indexing.
         if (data == nullptr) {

@@ -149,28 +149,26 @@ class HybridScalarIndex : public ScalarIndex<T> {
             lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
     }
 
-    std::shared_ptr<const roaring_bitmap_t>
-    TryGetRoaringRange(const T& value, OpType op) const override {
-        return internal_index_->TryGetRoaringRange(value, op);
-    }
-
-    std::shared_ptr<const roaring_bitmap_t>
-    TryGetRoaringRange(const T& lower_bound_value,
-                       bool lb_inclusive,
-                       const T& upper_bound_value,
-                       bool ub_inclusive) const override {
-        return internal_index_->TryGetRoaringRange(
-            lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
-    }
-
     std::shared_ptr<const std::vector<int32_t>>
     TryGetValidIdEqual(const T& value) const override {
         return internal_index_->TryGetValidIdEqual(value);
     }
 
     std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdEqual(const T& value, size_t max_cardinality) const override {
+        return internal_index_->TryGetValidIdEqual(value, max_cardinality);
+    }
+
+    std::shared_ptr<const std::vector<int32_t>>
     TryGetValidIdRange(const T& value, OpType op) const override {
         return internal_index_->TryGetValidIdRange(value, op);
+    }
+
+    std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdRange(const T& value,
+                       OpType op,
+                       size_t max_cardinality) const override {
+        return internal_index_->TryGetValidIdRange(value, op, max_cardinality);
     }
 
     std::shared_ptr<const std::vector<int32_t>>
@@ -180,6 +178,71 @@ class HybridScalarIndex : public ScalarIndex<T> {
                        bool ub_inclusive) const override {
         return internal_index_->TryGetValidIdRange(
             lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
+    }
+
+    std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdRange(const T& lower_bound_value,
+                       bool lb_inclusive,
+                       const T& upper_bound_value,
+                       bool ub_inclusive,
+                       size_t max_cardinality) const override {
+        return internal_index_->TryGetValidIdRange(lower_bound_value,
+                                                   lb_inclusive,
+                                                   upper_bound_value,
+                                                   ub_inclusive,
+                                                   max_cardinality);
+    }
+
+    bool
+    CanGetValidIdEqual(const T& value, size_t max_cardinality) const override {
+        return internal_index_->CanGetValidIdEqual(value, max_cardinality);
+    }
+
+    NativeValidIdPreflight
+    PreflightValidIdEqual(const T& value,
+                          size_t max_cardinality) const override {
+        return internal_index_->PreflightValidIdEqual(value, max_cardinality);
+    }
+
+    bool
+    CanGetValidIdRange(const T& value,
+                       OpType op,
+                       size_t max_cardinality) const override {
+        return internal_index_->CanGetValidIdRange(value, op, max_cardinality);
+    }
+
+    NativeValidIdPreflight
+    PreflightValidIdRange(const T& value,
+                          OpType op,
+                          size_t max_cardinality) const override {
+        return internal_index_->PreflightValidIdRange(
+            value, op, max_cardinality);
+    }
+
+    bool
+    CanGetValidIdRange(const T& lower_bound_value,
+                       bool lb_inclusive,
+                       const T& upper_bound_value,
+                       bool ub_inclusive,
+                       size_t max_cardinality) const override {
+        return internal_index_->CanGetValidIdRange(lower_bound_value,
+                                                   lb_inclusive,
+                                                   upper_bound_value,
+                                                   ub_inclusive,
+                                                   max_cardinality);
+    }
+
+    NativeValidIdPreflight
+    PreflightValidIdRange(const T& lower_bound_value,
+                          bool lb_inclusive,
+                          const T& upper_bound_value,
+                          bool ub_inclusive,
+                          size_t max_cardinality) const override {
+        return internal_index_->PreflightValidIdRange(lower_bound_value,
+                                                       lb_inclusive,
+                                                       upper_bound_value,
+                                                       ub_inclusive,
+                                                       max_cardinality);
     }
 
     std::optional<T>

@@ -123,23 +123,50 @@ class ScalarIndexSort : public ScalarIndex<T> {
           const T& upper_bound_value,
           bool ub_inclusive) override;
 
-    std::shared_ptr<const roaring_bitmap_t>
-    TryGetRoaringRange(const T& value, OpType op) const override;
-
-    std::shared_ptr<const roaring_bitmap_t>
-    TryGetRoaringRange(const T& lower_bound_value,
-                       bool lb_inclusive,
-                       const T& upper_bound_value,
-                       bool ub_inclusive) const override;
-
     std::shared_ptr<const std::vector<int32_t>>
     TryGetValidIdRange(const T& value, OpType op) const override;
+
+    std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdRange(const T& value,
+                       OpType op,
+                       size_t max_cardinality) const override;
 
     std::shared_ptr<const std::vector<int32_t>>
     TryGetValidIdRange(const T& lower_bound_value,
                        bool lb_inclusive,
                        const T& upper_bound_value,
                        bool ub_inclusive) const override;
+
+    std::shared_ptr<const std::vector<int32_t>>
+    TryGetValidIdRange(const T& lower_bound_value,
+                       bool lb_inclusive,
+                       const T& upper_bound_value,
+                       bool ub_inclusive,
+                       size_t max_cardinality) const override;
+
+    bool
+    CanGetValidIdRange(const T& value,
+                       OpType op,
+                       size_t max_cardinality) const override;
+
+    NativeValidIdPreflight
+    PreflightValidIdRange(const T& value,
+                          OpType op,
+                          size_t max_cardinality) const override;
+
+    bool
+    CanGetValidIdRange(const T& lower_bound_value,
+                       bool lb_inclusive,
+                       const T& upper_bound_value,
+                       bool ub_inclusive,
+                       size_t max_cardinality) const override;
+
+    NativeValidIdPreflight
+    PreflightValidIdRange(const T& lower_bound_value,
+                          bool lb_inclusive,
+                          const T& upper_bound_value,
+                          bool ub_inclusive,
+                          size_t max_cardinality) const override;
 
     std::optional<T>
     Reverse_Lookup(size_t offset) const override;
@@ -207,13 +234,10 @@ class ScalarIndexSort : public ScalarIndex<T> {
                     const T& upper_bound_value,
                     bool ub_inclusive) const;
 
-    std::shared_ptr<const roaring_bitmap_t>
-    BuildRoaringFromBounds(const IndexStructure<T>* lb,
-                           const IndexStructure<T>* ub) const;
-
     std::shared_ptr<const std::vector<int32_t>>
     BuildValidIdsFromBounds(const IndexStructure<T>* lb,
-                            const IndexStructure<T>* ub) const;
+                            const IndexStructure<T>* ub,
+                            size_t max_cardinality) const;
 
  public:
     const IndexStructure<T>*

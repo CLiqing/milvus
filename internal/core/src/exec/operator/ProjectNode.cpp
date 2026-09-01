@@ -138,6 +138,27 @@ PhyProjectNode::GetOutput() {
     if (is_finished_ || input_ == nullptr) {
         return nullptr;
     }
+    auto sparse_payload = query_context_->get_sparse_id_payload();
+    if (sparse_payload != nullptr && fields_to_project_.empty()) {
+        AssertInfo(sparse_payload->universe ==
+                       query_context_->get_active_count(),
+                   "Sparse Query payload universe {} does not match active "
+                   "row count {}",
+                   sparse_payload->universe,
+                   query_context_->get_active_count());
+        const auto valid_count =
+            static_cast<int64_t>(sparse_payload->ids->size());
+        is_finished_ = true;
+        if (valid_count == 0) {
+            return nullptr;
+        }
+        auto row_vector = std::make_shared<RowVector>(std::vector<VectorPtr>{});
+        row_vector->resize(valid_count);
+        return row_vector;
+    }
+    AssertInfo(sparse_payload == nullptr,
+               "Sparse Query projection/limit requires an ordering-preserving "
+               "offset consumer; phase-one isolation supports count(*) only");
     auto col_input = GetColumnVector(input_);
     // raw data view
     TargetBitmapView raw_data_view(col_input->GetRawData(), col_input->size());

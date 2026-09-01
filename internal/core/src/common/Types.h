@@ -32,7 +32,7 @@
 #include <variant>
 #include <vector>
 
-#include "CustomBitset.h"
+#include "FilterBitmap.h"
 #include "Geometry.h"
 #include "Json.h"
 #include "NamedType/named_type_impl.hpp"
@@ -671,12 +671,6 @@ using FixedVector = folly::fbvector<
     Type>;  // boost::container::vector has memory leak when version > 1.79, so use folly::fbvector instead
 
 using Config = nlohmann::json;
-//using TargetBitmap = std::vector<bool>;
-//using TargetBitmapPtr = std::unique_ptr<TargetBitmap>;
-using TargetBitmap = CustomBitset;
-using TargetBitmapView = CustomBitsetView;
-using TargetBitmapPtr = std::unique_ptr<TargetBitmap>;
-
 using BinaryPtr = knowhere::BinaryPtr;
 using BinarySet = knowhere::BinarySet;
 using Dataset = knowhere::DataSet;
