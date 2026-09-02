@@ -117,8 +117,8 @@ TEST(PlanProto, DownpushRangeSearchCarriesObservableFallback) {
     const auto& search_info = plan->plan_node_->search_info_;
     EXPECT_EQ(search_info.ann_filter_request_mode,
               milvus::AnnFilterRequestMode::Disabled);
-    ASSERT_TRUE(search_info.cardinal_downpush_fallback_reason.has_value());
-    EXPECT_EQ(search_info.cardinal_downpush_fallback_reason.value(),
+    ASSERT_TRUE(search_info.ann_filter_fusing_fallback_reason.has_value());
+    EXPECT_EQ(search_info.ann_filter_fusing_fallback_reason.value(),
               "range_search");
 }
 

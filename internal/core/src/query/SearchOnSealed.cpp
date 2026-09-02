@@ -25,7 +25,6 @@
 #include "common/BitsetView.h"
 #include "common/Chunk.h"
 #include "common/Consts.h"
-#include "common/Downpush.h"
 #include "common/EasyAssert.h"
 #include "common/FieldMeta.h"
 #include "common/OffsetMapping.h"
@@ -119,11 +118,10 @@ SearchOnSealedIndex(const Schema& schema,
     }
     AssertInfo(vec_index != nullptr, "invalid vector index");
     if (bitset.has_candidate_evaluator()) {
-        auto index_type = vec_index->GetIndexType();
-        AssertInfo(IsDownpushSupportedIndexType(index_type),
-                   "downpush hint is only supported by Cardinal index/backend "
-                   "in v1, actual index type: {}",
-                   index_type);
+        AssertInfo(search_info.ann_filter_vector_index_lease_ != nullptr &&
+                       search_info.ann_filter_vector_index_ == vec_index,
+                   "candidate evaluator must execute on the exact loaded "
+                   "index instance accepted by the ANN filter planner");
     }
 
     const auto& offset_mapping = vec_index->GetOffsetMapping();

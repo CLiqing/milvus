@@ -27,7 +27,7 @@
 
 namespace milvus {
 namespace exec {
-struct CardinalDownpushSearchContext;
+struct PreparedFusingBundle;
 class PhyFilterBitsNode : public Operator {
  public:
     PhyFilterBitsNode(
@@ -78,8 +78,8 @@ class PhyFilterBitsNode : public Operator {
 
  private:
     void
-    TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
-                              ExecContext* exec_context);
+    TryEnableAnnFilterFusing(const plan::FilterBitsNode& filter,
+                             ExecContext* exec_context);
 
     std::unique_ptr<ExprSet> exprs_;
     // entity TTL predicate, compiled separately from exprs_ so the downpush
@@ -93,10 +93,9 @@ class PhyFilterBitsNode : public Operator {
     // Cache backend is the process-level ExprResCacheManager.
     bool enable_expr_cache_ = false;
     std::string expr_cache_key_;
-    bool cardinal_downpush_enabled_ = false;
-    std::optional<CardinalDownpushPredicateProgram> cardinal_downpush_program_;
-    std::shared_ptr<CardinalDownpushSearchContext>
-        cardinal_downpush_search_context_;
+    bool ann_filter_fusing_enabled_ = false;
+    std::optional<AnnFilterFusingProgram> ann_filter_fusing_program_;
+    std::shared_ptr<PreparedFusingBundle> ann_filter_fusing_bundle_;
 };
 }  // namespace exec
 }  // namespace milvus

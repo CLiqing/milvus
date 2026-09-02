@@ -136,9 +136,6 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     HasJsonIndex(FieldId field_id) const override;
     bool
     HasFieldData(FieldId field_id) const override;
-    bool
-    SupportsDownpush(FieldId field_id) const override;
-
     knowhere::AnnFilterPlanResultV1
     PlanAnnFilter(milvus::OpContext* op_ctx,
                   FieldId field_id,

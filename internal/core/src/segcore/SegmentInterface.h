@@ -531,11 +531,6 @@ class SegmentInternalInterface : public SegmentInterface {
     // so callers (e.g. FilterBitsNode) never need to read the raw index type.
     // Default returns false for segment types that never build vector indexes
     // (e.g. growing segments); sealed segments override.
-    virtual bool
-    SupportsDownpush(FieldId field_id) const {
-        return false;
-    }
-
     virtual knowhere::AnnFilterPlanResultV1
     PlanAnnFilter(milvus::OpContext*,
                   FieldId,

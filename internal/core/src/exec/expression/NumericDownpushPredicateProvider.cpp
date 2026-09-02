@@ -6,8 +6,12 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <numeric>
 
-#include "exec/expression/CandidateEvaluator.h"
+#include "exec/expression/NumericCandidateEvaluator.h"
+#include "exec/expression/BinaryArithOpEvalRangeExprUtils.h"
+#include "exec/operator/NumericCandidateSourceOwner.h"
+#include "segcore/SegmentInterface.h"
 
 namespace milvus::exec {
 namespace {
@@ -125,7 +129,8 @@ EvaluateInt64ValueSpecialized(const Int64EvaluatorState& state,
     if constexpr (Op == Int64EvaluatorOp::GreaterEqual) {
         return value >= state.arg0;
     } else if constexpr (Op == Int64EvaluatorOp::ModLessThan) {
-        return value % state.arg0 < state.arg1;
+        return EvaluateNumericArithmeticLessThan<
+            proto::plan::ArithOpType::Mod>(value, state.arg0, state.arg1);
     } else if constexpr (Op == Int64EvaluatorOp::GreaterThan) {
         return value > state.arg0;
     } else if constexpr (Op == Int64EvaluatorOp::LessEqual) {
@@ -146,21 +151,17 @@ EvaluateInt64ValueSpecialized(const Int64EvaluatorState& state,
         return std::binary_search(
             state.terms.begin(), state.terms.end(), value);
     } else if constexpr (Op == Int64EvaluatorOp::AddLessThan) {
-        return static_cast<__int128>(value) +
-                   static_cast<__int128>(state.arg0) <
-               static_cast<__int128>(state.arg1);
+        return EvaluateNumericArithmeticLessThan<
+            proto::plan::ArithOpType::Add>(value, state.arg0, state.arg1);
     } else if constexpr (Op == Int64EvaluatorOp::SubLessThan) {
-        return static_cast<__int128>(value) -
-                   static_cast<__int128>(state.arg0) <
-               static_cast<__int128>(state.arg1);
+        return EvaluateNumericArithmeticLessThan<
+            proto::plan::ArithOpType::Sub>(value, state.arg0, state.arg1);
     } else if constexpr (Op == Int64EvaluatorOp::MulLessThan) {
-        return static_cast<__int128>(value) *
-                   static_cast<__int128>(state.arg0) <
-               static_cast<__int128>(state.arg1);
+        return EvaluateNumericArithmeticLessThan<
+            proto::plan::ArithOpType::Mul>(value, state.arg0, state.arg1);
     } else if constexpr (Op == Int64EvaluatorOp::DivLessThan) {
-        return static_cast<__int128>(value) /
-                   static_cast<__int128>(state.arg0) <
-               static_cast<__int128>(state.arg1);
+        return EvaluateNumericArithmeticLessThan<
+            proto::plan::ArithOpType::Div>(value, state.arg0, state.arg1);
     }
     return false;
 }
@@ -193,13 +194,17 @@ EvaluateFloatValue(const FloatEvaluatorState& state, float raw_value) noexcept {
                    std::binary_search(
                        state.terms.begin(), state.terms.end(), value);
         case Int64EvaluatorOp::AddLessThan:
-            return value + state.arg0 < state.arg1;
+            return EvaluateNumericArithmeticLessThan<
+                proto::plan::ArithOpType::Add>(value, state.arg0, state.arg1);
         case Int64EvaluatorOp::SubLessThan:
-            return value - state.arg0 < state.arg1;
+            return EvaluateNumericArithmeticLessThan<
+                proto::plan::ArithOpType::Sub>(value, state.arg0, state.arg1);
         case Int64EvaluatorOp::MulLessThan:
-            return value * state.arg0 < state.arg1;
+            return EvaluateNumericArithmeticLessThan<
+                proto::plan::ArithOpType::Mul>(value, state.arg0, state.arg1);
         case Int64EvaluatorOp::DivLessThan:
-            return value / state.arg0 < state.arg1;
+            return EvaluateNumericArithmeticLessThan<
+                proto::plan::ArithOpType::Div>(value, state.arg0, state.arg1);
         case Int64EvaluatorOp::ModLessThan:
             return false;
     }
@@ -502,33 +507,60 @@ EvaluateFloatContiguousCandidates(const void* opaque,
 }
 
 std::optional<Int64EvaluatorOp>
-ToInt64EvaluatorOp(CardinalDownpushPredicateOp op) {
+ToNumericEvaluatorOp(NumericCandidatePredicateOp op) {
     switch (op) {
-        case CardinalDownpushPredicateOp::Int64GreaterEqual:
+        case NumericCandidatePredicateOp::GreaterEqual:
             return Int64EvaluatorOp::GreaterEqual;
-        case CardinalDownpushPredicateOp::Int64ModLessThan:
-            return Int64EvaluatorOp::ModLessThan;
-        case CardinalDownpushPredicateOp::Int64GreaterThan:
+        case NumericCandidatePredicateOp::GreaterThan:
             return Int64EvaluatorOp::GreaterThan;
-        case CardinalDownpushPredicateOp::Int64LessEqual:
+        case NumericCandidatePredicateOp::LessEqual:
             return Int64EvaluatorOp::LessEqual;
-        case CardinalDownpushPredicateOp::Int64LessThan:
+        case NumericCandidatePredicateOp::LessThan:
             return Int64EvaluatorOp::LessThan;
-        case CardinalDownpushPredicateOp::Int64Equal:
+        case NumericCandidatePredicateOp::Equal:
             return Int64EvaluatorOp::Equal;
-        case CardinalDownpushPredicateOp::Int64NotEqual:
+        case NumericCandidatePredicateOp::NotEqual:
             return Int64EvaluatorOp::NotEqual;
-        case CardinalDownpushPredicateOp::ScalarRange:
+        case NumericCandidatePredicateOp::Range:
             return Int64EvaluatorOp::Range;
-        case CardinalDownpushPredicateOp::ScalarTerm:
+        case NumericCandidatePredicateOp::Term:
             return Int64EvaluatorOp::Term;
-        case CardinalDownpushPredicateOp::ScalarAddLessThan:
+    }
+    return std::nullopt;
+}
+
+std::optional<NumericCandidatePredicateOp>
+ToNumericPredicateOp(proto::plan::OpType op) {
+    switch (op) {
+        case proto::plan::OpType::GreaterEqual:
+            return NumericCandidatePredicateOp::GreaterEqual;
+        case proto::plan::OpType::GreaterThan:
+            return NumericCandidatePredicateOp::GreaterThan;
+        case proto::plan::OpType::LessEqual:
+            return NumericCandidatePredicateOp::LessEqual;
+        case proto::plan::OpType::LessThan:
+            return NumericCandidatePredicateOp::LessThan;
+        case proto::plan::OpType::Equal:
+            return NumericCandidatePredicateOp::Equal;
+        case proto::plan::OpType::NotEqual:
+            return NumericCandidatePredicateOp::NotEqual;
+        default:
+            return std::nullopt;
+    }
+}
+
+std::optional<Int64EvaluatorOp>
+ToArithmeticEvaluatorOp(proto::plan::ArithOpType op) {
+    switch (op) {
+        case proto::plan::ArithOpType::Mod:
+            return Int64EvaluatorOp::ModLessThan;
+        case proto::plan::ArithOpType::Add:
             return Int64EvaluatorOp::AddLessThan;
-        case CardinalDownpushPredicateOp::ScalarSubLessThan:
+        case proto::plan::ArithOpType::Sub:
             return Int64EvaluatorOp::SubLessThan;
-        case CardinalDownpushPredicateOp::ScalarMulLessThan:
+        case proto::plan::ArithOpType::Mul:
             return Int64EvaluatorOp::MulLessThan;
-        case CardinalDownpushPredicateOp::ScalarDivLessThan:
+        case proto::plan::ArithOpType::Div:
             return Int64EvaluatorOp::DivLessThan;
         default:
             return std::nullopt;
@@ -553,218 +585,573 @@ AsDouble(const proto::plan::GenericValue& value) {
     return std::nullopt;
 }
 
-class NumericProvider final : public DownpushPredicateProvider {
- public:
-    bool
-    Supports(const expr::ColumnInfo& column) const override {
-        const auto type = column.data_type_;
-        const bool supported =
-            type == DataType::INT8 || type == DataType::INT16 ||
-            type == DataType::INT32 || type == DataType::INT64 ||
-            type == DataType::TIMESTAMPTZ || type == DataType::FLOAT;
-        return supported && !column.nullable_ && !column.element_level_ &&
-               column.nested_path_.empty();
+std::shared_ptr<std::vector<int64_t>>
+MaterializeInt64CandidateValues(
+    const segcore::SegmentInternalInterface* segment,
+    OpContext* op_context,
+    FieldId field_id,
+    int64_t row_count) {
+    std::vector<int64_t> offsets(row_count);
+    std::iota(offsets.begin(), offsets.end(), 0);
+    auto field_data = segment->bulk_subscript(
+        op_context, field_id, offsets.data(), row_count);
+    if (field_data == nullptr || !field_data->has_scalars()) {
+        return nullptr;
+    }
+    auto values = std::make_shared<std::vector<int64_t>>();
+    values->reserve(row_count);
+    const auto& scalars = field_data->scalars();
+    if (scalars.has_long_data() &&
+        scalars.long_data().data_size() == row_count) {
+        const auto& data = scalars.long_data().data();
+        values->assign(data.begin(), data.end());
+        return values;
+    }
+    if (scalars.has_int_data() &&
+        scalars.int_data().data_size() == row_count) {
+        for (const auto value : scalars.int_data().data()) {
+            values->push_back(static_cast<int64_t>(value));
+        }
+        return values;
+    }
+    if (scalars.has_timestamptz_data() &&
+        scalars.timestamptz_data().data_size() == row_count) {
+        const auto& data = scalars.timestamptz_data().data();
+        values->assign(data.begin(), data.end());
+        return values;
+    }
+    return nullptr;
+}
+
+std::shared_ptr<std::vector<float>>
+MaterializeFloatCandidateValues(
+    const segcore::SegmentInternalInterface* segment,
+    OpContext* op_context,
+    FieldId field_id,
+    int64_t row_count) {
+    std::vector<int64_t> offsets(row_count);
+    std::iota(offsets.begin(), offsets.end(), 0);
+    auto field_data = segment->bulk_subscript(
+        op_context, field_id, offsets.data(), row_count);
+    if (field_data == nullptr || !field_data->has_scalars() ||
+        !field_data->scalars().has_float_data() ||
+        field_data->scalars().float_data().data_size() != row_count) {
+        return nullptr;
+    }
+    const auto& data = field_data->scalars().float_data().data();
+    return std::make_shared<std::vector<float>>(data.begin(), data.end());
+}
+
+template <typename PrepareEvaluator>
+std::optional<PreparedCandidateLeaf>
+PrepareInt64SourceLeaf(const segcore::SegmentInternalInterface* segment,
+                       OpContext* op_context,
+                       FieldId field_id,
+                       DataType field_data_type,
+                       PrepareEvaluator&& prepare_evaluator) {
+    if (segment == nullptr || segment->type() != SegmentType::Sealed ||
+        segment->get_schema()[field_id].get_data_type() != field_data_type) {
+        return std::nullopt;
+    }
+    const auto row_count = segment->get_row_count();
+    PreparedCandidateLeaf leaf;
+    if ((field_data_type == DataType::INT64 ||
+         field_data_type == DataType::TIMESTAMPTZ) &&
+        segment->HasFieldData(field_id)) {
+        auto owner = std::make_shared<Int64ChunkedCandidateSourceOwner>();
+        const auto num_chunks = segment->num_chunk_data(field_id);
+        if (num_chunks <= 0) {
+            return std::nullopt;
+        }
+        owner->pins.reserve(num_chunks);
+        owner->chunk_values.reserve(num_chunks);
+        owner->chunk_offsets.reserve(num_chunks + 1);
+        for (int64_t chunk_id = 0; chunk_id < num_chunks; ++chunk_id) {
+            owner->chunk_offsets.push_back(
+                segment->num_rows_until_chunk(field_id, chunk_id));
+            auto pin =
+                segment->chunk_data<int64_t>(op_context, field_id, chunk_id);
+            owner->chunk_values.push_back(pin.get().data());
+            owner->pins.push_back(std::move(pin));
+        }
+        owner->chunk_offsets.push_back(row_count);
+        auto evaluator =
+            prepare_evaluator(owner->view(static_cast<size_t>(row_count)));
+        if (!evaluator.has_value()) {
+            return std::nullopt;
+        }
+        leaf.evaluator = std::move(*evaluator);
+        leaf.resource_owners.push_back(std::move(owner));
+        return leaf;
     }
 
-    CardinalDownpushPredicate
-    NewPredicate(const expr::ColumnInfo& column) const override {
-        CardinalDownpushPredicate predicate;
-        predicate.field_id_ = column.field_id_;
-        predicate.field_data_type_ = column.data_type_;
-        predicate.field_nullable_ = column.nullable_;
-        predicate.value_type_ = column.data_type_ == DataType::FLOAT
-                                    ? CardinalDownpushPredicateValueType::Float
-                                    : CardinalDownpushPredicateValueType::Int64;
-        return predicate;
+    if (field_data_type != DataType::INT8 &&
+        field_data_type != DataType::INT16 &&
+        field_data_type != DataType::INT32) {
+        return std::nullopt;
     }
+    auto owner = std::make_shared<Int64MaterializedCandidateSourceOwner>();
+    owner->materialized_values = MaterializeInt64CandidateValues(
+        segment, op_context, field_id, row_count);
+    if (owner->materialized_values == nullptr) {
+        return std::nullopt;
+    }
+    auto evaluator =
+        prepare_evaluator(owner->view(static_cast<size_t>(row_count)));
+    if (!evaluator.has_value()) {
+        return std::nullopt;
+    }
+    leaf.evaluator = std::move(*evaluator);
+    leaf.resource_owners.push_back(std::move(owner));
+    return leaf;
+}
 
-    bool
-    SupportsRangeOp(CardinalDownpushPredicateOp op) const override {
-        return op != CardinalDownpushPredicateOp::StringPrefixMatch &&
-               op != CardinalDownpushPredicateOp::StringPostfixMatch &&
-               op != CardinalDownpushPredicateOp::StringInnerMatch &&
-               op != CardinalDownpushPredicateOp::StringLikeMatch;
+template <typename PrepareEvaluator>
+std::optional<PreparedCandidateLeaf>
+PrepareFloatSourceLeaf(const segcore::SegmentInternalInterface* segment,
+                       OpContext* op_context,
+                       FieldId field_id,
+                       DataType field_data_type,
+                       PrepareEvaluator&& prepare_evaluator) {
+    if (segment == nullptr || segment->type() != SegmentType::Sealed ||
+        field_data_type != DataType::FLOAT ||
+        segment->get_schema()[field_id].get_data_type() != DataType::FLOAT) {
+        return std::nullopt;
     }
+    const auto row_count = segment->get_row_count();
+    PreparedCandidateLeaf leaf;
+    if (segment->HasFieldData(field_id)) {
+        auto owner = std::make_shared<FloatChunkedCandidateSourceOwner>();
+        const auto num_chunks = segment->num_chunk_data(field_id);
+        if (num_chunks <= 0) {
+            return std::nullopt;
+        }
+        owner->pins.reserve(num_chunks);
+        owner->chunk_values.reserve(num_chunks);
+        owner->chunk_offsets.reserve(num_chunks + 1);
+        for (int64_t chunk_id = 0; chunk_id < num_chunks; ++chunk_id) {
+            owner->chunk_offsets.push_back(
+                segment->num_rows_until_chunk(field_id, chunk_id));
+            auto pin =
+                segment->chunk_data<float>(op_context, field_id, chunk_id);
+            owner->chunk_values.push_back(pin.get().data());
+            owner->pins.push_back(std::move(pin));
+        }
+        owner->chunk_offsets.push_back(row_count);
+        auto evaluator =
+            prepare_evaluator(owner->view(static_cast<size_t>(row_count)));
+        if (!evaluator.has_value()) {
+            return std::nullopt;
+        }
+        leaf.evaluator = std::move(*evaluator);
+        leaf.resource_owners.push_back(std::move(owner));
+        return leaf;
+    }
+    auto owner = std::make_shared<FloatMaterializedCandidateSourceOwner>();
+    owner->materialized_values = MaterializeFloatCandidateValues(
+        segment, op_context, field_id, row_count);
+    if (owner->materialized_values == nullptr) {
+        return std::nullopt;
+    }
+    auto evaluator =
+        prepare_evaluator(owner->view(static_cast<size_t>(row_count)));
+    if (!evaluator.has_value()) {
+        return std::nullopt;
+    }
+    leaf.evaluator = std::move(*evaluator);
+    leaf.resource_owners.push_back(std::move(owner));
+    return leaf;
+}
 
-    bool
-    FillArg(CardinalDownpushPredicate& predicate,
-            const proto::plan::GenericValue& value,
-            bool second_arg) const override {
-        if (predicate.value_type_ ==
-            CardinalDownpushPredicateValueType::Int64) {
-            const auto converted = AsInt64(value);
-            if (!converted.has_value()) {
-                return false;
-            }
-            (second_arg ? predicate.arg1_ : predicate.arg0_) = *converted;
-            return true;
-        }
-        const auto converted = AsDouble(value);
-        if (!converted.has_value()) {
-            return false;
-        }
-        (second_arg ? predicate.double_arg1_ : predicate.double_arg0_) =
-            *converted;
-        return true;
+std::optional<PreparedCandidateLeaf>
+PrepareInt64ArithmeticLeaf(const segcore::SegmentInternalInterface* segment,
+                           OpContext* op_context,
+                           const void* typed_state) {
+    if (typed_state == nullptr) {
+        return std::nullopt;
     }
+    const auto& predicate =
+        *static_cast<const Int64ArithmeticCandidatePredicate*>(typed_state);
+    return PrepareInt64SourceLeaf(
+        segment,
+        op_context,
+        predicate.field_id,
+        predicate.field_data_type,
+        [&](const Int64CandidateSourceView& source) {
+            return PrepareInt64ArithmeticCandidateEvaluator(source,
+                                                             predicate);
+        });
+}
 
-    bool
-    FillTerms(
-        CardinalDownpushPredicate& predicate,
-        const std::vector<proto::plan::GenericValue>& values) const override {
-        if (values.empty()) {
-            return false;
-        }
-        if (predicate.value_type_ ==
-            CardinalDownpushPredicateValueType::Int64) {
-            for (const auto& value : values) {
-                const auto converted = AsInt64(value);
-                if (!converted.has_value()) {
-                    return false;
-                }
-                predicate.int64_terms_.push_back(*converted);
-            }
-            std::sort(predicate.int64_terms_.begin(),
-                      predicate.int64_terms_.end());
-            predicate.int64_terms_.erase(
-                std::unique(predicate.int64_terms_.begin(),
-                            predicate.int64_terms_.end()),
-                predicate.int64_terms_.end());
-            return true;
-        }
-        for (const auto& value : values) {
-            const auto converted = AsDouble(value);
-            if (!converted.has_value()) {
-                return false;
-            }
-            predicate.double_terms_.push_back(*converted);
-        }
-        std::sort(predicate.double_terms_.begin(),
-                  predicate.double_terms_.end());
-        predicate.double_terms_.erase(
-            std::unique(predicate.double_terms_.begin(),
-                        predicate.double_terms_.end()),
-            predicate.double_terms_.end());
-        return true;
+std::optional<PreparedCandidateLeaf>
+PrepareFloatArithmeticLeaf(const segcore::SegmentInternalInterface* segment,
+                           OpContext* op_context,
+                           const void* typed_state) {
+    if (typed_state == nullptr) {
+        return std::nullopt;
     }
+    const auto& predicate =
+        *static_cast<const FloatArithmeticCandidatePredicate*>(typed_state);
+    return PrepareFloatSourceLeaf(
+        segment,
+        op_context,
+        predicate.field_id,
+        predicate.field_data_type,
+        [&](const FloatCandidateSourceView& source) {
+            return PrepareFloatArithmeticCandidateEvaluator(source,
+                                                             predicate);
+        });
+}
 
-    bool
-    FillArithmetic(
-        CardinalDownpushPredicate& predicate,
-        const expr::BinaryArithOpEvalRangeExpr& expression) const override {
-        if (expression.op_type_ != proto::plan::OpType::LessThan) {
-            return false;
-        }
-        if (expression.arith_op_type_ == proto::plan::ArithOpType::Mod) {
-            const auto modulus = AsInt64(expression.right_operand_);
-            const auto threshold = AsInt64(expression.value_);
-            if (predicate.value_type_ !=
-                    CardinalDownpushPredicateValueType::Int64 ||
-                !modulus.has_value() || !threshold.has_value() ||
-                *modulus <= 0 || *threshold < 0 || *threshold > *modulus) {
-                return false;
-            }
-            predicate.op_ = CardinalDownpushPredicateOp::Int64ModLessThan;
-            predicate.arg0_ = *modulus;
-            predicate.arg1_ = *threshold;
-            return true;
-        }
-        CardinalDownpushPredicateOp op;
-        switch (expression.arith_op_type_) {
-            case proto::plan::ArithOpType::Add:
-                op = CardinalDownpushPredicateOp::ScalarAddLessThan;
-                break;
-            case proto::plan::ArithOpType::Sub:
-                op = CardinalDownpushPredicateOp::ScalarSubLessThan;
-                break;
-            case proto::plan::ArithOpType::Mul:
-                op = CardinalDownpushPredicateOp::ScalarMulLessThan;
-                break;
-            case proto::plan::ArithOpType::Div:
-                op = CardinalDownpushPredicateOp::ScalarDivLessThan;
-                break;
-            default:
-                return false;
-        }
-        predicate.op_ = op;
-        if (predicate.value_type_ ==
-            CardinalDownpushPredicateValueType::Int64) {
-            const auto operand = AsInt64(expression.right_operand_);
-            const auto threshold = AsInt64(expression.value_);
-            if (!operand.has_value() || !threshold.has_value() ||
-                (expression.arith_op_type_ == proto::plan::ArithOpType::Div &&
-                 *operand == 0)) {
-                return false;
-            }
-            predicate.arg0_ = *operand;
-            predicate.arg1_ = *threshold;
-            return true;
-        }
-        const auto operand = AsDouble(expression.right_operand_);
-        const auto threshold = AsDouble(expression.value_);
-        if (!operand.has_value() || !threshold.has_value() ||
-            (expression.arith_op_type_ == proto::plan::ArithOpType::Div &&
-             *operand == 0.0)) {
-            return false;
-        }
-        predicate.double_arg0_ = *operand;
-        predicate.double_arg1_ = *threshold;
-        return true;
+std::optional<PreparedCandidateLeaf>
+PrepareInt64PredicateLeaf(const segcore::SegmentInternalInterface* segment,
+                          OpContext* op_context,
+                          const void* typed_state) {
+    if (typed_state == nullptr) {
+        return std::nullopt;
     }
-};
+    const auto& predicate =
+        *static_cast<const Int64CandidatePredicate*>(typed_state);
+    return PrepareInt64SourceLeaf(
+        segment,
+        op_context,
+        predicate.field_id,
+        predicate.field_data_type,
+        [&](const Int64CandidateSourceView& source) {
+            return PrepareInt64CandidateEvaluator(source, predicate);
+        });
+}
+
+std::optional<PreparedCandidateLeaf>
+PrepareFloatPredicateLeaf(const segcore::SegmentInternalInterface* segment,
+                          OpContext* op_context,
+                          const void* typed_state) {
+    if (typed_state == nullptr) {
+        return std::nullopt;
+    }
+    const auto& predicate =
+        *static_cast<const FloatCandidatePredicate*>(typed_state);
+    return PrepareFloatSourceLeaf(
+        segment,
+        op_context,
+        predicate.field_id,
+        predicate.field_data_type,
+        [&](const FloatCandidateSourceView& source) {
+            return PrepareFloatCandidateEvaluator(source, predicate);
+        });
+}
 
 }  // namespace
 
-const DownpushPredicateProvider&
-NumericDownpushPredicateProvider() {
-    static const NumericProvider provider;
-    return provider;
+std::optional<CandidateLeafPlan>
+TryCompileNumericCandidateLeaf(const expr::TypedExprPtr& expression) {
+    if (expression == nullptr) {
+        return std::nullopt;
+    }
+
+    auto is_supported_column = [](const expr::ColumnInfo& column) {
+        const auto type = column.data_type_;
+        const bool numeric =
+            type == DataType::INT8 || type == DataType::INT16 ||
+            type == DataType::INT32 || type == DataType::INT64 ||
+            type == DataType::TIMESTAMPTZ || type == DataType::FLOAT;
+        return numeric && !column.nullable_ && !column.element_level_ &&
+               column.nested_path_.empty();
+    };
+
+    auto make_int_plan = [](Int64CandidatePredicate predicate) {
+        auto state =
+            std::make_shared<Int64CandidatePredicate>(std::move(predicate));
+        return CandidateLeafPlan{std::move(state), &PrepareInt64PredicateLeaf};
+    };
+    auto make_float_plan = [](FloatCandidatePredicate predicate) {
+        auto state =
+            std::make_shared<FloatCandidatePredicate>(std::move(predicate));
+        return CandidateLeafPlan{std::move(state), &PrepareFloatPredicateLeaf};
+    };
+
+    if (auto unary =
+            std::dynamic_pointer_cast<const expr::UnaryRangeFilterExpr>(
+                expression)) {
+        const auto& column = unary->column_;
+        const auto op = ToNumericPredicateOp(unary->op_type_);
+        if (!is_supported_column(column) || !op.has_value()) {
+            return std::nullopt;
+        }
+        if (column.data_type_ == DataType::FLOAT) {
+            const auto arg = AsDouble(unary->val_);
+            if (!arg.has_value()) {
+                return std::nullopt;
+            }
+            FloatCandidatePredicate predicate;
+            predicate.field_id = column.field_id_;
+            predicate.field_data_type = column.data_type_;
+            predicate.op = *op;
+            predicate.arg0 = static_cast<float>(*arg);
+            return make_float_plan(std::move(predicate));
+        }
+        const auto arg = AsInt64(unary->val_);
+        if (!arg.has_value()) {
+            return std::nullopt;
+        }
+        Int64CandidatePredicate predicate;
+        predicate.field_id = column.field_id_;
+        predicate.field_data_type = column.data_type_;
+        predicate.op = *op;
+        predicate.arg0 = *arg;
+        return make_int_plan(std::move(predicate));
+    }
+
+    if (auto range =
+            std::dynamic_pointer_cast<const expr::BinaryRangeFilterExpr>(
+                expression)) {
+        const auto& column = range->column_;
+        if (!is_supported_column(column)) {
+            return std::nullopt;
+        }
+        if (column.data_type_ == DataType::FLOAT) {
+            const auto lower = AsDouble(range->lower_val_);
+            const auto upper = AsDouble(range->upper_val_);
+            if (!lower.has_value() || !upper.has_value()) {
+                return std::nullopt;
+            }
+            FloatCandidatePredicate predicate;
+            predicate.field_id = column.field_id_;
+            predicate.field_data_type = column.data_type_;
+            predicate.op = NumericCandidatePredicateOp::Range;
+            predicate.arg0 = static_cast<float>(*lower);
+            predicate.arg1 = static_cast<float>(*upper);
+            predicate.lower_inclusive = range->lower_inclusive_;
+            predicate.upper_inclusive = range->upper_inclusive_;
+            return make_float_plan(std::move(predicate));
+        }
+        const auto lower = AsInt64(range->lower_val_);
+        const auto upper = AsInt64(range->upper_val_);
+        if (!lower.has_value() || !upper.has_value()) {
+            return std::nullopt;
+        }
+        Int64CandidatePredicate predicate;
+        predicate.field_id = column.field_id_;
+        predicate.field_data_type = column.data_type_;
+        predicate.op = NumericCandidatePredicateOp::Range;
+        predicate.arg0 = *lower;
+        predicate.arg1 = *upper;
+        predicate.lower_inclusive = range->lower_inclusive_;
+        predicate.upper_inclusive = range->upper_inclusive_;
+        return make_int_plan(std::move(predicate));
+    }
+
+    auto term =
+        std::dynamic_pointer_cast<const expr::TermFilterExpr>(expression);
+    if (term == nullptr || !is_supported_column(term->column_) ||
+        term->vals_.empty()) {
+        return std::nullopt;
+    }
+    const auto& column = term->column_;
+    if (column.data_type_ == DataType::FLOAT) {
+        FloatCandidatePredicate predicate;
+        predicate.field_id = column.field_id_;
+        predicate.field_data_type = column.data_type_;
+        predicate.op = NumericCandidatePredicateOp::Term;
+        predicate.terms.reserve(term->vals_.size());
+        for (const auto& value : term->vals_) {
+            const auto converted = AsDouble(value);
+            if (!converted.has_value()) {
+                return std::nullopt;
+            }
+            predicate.terms.push_back(static_cast<float>(*converted));
+        }
+        std::sort(predicate.terms.begin(), predicate.terms.end());
+        predicate.terms.erase(
+            std::unique(predicate.terms.begin(), predicate.terms.end()),
+            predicate.terms.end());
+        return make_float_plan(std::move(predicate));
+    }
+
+    Int64CandidatePredicate predicate;
+    predicate.field_id = column.field_id_;
+    predicate.field_data_type = column.data_type_;
+    predicate.op = NumericCandidatePredicateOp::Term;
+    predicate.terms.reserve(term->vals_.size());
+    for (const auto& value : term->vals_) {
+        const auto converted = AsInt64(value);
+        if (!converted.has_value()) {
+            return std::nullopt;
+        }
+        predicate.terms.push_back(*converted);
+    }
+    std::sort(predicate.terms.begin(), predicate.terms.end());
+    predicate.terms.erase(
+        std::unique(predicate.terms.begin(), predicate.terms.end()),
+        predicate.terms.end());
+
+    // A dense integral TERM is equivalent to an inclusive range and avoids a
+    // binary search in the graph hot path.
+    const auto first = predicate.terms.front();
+    const auto last = predicate.terms.back();
+    const auto expected_size =
+        static_cast<__int128>(last) - static_cast<__int128>(first) + 1;
+    if (expected_size > 0 &&
+        expected_size == static_cast<__int128>(predicate.terms.size())) {
+        predicate.op = NumericCandidatePredicateOp::Range;
+        predicate.arg0 = first;
+        predicate.arg1 = last;
+        predicate.terms.clear();
+    }
+    return make_int_plan(std::move(predicate));
+}
+
+std::optional<CandidateLeafPlan>
+TryCompileNumericArithmeticCandidateLeaf(
+    const expr::BinaryArithOpEvalRangeExpr& expression) {
+    const auto& column = expression.column_;
+    if (expression.op_type_ != proto::plan::OpType::LessThan ||
+        column.nullable_ || column.element_level_ ||
+        !column.nested_path_.empty() ||
+        !ToArithmeticEvaluatorOp(expression.arith_op_type_).has_value()) {
+        return std::nullopt;
+    }
+
+    if (column.data_type_ == DataType::FLOAT) {
+        if (expression.arith_op_type_ == proto::plan::ArithOpType::Mod) {
+            return std::nullopt;
+        }
+        const auto operand = AsDouble(expression.right_operand_);
+        const auto target = AsDouble(expression.value_);
+        if (!operand.has_value() || !target.has_value() ||
+            (expression.arith_op_type_ == proto::plan::ArithOpType::Div &&
+             *operand == 0.0)) {
+            return std::nullopt;
+        }
+        auto state = std::make_shared<FloatArithmeticCandidatePredicate>(
+            FloatArithmeticCandidatePredicate{column.field_id_,
+                                              column.data_type_,
+                                              expression.arith_op_type_,
+                                              static_cast<float>(*operand),
+                                              static_cast<float>(*target)});
+        return CandidateLeafPlan{std::move(state),
+                                 &PrepareFloatArithmeticLeaf};
+    }
+
+    if (column.data_type_ != DataType::INT8 &&
+        column.data_type_ != DataType::INT16 &&
+        column.data_type_ != DataType::INT32 &&
+        column.data_type_ != DataType::INT64 &&
+        column.data_type_ != DataType::TIMESTAMPTZ) {
+        return std::nullopt;
+    }
+    const auto operand = AsInt64(expression.right_operand_);
+    const auto target = AsInt64(expression.value_);
+    if (!operand.has_value() || !target.has_value() ||
+        ((expression.arith_op_type_ == proto::plan::ArithOpType::Div) &&
+         *operand == 0) ||
+        (expression.arith_op_type_ == proto::plan::ArithOpType::Mod &&
+         (*operand <= 0 || *target < 0 || *target > *operand))) {
+        return std::nullopt;
+    }
+    auto state = std::make_shared<Int64ArithmeticCandidatePredicate>(
+        Int64ArithmeticCandidatePredicate{column.field_id_,
+                                          column.data_type_,
+                                          expression.arith_op_type_,
+                                          *operand,
+                                          *target});
+    return CandidateLeafPlan{std::move(state), &PrepareInt64ArithmeticLeaf};
 }
 
 std::optional<PreparedCandidateEvaluator>
 PrepareInt64ModCandidateEvaluator(const Int64CandidateSourceView& source,
                                   int64_t divisor,
                                   int64_t upper_bound) {
-    CardinalDownpushPredicate predicate;
-    predicate.value_type_ = CardinalDownpushPredicateValueType::Int64;
-    predicate.op_ = CardinalDownpushPredicateOp::Int64ModLessThan;
-    predicate.arg0_ = divisor;
-    predicate.arg1_ = upper_bound;
-    return PrepareInt64CandidateEvaluator(source, predicate);
+    return PrepareInt64ArithmeticCandidateEvaluator(
+        source,
+        Int64ArithmeticCandidatePredicate{FieldId{},
+                                          DataType::INT64,
+                                          proto::plan::ArithOpType::Mod,
+                                          divisor,
+                                          upper_bound});
 }
 
 std::optional<PreparedCandidateEvaluator>
-PrepareInt64CandidateEvaluator(const Int64CandidateSourceView& source,
-                               const CardinalDownpushPredicate& predicate) {
+PrepareInt64ArithmeticCandidateEvaluator(
+    const Int64CandidateSourceView& source,
+    const Int64ArithmeticCandidatePredicate& predicate) {
     const bool has_contiguous_source = source.row_values != nullptr;
     const bool has_chunked_source = source.chunk_values != nullptr &&
                                     source.chunk_offsets != nullptr &&
                                     source.num_chunks > 0;
-    const auto op = ToInt64EvaluatorOp(predicate.op_);
-    if (predicate.value_type_ != CardinalDownpushPredicateValueType::Int64 ||
-        !op.has_value() || source.row_count == 0 ||
+    const auto op = ToArithmeticEvaluatorOp(predicate.arithmetic_op);
+    if (!op.has_value() || source.row_count == 0 ||
+        (!has_contiguous_source && !has_chunked_source) ||
+        (*op == Int64EvaluatorOp::ModLessThan &&
+         (predicate.operand <= 0 || predicate.target < 0 ||
+          predicate.target > predicate.operand)) ||
+        (*op == Int64EvaluatorOp::DivLessThan && predicate.operand == 0)) {
+        return std::nullopt;
+    }
+    auto owner = std::make_shared<Int64EvaluatorState>(Int64EvaluatorState{
+        source, *op, predicate.operand, predicate.target, true, true, {}});
+    PreparedCandidateEvaluator prepared;
+    prepared.owner = owner;
+    prepared.view.context = owner.get();
+    ConfigureInt64EvaluatorCallbacks(*op, prepared);
+    return prepared;
+}
+
+std::optional<PreparedCandidateEvaluator>
+PrepareFloatArithmeticCandidateEvaluator(
+    const FloatCandidateSourceView& source,
+    const FloatArithmeticCandidatePredicate& predicate) {
+    const bool has_contiguous_source = source.row_values != nullptr;
+    const bool has_chunked_source = source.chunk_values != nullptr &&
+                                    source.chunk_offsets != nullptr &&
+                                    source.num_chunks > 0;
+    const auto op = ToArithmeticEvaluatorOp(predicate.arithmetic_op);
+    if (!op.has_value() || *op == Int64EvaluatorOp::ModLessThan ||
+        source.row_count == 0 ||
+        (!has_contiguous_source && !has_chunked_source) ||
+        (*op == Int64EvaluatorOp::DivLessThan && predicate.operand == 0.0F)) {
+        return std::nullopt;
+    }
+    auto owner = std::make_shared<FloatEvaluatorState>(FloatEvaluatorState{
+        source,
+        *op,
+        predicate.operand,
+        predicate.target,
+        true,
+        true,
+        {}});
+    PreparedCandidateEvaluator prepared;
+    prepared.owner = owner;
+    prepared.view.context = owner.get();
+    prepared.view.eval_batch = &EvaluateFloatCandidates;
+    prepared.view.eval_contiguous = &EvaluateFloatContiguousCandidates;
+    prepared.eval_truth_batch = &EvaluateFloatTruth;
+    return prepared;
+}
+
+std::optional<PreparedCandidateEvaluator>
+PrepareInt64CandidateEvaluator(const Int64CandidateSourceView& source,
+                               const Int64CandidatePredicate& predicate) {
+    const bool has_contiguous_source = source.row_values != nullptr;
+    const bool has_chunked_source = source.chunk_values != nullptr &&
+                                    source.chunk_offsets != nullptr &&
+                                    source.num_chunks > 0;
+    const auto op = ToNumericEvaluatorOp(predicate.op);
+    if (!op.has_value() || source.row_count == 0 ||
         (!has_contiguous_source && !has_chunked_source)) {
         return std::nullopt;
     }
-    if (*op == Int64EvaluatorOp::ModLessThan &&
-        (predicate.arg0_ <= 0 || predicate.arg1_ < 0 ||
-         predicate.arg1_ > predicate.arg0_)) {
-        return std::nullopt;
-    }
-    if (*op == Int64EvaluatorOp::Term && predicate.int64_terms_.empty()) {
-        return std::nullopt;
-    }
-    if (*op == Int64EvaluatorOp::DivLessThan && predicate.arg0_ == 0) {
+    if (*op == Int64EvaluatorOp::Term && predicate.terms.empty()) {
         return std::nullopt;
     }
     auto owner = std::make_shared<Int64EvaluatorState>(
         Int64EvaluatorState{source,
                             *op,
-                            predicate.arg0_,
-                            predicate.arg1_,
-                            predicate.lower_inclusive_,
-                            predicate.upper_inclusive_,
-                            predicate.int64_terms_});
+                            predicate.arg0,
+                            predicate.arg1,
+                            predicate.lower_inclusive,
+                            predicate.upper_inclusive,
+                            predicate.terms});
     if (*op == Int64EvaluatorOp::Term) {
         std::sort(owner->terms.begin(), owner->terms.end());
         owner->terms.erase(
@@ -780,37 +1167,28 @@ PrepareInt64CandidateEvaluator(const Int64CandidateSourceView& source,
 
 std::optional<PreparedCandidateEvaluator>
 PrepareFloatCandidateEvaluator(const FloatCandidateSourceView& source,
-                               const CardinalDownpushPredicate& predicate) {
+                               const FloatCandidatePredicate& predicate) {
     const bool has_contiguous_source = source.row_values != nullptr;
     const bool has_chunked_source = source.chunk_values != nullptr &&
                                     source.chunk_offsets != nullptr &&
                                     source.num_chunks > 0;
-    const auto op = ToInt64EvaluatorOp(predicate.op_);
-    if (predicate.value_type_ != CardinalDownpushPredicateValueType::Float ||
-        !op.has_value() || *op == Int64EvaluatorOp::ModLessThan ||
-        source.row_count == 0 ||
+    const auto op = ToNumericEvaluatorOp(predicate.op);
+    if (!op.has_value() || source.row_count == 0 ||
         (!has_contiguous_source && !has_chunked_source)) {
         return std::nullopt;
     }
-    if (*op == Int64EvaluatorOp::Term && predicate.double_terms_.empty()) {
-        return std::nullopt;
-    }
-    if (*op == Int64EvaluatorOp::DivLessThan && predicate.double_arg0_ == 0.0) {
+    if (*op == Int64EvaluatorOp::Term && predicate.terms.empty()) {
         return std::nullopt;
     }
     auto owner = std::make_shared<FloatEvaluatorState>(
         FloatEvaluatorState{source,
                             *op,
-                            static_cast<float>(predicate.double_arg0_),
-                            static_cast<float>(predicate.double_arg1_),
-                            predicate.lower_inclusive_,
-                            predicate.upper_inclusive_,
-                            {}});
+                            predicate.arg0,
+                            predicate.arg1,
+                            predicate.lower_inclusive,
+                            predicate.upper_inclusive,
+                            predicate.terms});
     if (*op == Int64EvaluatorOp::Term) {
-        owner->terms.reserve(predicate.double_terms_.size());
-        for (const auto value : predicate.double_terms_) {
-            owner->terms.push_back(static_cast<float>(value));
-        }
         owner->terms.erase(
             std::remove_if(owner->terms.begin(),
                            owner->terms.end(),

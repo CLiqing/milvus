@@ -5,22 +5,21 @@
 
 #include <algorithm>
 #include <array>
-#include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <type_traits>
 
 #include "common/RegexQuery.h"
-#include "exec/expression/CandidateEvaluator.h"
+#include "exec/expression/StringCandidateEvaluator.h"
+#include "exec/operator/StringCandidateSourceOwner.h"
+#include "index/StringIndex.h"
+#include "log/Log.h"
+#include "segcore/SegmentInterface.h"
 
 namespace milvus::exec {
 namespace {
-
-enum class LikeTokenType : uint8_t {
-    Literal = 0,
-    AnyOne = 1,
-    AnyMany = 2,
-};
 
 enum class StringEvaluatorOp : uint8_t {
     GreaterEqual,
@@ -46,29 +45,22 @@ struct StringEvaluatorState {
 };
 
 std::optional<StringEvaluatorOp>
-ToStringEvaluatorOp(CardinalDownpushPredicateOp op) {
+ToStringEvaluatorOp(StringCandidateComparisonOp op) {
     switch (op) {
-        case CardinalDownpushPredicateOp::Int64GreaterEqual:
+        case StringCandidateComparisonOp::GreaterEqual:
             return StringEvaluatorOp::GreaterEqual;
-        case CardinalDownpushPredicateOp::Int64GreaterThan:
+        case StringCandidateComparisonOp::GreaterThan:
             return StringEvaluatorOp::GreaterThan;
-        case CardinalDownpushPredicateOp::Int64LessEqual:
+        case StringCandidateComparisonOp::LessEqual:
             return StringEvaluatorOp::LessEqual;
-        case CardinalDownpushPredicateOp::Int64LessThan:
+        case StringCandidateComparisonOp::LessThan:
             return StringEvaluatorOp::LessThan;
-        case CardinalDownpushPredicateOp::Int64Equal:
+        case StringCandidateComparisonOp::Equal:
             return StringEvaluatorOp::Equal;
-        case CardinalDownpushPredicateOp::Int64NotEqual:
+        case StringCandidateComparisonOp::NotEqual:
             return StringEvaluatorOp::NotEqual;
-        case CardinalDownpushPredicateOp::ScalarRange:
-            return StringEvaluatorOp::Range;
-        case CardinalDownpushPredicateOp::ScalarTerm:
-            return StringEvaluatorOp::Term;
-        case CardinalDownpushPredicateOp::StringLikeMatch:
-            return StringEvaluatorOp::Like;
-        default:
-            return std::nullopt;
     }
+    return std::nullopt;
 }
 
 bool
@@ -286,160 +278,322 @@ EvaluateStringContiguousCandidates(const void* context,
         context, candidate_ids.data(), count, active_mask, valid_mask);
 }
 
-class StringProvider final : public DownpushPredicateProvider {
- public:
-    bool
-    Supports(const expr::ColumnInfo& column) const override {
-        return (column.data_type_ == DataType::VARCHAR ||
-                column.data_type_ == DataType::STRING) &&
-               !column.element_level_ && column.nested_path_.empty();
-    }
+FieldId
+StringPredicateFieldId(const StringCandidatePredicate& predicate) {
+    return std::visit([](const auto& value) { return value.field_id; },
+                      predicate);
+}
 
-    CardinalDownpushPredicate
-    NewPredicate(const expr::ColumnInfo& column) const override {
-        CardinalDownpushPredicate predicate;
-        predicate.field_id_ = column.field_id_;
-        predicate.field_data_type_ = column.data_type_;
-        predicate.field_nullable_ = column.nullable_;
-        predicate.value_type_ = CardinalDownpushPredicateValueType::String;
-        return predicate;
-    }
+DataType
+StringPredicateFieldType(const StringCandidatePredicate& predicate) {
+    return std::visit([](const auto& value) { return value.field_data_type; },
+                      predicate);
+}
 
-    bool
-    SupportsRangeOp(CardinalDownpushPredicateOp op) const override {
-        return op != CardinalDownpushPredicateOp::Int64ModLessThan;
+std::optional<std::string_view>
+DictionaryLookupValue(const StringCandidatePredicate& predicate) {
+    const auto* comparison =
+        std::get_if<StringComparisonCandidatePredicate>(&predicate);
+    if (comparison == nullptr ||
+        (comparison->op != StringCandidateComparisonOp::Equal &&
+         comparison->op != StringCandidateComparisonOp::NotEqual)) {
+        return std::nullopt;
     }
+    return comparison->value;
+}
 
-    bool
-    FillArg(CardinalDownpushPredicate& predicate,
-            const proto::plan::GenericValue& value,
-            bool second_arg) const override {
-        if (value.val_case() != proto::plan::GenericValue::kStringVal) {
-            return false;
+std::optional<PreparedCandidateLeaf>
+PrepareStringPredicateLeaf(const segcore::SegmentInternalInterface* segment,
+                           OpContext* op_context,
+                           const void* typed_state) {
+    if (segment == nullptr || typed_state == nullptr ||
+        segment->type() != SegmentType::Sealed) {
+        return std::nullopt;
+    }
+    const auto& predicate =
+        *static_cast<const StringCandidatePredicate*>(typed_state);
+    const auto field_id = StringPredicateFieldId(predicate);
+    const auto field_type = StringPredicateFieldType(predicate);
+    if ((field_type != DataType::VARCHAR && field_type != DataType::STRING) ||
+        segment->get_schema()[field_id].get_data_type() != field_type) {
+        return std::nullopt;
+    }
+    const auto row_count = segment->get_row_count();
+    PreparedCandidateLeaf leaf;
+    if (segment->HasFieldData(field_id)) {
+        auto owner = std::make_shared<RawStringCandidateSourceOwner>();
+        const auto num_chunks = segment->num_chunk_data(field_id);
+        if (num_chunks <= 0) {
+            return std::nullopt;
         }
-        (second_arg ? predicate.string_arg1_ : predicate.string_arg0_) =
-            value.string_val();
-        return true;
-    }
-
-    bool
-    FillTerms(
-        CardinalDownpushPredicate& predicate,
-        const std::vector<proto::plan::GenericValue>& values) const override {
-        if (values.empty()) {
-            return false;
-        }
-        for (const auto& value : values) {
-            if (value.val_case() != proto::plan::GenericValue::kStringVal) {
-                return false;
+        owner->pins.reserve(num_chunks);
+        owner->chunk_bases.reserve(num_chunks);
+        owner->chunk_value_offsets.reserve(num_chunks);
+        owner->chunk_valid_data.reserve(num_chunks);
+        owner->chunk_row_counts.reserve(num_chunks);
+        owner->chunk_row_offsets.reserve(num_chunks + 1);
+        int64_t expected_row_offset = 0;
+        for (int64_t chunk_id = 0; chunk_id < num_chunks; ++chunk_id) {
+            const auto chunk_row_offset =
+                segment->num_rows_until_chunk(field_id, chunk_id);
+            if (chunk_row_offset != expected_row_offset) {
+                return std::nullopt;
             }
-            predicate.string_terms_.push_back(value.string_val());
-        }
-        std::sort(predicate.string_terms_.begin(),
-                  predicate.string_terms_.end());
-        predicate.string_terms_.erase(
-            std::unique(predicate.string_terms_.begin(),
-                        predicate.string_terms_.end()),
-            predicate.string_terms_.end());
-        return true;
-    }
-
-    bool
-    FinalizeUnary(CardinalDownpushPredicate& predicate) const override {
-        if (predicate.op_ != CardinalDownpushPredicateOp::StringLikeMatch) {
-            return true;
-        }
-        const auto& pattern = predicate.string_arg0_;
-        if (pattern.size() > std::numeric_limits<uint32_t>::max()) {
-            return false;
-        }
-        auto add_token = [&](LikeTokenType type, size_t offset, size_t size) {
-            predicate.like_token_offsets_.push_back(
-                static_cast<uint32_t>(offset));
-            predicate.like_token_sizes_.push_back(static_cast<uint32_t>(size));
-            predicate.like_token_types_.push_back(static_cast<uint8_t>(type));
-        };
-        for (size_t i = 0; i < pattern.size();) {
-            const auto c = pattern[i];
-            if (c == '\\') {
-                ++i;
-                if (i == pattern.size()) {
-                    return false;
-                }
-                const auto size = Utf8ValidatedCharByteLen(pattern.data() + i,
-                                                           pattern.size() - i);
-                add_token(LikeTokenType::Literal, i, size);
-                i += size;
-            } else if (c == '%') {
-                if (predicate.like_token_types_.empty() ||
-                    predicate.like_token_types_.back() !=
-                        static_cast<uint8_t>(LikeTokenType::AnyMany)) {
-                    add_token(LikeTokenType::AnyMany, i, 1);
-                }
-                ++i;
-            } else if (c == '_') {
-                add_token(LikeTokenType::AnyOne, i, 1);
-                ++i;
-            } else {
-                const auto size = Utf8ValidatedCharByteLen(pattern.data() + i,
-                                                           pattern.size() - i);
-                add_token(LikeTokenType::Literal, i, size);
-                i += size;
+            auto pin =
+                segment->raw_string_chunk_view(op_context, field_id, chunk_id);
+            const auto view = pin.get();
+            if (view.base == nullptr || view.offsets == nullptr ||
+                view.row_count == 0 || expected_row_offset > row_count ||
+                static_cast<int64_t>(view.row_count) >
+                    row_count - expected_row_offset) {
+                return std::nullopt;
             }
+            owner->chunk_row_offsets.push_back(chunk_row_offset);
+            owner->chunk_bases.push_back(view.base);
+            owner->chunk_value_offsets.push_back(view.offsets);
+            owner->chunk_valid_data.push_back(view.valid_data);
+            owner->chunk_row_counts.push_back(view.row_count);
+            owner->pins.push_back(std::move(pin));
+            expected_row_offset += view.row_count;
         }
-        return true;
+        if (expected_row_offset != row_count) {
+            return std::nullopt;
+        }
+        owner->chunk_row_offsets.push_back(row_count);
+        const auto uniform_rows = owner->chunk_row_counts.front();
+        bool uniform = uniform_rows > 0;
+        for (size_t i = 1; i + 1 < owner->chunk_row_counts.size(); ++i) {
+            uniform = uniform && owner->chunk_row_counts[i] == uniform_rows;
+        }
+        if (owner->chunk_row_counts.back() > uniform_rows) {
+            uniform = false;
+        }
+        owner->uniform_chunk_rows = uniform ? uniform_rows : 0;
+        auto evaluator = PrepareStringCandidateEvaluator(
+            owner->view(static_cast<size_t>(row_count)), predicate);
+        if (!evaluator.has_value()) {
+            return std::nullopt;
+        }
+        leaf.evaluator = std::move(*evaluator);
+        leaf.resource_owners.push_back(std::move(owner));
+        return leaf;
     }
 
-    bool
-    FillArithmetic(CardinalDownpushPredicate&,
-                   const expr::BinaryArithOpEvalRangeExpr&) const override {
-        return false;
+    const auto dictionary_value = DictionaryLookupValue(predicate);
+    if (!dictionary_value.has_value() || !segment->HasIndex(field_id)) {
+        return std::nullopt;
     }
-};
+    auto pins = segment->PinIndex(op_context, field_id);
+    if (pins.size() != 1) {
+        return std::nullopt;
+    }
+    const auto* string_index =
+        dynamic_cast<const index::StringIndex*>(pins.front().get());
+    if (string_index == nullptr) {
+        return std::nullopt;
+    }
+    auto dictionary = string_index->GetDictionaryIdColumnView(
+        std::string(*dictionary_value));
+    if (!dictionary.has_value() || dictionary->row_value_ids == nullptr ||
+        dictionary->row_count != static_cast<size_t>(row_count)) {
+        return std::nullopt;
+    }
+    auto owner = std::make_shared<StringDictionaryCandidateSourceOwner>();
+    owner->row_dictionary_ids = dictionary->row_value_ids;
+    owner->row_count = dictionary->row_count;
+    owner->target_dictionary_id = dictionary->target_dictionary_id;
+    owner->target_dictionary_id_found =
+        dictionary->target_dictionary_id_found;
+    owner->index_pins = std::move(pins);
+    auto evaluator = PrepareStringCandidateEvaluator(owner->view(), predicate);
+    if (!evaluator.has_value()) {
+        return std::nullopt;
+    }
+    leaf.evaluator = std::move(*evaluator);
+    leaf.resource_owners.push_back(std::move(owner));
+    return leaf;
+}
 
 }  // namespace
 
-const DownpushPredicateProvider&
-StringDownpushPredicateProvider() {
-    static const StringProvider provider;
-    return provider;
+std::optional<CandidateLeafPlan>
+TryCompileStringCandidateLeaf(const expr::TypedExprPtr& expression) {
+    if (expression == nullptr) {
+        return std::nullopt;
+    }
+    auto supported = [](const expr::ColumnInfo& column) {
+        return (column.data_type_ == DataType::VARCHAR ||
+                column.data_type_ == DataType::STRING) &&
+               !column.element_level_ && column.nested_path_.empty();
+    };
+    auto as_string = [](const proto::plan::GenericValue& value)
+        -> std::optional<std::string> {
+        if (value.val_case() != proto::plan::GenericValue::kStringVal) {
+            return std::nullopt;
+        }
+        return value.string_val();
+    };
+    auto make_plan = [](StringCandidatePredicate predicate) {
+        auto state =
+            std::make_shared<StringCandidatePredicate>(std::move(predicate));
+        return CandidateLeafPlan{std::move(state), &PrepareStringPredicateLeaf};
+    };
+
+    if (auto unary =
+            std::dynamic_pointer_cast<const expr::UnaryRangeFilterExpr>(
+                expression)) {
+        const auto& column = unary->column_;
+        auto value = as_string(unary->val_);
+        if (!supported(column) || !value.has_value()) {
+            return std::nullopt;
+        }
+        auto comparison_op = [&]()
+            -> std::optional<StringCandidateComparisonOp> {
+            switch (unary->op_type_) {
+                case proto::plan::OpType::GreaterEqual:
+                    return StringCandidateComparisonOp::GreaterEqual;
+                case proto::plan::OpType::GreaterThan:
+                    return StringCandidateComparisonOp::GreaterThan;
+                case proto::plan::OpType::LessEqual:
+                    return StringCandidateComparisonOp::LessEqual;
+                case proto::plan::OpType::LessThan:
+                    return StringCandidateComparisonOp::LessThan;
+                case proto::plan::OpType::Equal:
+                    return StringCandidateComparisonOp::Equal;
+                case proto::plan::OpType::NotEqual:
+                    return StringCandidateComparisonOp::NotEqual;
+                default:
+                    return std::nullopt;
+            }
+        }();
+        if (comparison_op.has_value()) {
+            return make_plan(StringComparisonCandidatePredicate{
+                column.field_id_, column.data_type_, column.nullable_,
+                *comparison_op, std::move(*value)});
+        }
+
+        std::string pattern;
+        if (unary->op_type_ == proto::plan::OpType::Match) {
+            pattern = std::move(*value);
+        } else if (unary->op_type_ == proto::plan::OpType::PrefixMatch ||
+                   unary->op_type_ == proto::plan::OpType::PostfixMatch ||
+                   unary->op_type_ == proto::plan::OpType::InnerMatch) {
+            for (const char c : *value) {
+                if (c == '%' || c == '_' || c == '\\') {
+                    pattern.push_back('\\');
+                }
+                pattern.push_back(c);
+            }
+            if (unary->op_type_ != proto::plan::OpType::PrefixMatch) {
+                pattern.insert(pattern.begin(), '%');
+            }
+            if (unary->op_type_ != proto::plan::OpType::PostfixMatch) {
+                pattern.push_back('%');
+            }
+        } else {
+            return std::nullopt;
+        }
+        try {
+            LikePatternMatcher validation(pattern);
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+        return make_plan(StringLikeCandidatePredicate{column.field_id_,
+                                                      column.data_type_,
+                                                      column.nullable_,
+                                                      std::move(pattern)});
+    }
+
+    if (auto range =
+            std::dynamic_pointer_cast<const expr::BinaryRangeFilterExpr>(
+                expression)) {
+        const auto& column = range->column_;
+        auto lower = as_string(range->lower_val_);
+        auto upper = as_string(range->upper_val_);
+        if (!supported(column) || !lower.has_value() || !upper.has_value()) {
+            return std::nullopt;
+        }
+        return make_plan(StringRangeCandidatePredicate{column.field_id_,
+                                                       column.data_type_,
+                                                       column.nullable_,
+                                                       std::move(*lower),
+                                                       std::move(*upper),
+                                                       range->lower_inclusive_,
+                                                       range->upper_inclusive_});
+    }
+
+    auto term =
+        std::dynamic_pointer_cast<const expr::TermFilterExpr>(expression);
+    if (term == nullptr || !supported(term->column_) || term->vals_.empty()) {
+        return std::nullopt;
+    }
+    std::vector<std::string> terms;
+    terms.reserve(term->vals_.size());
+    for (const auto& value : term->vals_) {
+        auto converted = as_string(value);
+        if (!converted.has_value()) {
+            return std::nullopt;
+        }
+        terms.push_back(std::move(*converted));
+    }
+    std::sort(terms.begin(), terms.end());
+    terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
+    return make_plan(StringTermCandidatePredicate{term->column_.field_id_,
+                                                  term->column_.data_type_,
+                                                  term->column_.nullable_,
+                                                  std::move(terms)});
 }
 
 std::optional<PreparedCandidateEvaluator>
 PrepareStringCandidateEvaluator(const StringCandidateSourceView& source,
-                                const CardinalDownpushPredicate& predicate) {
-    const auto op = ToStringEvaluatorOp(predicate.op_);
+                                const StringCandidatePredicate& predicate) {
+    auto owner = std::make_shared<StringEvaluatorState>();
+    owner->source = source;
+    std::visit(
+        [&](const auto& value) {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T,
+                                         StringComparisonCandidatePredicate>) {
+                owner->op = *ToStringEvaluatorOp(value.op);
+                owner->arg0 = value.value;
+            } else if constexpr (std::is_same_v<
+                                     T, StringRangeCandidatePredicate>) {
+                owner->op = StringEvaluatorOp::Range;
+                owner->arg0 = value.lower;
+                owner->arg1 = value.upper;
+                owner->lower_inclusive = value.lower_inclusive;
+                owner->upper_inclusive = value.upper_inclusive;
+            } else if constexpr (std::is_same_v<T,
+                                                StringTermCandidatePredicate>) {
+                owner->op = StringEvaluatorOp::Term;
+                owner->terms = value.terms;
+            } else {
+                owner->op = StringEvaluatorOp::Like;
+                owner->arg0 = value.pattern;
+            }
+        },
+        predicate);
     const bool has_raw_source = source.chunk_bases != nullptr &&
                                 source.chunk_value_offsets != nullptr &&
                                 source.chunk_row_counts != nullptr &&
                                 source.chunk_row_offsets != nullptr &&
                                 source.num_chunks > 0;
-    const bool dictionary_op =
-        op.has_value() &&
-        (*op == StringEvaluatorOp::Equal || *op == StringEvaluatorOp::NotEqual);
+    const bool dictionary_op = owner->op == StringEvaluatorOp::Equal ||
+                               owner->op == StringEvaluatorOp::NotEqual;
     const bool has_dictionary_source =
         source.row_dictionary_ids != nullptr && dictionary_op;
-    if (predicate.value_type_ != CardinalDownpushPredicateValueType::String ||
-        !op.has_value() || source.row_count == 0 ||
+    if (source.row_count == 0 ||
         (!has_raw_source && !has_dictionary_source) ||
-        (*op == StringEvaluatorOp::Term && predicate.string_terms_.empty())) {
+        (owner->op == StringEvaluatorOp::Term && owner->terms.empty())) {
         return std::nullopt;
     }
-    auto owner = std::make_shared<StringEvaluatorState>();
-    owner->source = source;
-    owner->op = *op;
-    owner->arg0 = predicate.string_arg0_;
-    owner->arg1 = predicate.string_arg1_;
-    owner->lower_inclusive = predicate.lower_inclusive_;
-    owner->upper_inclusive = predicate.upper_inclusive_;
-    owner->terms = predicate.string_terms_;
-    if (*op == StringEvaluatorOp::Term) {
+    if (owner->op == StringEvaluatorOp::Term) {
         std::sort(owner->terms.begin(), owner->terms.end());
         owner->terms.erase(
             std::unique(owner->terms.begin(), owner->terms.end()),
             owner->terms.end());
     }
-    if (*op == StringEvaluatorOp::Like) {
+    if (owner->op == StringEvaluatorOp::Like) {
         try {
             // Reuse the same prepared matcher as the baseline String
             // expression path.  Cardinal receives only the generic batch

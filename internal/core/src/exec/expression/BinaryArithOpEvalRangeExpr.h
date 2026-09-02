@@ -23,6 +23,7 @@
 #include "common/Types.h"
 #include "common/Vector.h"
 #include "exec/expression/Expr.h"
+#include "exec/expression/BinaryArithOpEvalRangeExprUtils.h"
 #include "segcore/SegmentInterface.h"
 #include "exec/expression/Element.h"
 
@@ -224,27 +225,10 @@ struct ArithOpElementFunc {
                                               arith_op));
                     }
                 } else if constexpr (cmp_op == proto::plan::OpType::LessThan) {
-                    if constexpr (arith_op == proto::plan::ArithOpType::Add) {
-                        res[i] = (src[offset] + right_operand) < val;
-                    } else if constexpr (arith_op ==
-                                         proto::plan::ArithOpType::Sub) {
-                        res[i] = (src[offset] - right_operand) < val;
-                    } else if constexpr (arith_op ==
-                                         proto::plan::ArithOpType::Mul) {
-                        res[i] = (src[offset] * right_operand) < val;
-                    } else if constexpr (arith_op ==
-                                         proto::plan::ArithOpType::Div) {
-                        res[i] = (src[offset] / right_operand) < val;
-                    } else if constexpr (arith_op ==
-                                         proto::plan::ArithOpType::Mod) {
-                        res[i] =
-                            (long(src[offset]) % long(right_operand)) < val;
-                    } else {
-                        ThrowInfo(OpTypeInvalid,
-                                  fmt::format("unsupported arith type:{} for "
-                                              "ArithOpElementFunc",
-                                              arith_op));
-                    }
+                    res[i] = EvaluateNumericArithmeticLessThan<arith_op>(
+                        static_cast<HighPrecisonType>(src[offset]),
+                        right_operand,
+                        val);
                 } else if constexpr (cmp_op == proto::plan::OpType::LessEqual) {
                     if constexpr (arith_op == proto::plan::ArithOpType::Add) {
                         res[i] = (src[offset] + right_operand) <= val;

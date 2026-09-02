@@ -3,57 +3,26 @@
 
 #pragma once
 
-#include <memory>
 #include <optional>
 
-#include "common/Downpush.h"
+#include "exec/operator/DownpushSearchContext.h"
 #include "expr/ITypeExpr.h"
 
 namespace milvus::exec {
 
-// Type-owned conversion boundary for ANN filter fusing. The pipeline owns
-// expression composition; numeric, varchar, JSON and future value families
-// own literal conversion and operator capability here.
-class DownpushPredicateProvider {
- public:
-    virtual ~DownpushPredicateProvider() = default;
+// Numeric arithmetic owns its typed lowering and preparation. The returned
+// leaf is opaque to the logical fusing pipeline.
+std::optional<CandidateLeafPlan>
+TryCompileNumericArithmeticCandidateLeaf(
+    const expr::BinaryArithOpEvalRangeExpr& expression);
 
-    virtual bool
-    Supports(const expr::ColumnInfo& column) const = 0;
+// Numeric comparison/range/TERM lowering is entirely type-owned.  The
+// generic FilterBits composer neither maps Numeric operators nor stores their
+// literals.
+std::optional<CandidateLeafPlan>
+TryCompileNumericCandidateLeaf(const expr::TypedExprPtr& expression);
 
-    virtual CardinalDownpushPredicate
-    NewPredicate(const expr::ColumnInfo& column) const = 0;
-
-    virtual bool
-    SupportsRangeOp(CardinalDownpushPredicateOp op) const = 0;
-
-    virtual bool
-    FillArg(CardinalDownpushPredicate& predicate,
-            const proto::plan::GenericValue& value,
-            bool second_arg) const = 0;
-
-    virtual bool
-    FillTerms(CardinalDownpushPredicate& predicate,
-              const std::vector<proto::plan::GenericValue>& values) const = 0;
-
-    virtual bool
-    FinalizeUnary(CardinalDownpushPredicate& predicate) const {
-        return true;
-    }
-
-    virtual bool
-    FillArithmetic(
-        CardinalDownpushPredicate& predicate,
-        const expr::BinaryArithOpEvalRangeExpr& expression) const = 0;
-};
-
-const DownpushPredicateProvider*
-FindDownpushPredicateProvider(const expr::ColumnInfo& column);
-
-const DownpushPredicateProvider&
-NumericDownpushPredicateProvider();
-
-const DownpushPredicateProvider&
-StringDownpushPredicateProvider();
+std::optional<CandidateLeafPlan>
+TryCompileStringCandidateLeaf(const expr::TypedExprPtr& expression);
 
 }  // namespace milvus::exec

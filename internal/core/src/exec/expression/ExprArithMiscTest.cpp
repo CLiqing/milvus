@@ -49,6 +49,8 @@
 #include "exec/Task.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/CandidateEvaluator.h"
+#include "exec/expression/NumericCandidateEvaluator.h"
+#include "exec/expression/StringCandidateEvaluator.h"
 #include "expr/ITypeExpr.h"
 #include "gtest/gtest.h"
 #include "index/BitmapIndex.h"
@@ -164,7 +166,7 @@ TEST(CandidateEvaluatorTest, Int64ComparisonRangeAndTermStayMilvusOwned) {
     chunked.num_chunks = chunks.size();
 
     struct TestCase {
-        CardinalDownpushPredicateOp op;
+        exec::NumericCandidatePredicateOp op;
         int64_t arg0;
         int64_t arg1;
         bool lower_inclusive;
@@ -172,43 +174,43 @@ TEST(CandidateEvaluatorTest, Int64ComparisonRangeAndTermStayMilvusOwned) {
         std::function<bool(int64_t)> expected;
     };
     const std::vector<TestCase> cases = {
-        {CardinalDownpushPredicateOp::Int64GreaterEqual,
+        {exec::NumericCandidatePredicateOp::GreaterEqual,
          3,
          0,
          true,
          true,
          [](int64_t v) { return v >= 3; }},
-        {CardinalDownpushPredicateOp::Int64GreaterThan,
+        {exec::NumericCandidatePredicateOp::GreaterThan,
          3,
          0,
          true,
          true,
          [](int64_t v) { return v > 3; }},
-        {CardinalDownpushPredicateOp::Int64LessEqual,
+        {exec::NumericCandidatePredicateOp::LessEqual,
          3,
          0,
          true,
          true,
          [](int64_t v) { return v <= 3; }},
-        {CardinalDownpushPredicateOp::Int64LessThan,
+        {exec::NumericCandidatePredicateOp::LessThan,
          3,
          0,
          true,
          true,
          [](int64_t v) { return v < 3; }},
-        {CardinalDownpushPredicateOp::Int64Equal,
+        {exec::NumericCandidatePredicateOp::Equal,
          3,
          0,
          true,
          true,
          [](int64_t v) { return v == 3; }},
-        {CardinalDownpushPredicateOp::Int64NotEqual,
+        {exec::NumericCandidatePredicateOp::NotEqual,
          3,
          0,
          true,
          true,
          [](int64_t v) { return v != 3; }},
-        {CardinalDownpushPredicateOp::ScalarRange,
+        {exec::NumericCandidatePredicateOp::Range,
          -1,
          4,
          false,
@@ -217,13 +219,12 @@ TEST(CandidateEvaluatorTest, Int64ComparisonRangeAndTermStayMilvusOwned) {
     };
 
     for (const auto& test_case : cases) {
-        CardinalDownpushPredicate predicate;
-        predicate.value_type_ = CardinalDownpushPredicateValueType::Int64;
-        predicate.op_ = test_case.op;
-        predicate.arg0_ = test_case.arg0;
-        predicate.arg1_ = test_case.arg1;
-        predicate.lower_inclusive_ = test_case.lower_inclusive;
-        predicate.upper_inclusive_ = test_case.upper_inclusive;
+        exec::Int64CandidatePredicate predicate;
+        predicate.op = test_case.op;
+        predicate.arg0 = test_case.arg0;
+        predicate.arg1 = test_case.arg1;
+        predicate.lower_inclusive = test_case.lower_inclusive;
+        predicate.upper_inclusive = test_case.upper_inclusive;
 
         uint64_t reference_mask = 0;
         for (size_t lane = 0; lane < row_ids.size(); ++lane) {
@@ -247,10 +248,9 @@ TEST(CandidateEvaluatorTest, Int64ComparisonRangeAndTermStayMilvusOwned) {
         }
     }
 
-    CardinalDownpushPredicate term;
-    term.value_type_ = CardinalDownpushPredicateValueType::Int64;
-    term.op_ = CardinalDownpushPredicateOp::ScalarTerm;
-    term.int64_terms_ = {-8, 1, 4, 13};
+    exec::Int64CandidatePredicate term;
+    term.op = exec::NumericCandidatePredicateOp::Term;
+    term.terms = {-8, 1, 4, 13};
     auto prepared = exec::PrepareInt64CandidateEvaluator(contiguous, term);
     ASSERT_TRUE(prepared.has_value());
     uint64_t valid_mask = 0;
@@ -262,15 +262,15 @@ TEST(CandidateEvaluatorTest, Int64ComparisonRangeAndTermStayMilvusOwned) {
               0);
     uint64_t expected_mask = 0;
     for (size_t lane = 0; lane < row_ids.size(); ++lane) {
-        if (std::binary_search(term.int64_terms_.begin(),
-                               term.int64_terms_.end(),
+        if (std::binary_search(term.terms.begin(),
+                               term.terms.end(),
                                values[row_ids[lane]])) {
             expected_mask |= uint64_t{1} << lane;
         }
     }
     EXPECT_EQ(valid_mask, expected_mask);
 
-    term.int64_terms_.clear();
+    term.terms.clear();
     EXPECT_FALSE(
         exec::PrepareInt64CandidateEvaluator(contiguous, term).has_value());
 }
@@ -301,8 +301,7 @@ TEST(CandidateEvaluatorTest, StringComparisonRangeAndTermStayMilvusOwned) {
     source.row_count = 6;
     source.uniform_chunk_rows = 3;
 
-    auto evaluate = [&](CardinalDownpushPredicate predicate) {
-        predicate.value_type_ = CardinalDownpushPredicateValueType::String;
+    auto evaluate = [&](exec::StringCandidatePredicate predicate) {
         auto prepared =
             exec::PrepareStringCandidateEvaluator(source, predicate);
         EXPECT_TRUE(prepared.has_value());
@@ -316,23 +315,29 @@ TEST(CandidateEvaluatorTest, StringComparisonRangeAndTermStayMilvusOwned) {
         return valid_mask;
     };
 
-    CardinalDownpushPredicate equal;
-    equal.op_ = CardinalDownpushPredicateOp::Int64Equal;
-    equal.string_arg0_ = "dog";
+    exec::StringCandidatePredicate equal =
+        exec::StringComparisonCandidatePredicate{
+            FieldId{},
+            DataType::VARCHAR,
+            false,
+            exec::StringCandidateComparisonOp::Equal,
+            "dog"};
     EXPECT_EQ(evaluate(equal), uint64_t{1} << 2);
 
-    CardinalDownpushPredicate range;
-    range.op_ = CardinalDownpushPredicateOp::ScalarRange;
-    range.string_arg0_ = "cat";
-    range.string_arg1_ = "fox";
-    range.lower_inclusive_ = true;
-    range.upper_inclusive_ = false;
+    exec::StringCandidatePredicate range =
+        exec::StringRangeCandidatePredicate{FieldId{},
+                                            DataType::VARCHAR,
+                                            false,
+                                            "cat",
+                                            "fox",
+                                            true,
+                                            false};
     EXPECT_EQ(evaluate(range),
               (uint64_t{1} << 2) | (uint64_t{1} << 4) | (uint64_t{1} << 5));
 
-    CardinalDownpushPredicate term;
-    term.op_ = CardinalDownpushPredicateOp::ScalarTerm;
-    term.string_terms_ = {"fox", "ant"};
+    exec::StringCandidatePredicate term =
+        exec::StringTermCandidatePredicate{
+            FieldId{}, DataType::VARCHAR, false, {"fox", "ant"}};
     EXPECT_EQ(evaluate(term), (uint64_t{1} << 0) | (uint64_t{1} << 1));
 
     static constexpr std::array<int32_t, 4> dictionary_ids = {1, -1, 2, 1};
@@ -342,7 +347,6 @@ TEST(CandidateEvaluatorTest, StringComparisonRangeAndTermStayMilvusOwned) {
     dictionary.target_dictionary_id = 1;
     dictionary.target_dictionary_id_found = true;
     static constexpr std::array<int64_t, 4> dictionary_rows = {0, 1, 2, 3};
-    equal.value_type_ = CardinalDownpushPredicateValueType::String;
     auto prepared = exec::PrepareStringCandidateEvaluator(dictionary, equal);
     ASSERT_TRUE(prepared.has_value());
     uint64_t valid_mask = 0;
@@ -355,16 +359,15 @@ TEST(CandidateEvaluatorTest, StringComparisonRangeAndTermStayMilvusOwned) {
         0);
     EXPECT_EQ(valid_mask, (uint64_t{1} << 0) | (uint64_t{1} << 3));
 
-    CardinalDownpushPredicate like;
-    like.value_type_ = CardinalDownpushPredicateValueType::String;
-    like.op_ = CardinalDownpushPredicateOp::StringLikeMatch;
-    like.string_arg0_ = "_o%";
+    exec::StringCandidatePredicate like =
+        exec::StringLikeCandidatePredicate{
+            FieldId{}, DataType::VARCHAR, false, "_o%"};
     EXPECT_EQ(evaluate(like), (uint64_t{1} << 0) | (uint64_t{1} << 2));
 
-    like.string_arg0_ = "d\\%g";
+    std::get<exec::StringLikeCandidatePredicate>(like).pattern = "d\\%g";
     EXPECT_EQ(evaluate(like), uint64_t{0});
 
-    like.string_arg0_ = "broken\\";
+    std::get<exec::StringLikeCandidatePredicate>(like).pattern = "broken\\";
     EXPECT_FALSE(
         exec::PrepareStringCandidateEvaluator(source, like).has_value());
 }
@@ -395,10 +398,11 @@ TEST(CandidateEvaluatorTest, StringLikePreservesUtf8AndEscapeSemantics) {
     source.uniform_chunk_rows = values.size();
 
     auto evaluate = [&](std::string pattern) {
-        CardinalDownpushPredicate like;
-        like.value_type_ = CardinalDownpushPredicateValueType::String;
-        like.op_ = CardinalDownpushPredicateOp::StringLikeMatch;
-        like.string_arg0_ = std::move(pattern);
+        exec::StringCandidatePredicate like =
+            exec::StringLikeCandidatePredicate{FieldId{},
+                                               DataType::VARCHAR,
+                                               false,
+                                               std::move(pattern)};
         auto prepared = exec::PrepareStringCandidateEvaluator(source, like);
         EXPECT_TRUE(prepared.has_value());
         uint64_t valid_mask = 0;
@@ -431,10 +435,9 @@ TEST(CandidateEvaluatorTest, LogicalComposerPreservesThreeValuedSemantics) {
     numeric_source.row_values = numeric_values.data();
     numeric_source.row_count = numeric_values.size();
 
-    CardinalDownpushPredicate greater_equal;
-    greater_equal.value_type_ = CardinalDownpushPredicateValueType::Int64;
-    greater_equal.op_ = CardinalDownpushPredicateOp::Int64GreaterEqual;
-    greater_equal.arg0_ = 3;
+    exec::Int64CandidatePredicate greater_equal;
+    greater_equal.op = exec::NumericCandidatePredicateOp::GreaterEqual;
+    greater_equal.arg0 = 3;
     auto ge =
         exec::PrepareInt64CandidateEvaluator(numeric_source, greater_equal);
     ASSERT_TRUE(ge.has_value());
@@ -444,18 +447,20 @@ TEST(CandidateEvaluatorTest, LogicalComposerPreservesThreeValuedSemantics) {
     string_source.row_dictionary_ids = dictionary_ids.data();
     string_source.target_dictionary_id = 0;
     string_source.target_dictionary_id_found = true;
-    CardinalDownpushPredicate string_equal;
-    string_equal.value_type_ = CardinalDownpushPredicateValueType::String;
-    string_equal.op_ = CardinalDownpushPredicateOp::Int64Equal;
-    string_equal.string_arg0_ = "x";
+    exec::StringCandidatePredicate string_equal =
+        exec::StringComparisonCandidatePredicate{
+            FieldId{},
+            DataType::VARCHAR,
+            true,
+            exec::StringCandidateComparisonOp::Equal,
+            "x"};
     auto eq =
         exec::PrepareStringCandidateEvaluator(string_source, string_equal);
     ASSERT_TRUE(eq.has_value());
 
-    CardinalDownpushPredicate equal_zero;
-    equal_zero.value_type_ = CardinalDownpushPredicateValueType::Int64;
-    equal_zero.op_ = CardinalDownpushPredicateOp::Int64Equal;
-    equal_zero.arg0_ = 0;
+    exec::Int64CandidatePredicate equal_zero;
+    equal_zero.op = exec::NumericCandidatePredicateOp::Equal;
+    equal_zero.arg0 = 0;
     auto zero =
         exec::PrepareInt64CandidateEvaluator(numeric_source, equal_zero);
     ASSERT_TRUE(zero.has_value());
@@ -499,37 +504,39 @@ TEST(CandidateEvaluatorTest, Int64ArithmeticUsesWideIntermediate) {
     source.row_count = values.size();
 
     struct TestCase {
-        CardinalDownpushPredicateOp op;
+        proto::plan::ArithOpType op;
         int64_t operand;
         int64_t threshold;
         std::function<bool(int64_t)> expected;
     };
     const std::vector<TestCase> cases = {
-        {CardinalDownpushPredicateOp::ScalarAddLessThan,
+        {proto::plan::ArithOpType::Add,
          9,
          50,
          [](int64_t v) { return static_cast<__int128>(v) + 9 < 50; }},
-        {CardinalDownpushPredicateOp::ScalarSubLessThan,
+        {proto::plan::ArithOpType::Sub,
          -9,
          50,
          [](int64_t v) { return static_cast<__int128>(v) - (-9) < 50; }},
-        {CardinalDownpushPredicateOp::ScalarMulLessThan,
+        {proto::plan::ArithOpType::Mul,
          3,
          50,
          [](int64_t v) { return static_cast<__int128>(v) * 3 < 50; }},
-        {CardinalDownpushPredicateOp::ScalarDivLessThan,
+        {proto::plan::ArithOpType::Div,
          -1,
          50,
          [](int64_t v) { return static_cast<__int128>(v) / (-1) < 50; }},
     };
 
     for (const auto& test_case : cases) {
-        CardinalDownpushPredicate predicate;
-        predicate.value_type_ = CardinalDownpushPredicateValueType::Int64;
-        predicate.op_ = test_case.op;
-        predicate.arg0_ = test_case.operand;
-        predicate.arg1_ = test_case.threshold;
-        auto prepared = exec::PrepareInt64CandidateEvaluator(source, predicate);
+        exec::Int64ArithmeticCandidatePredicate predicate{
+            FieldId{},
+            DataType::INT64,
+            test_case.op,
+            test_case.operand,
+            test_case.threshold};
+        auto prepared = exec::PrepareInt64ArithmeticCandidateEvaluator(
+            source, predicate);
         ASSERT_TRUE(prepared.has_value());
         uint64_t valid_mask = 0;
         EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
@@ -547,11 +554,14 @@ TEST(CandidateEvaluatorTest, Int64ArithmeticUsesWideIntermediate) {
         EXPECT_EQ(valid_mask, expected_mask);
     }
 
-    CardinalDownpushPredicate divide_by_zero;
-    divide_by_zero.value_type_ = CardinalDownpushPredicateValueType::Int64;
-    divide_by_zero.op_ = CardinalDownpushPredicateOp::ScalarDivLessThan;
-    divide_by_zero.arg0_ = 0;
-    EXPECT_FALSE(exec::PrepareInt64CandidateEvaluator(source, divide_by_zero)
+    exec::Int64ArithmeticCandidatePredicate divide_by_zero{
+        FieldId{},
+        DataType::INT64,
+        proto::plan::ArithOpType::Div,
+        0,
+        1};
+    EXPECT_FALSE(exec::PrepareInt64ArithmeticCandidateEvaluator(
+                     source, divide_by_zero)
                      .has_value());
 }
 
@@ -579,7 +589,7 @@ TEST(CandidateEvaluatorTest, FloatLeavesPreserveIeeeSemantics) {
     chunked.chunk_offsets = chunk_offsets.data();
     chunked.num_chunks = chunks.size();
 
-    auto check = [&](CardinalDownpushPredicate predicate,
+    auto check = [&](exec::FloatCandidatePredicate predicate,
                      const std::function<bool(float)>& expected) {
         for (const auto& source : {contiguous, chunked}) {
             auto prepared =
@@ -602,39 +612,70 @@ TEST(CandidateEvaluatorTest, FloatLeavesPreserveIeeeSemantics) {
         }
     };
 
-    CardinalDownpushPredicate predicate;
-    predicate.value_type_ = CardinalDownpushPredicateValueType::Float;
-    predicate.op_ = CardinalDownpushPredicateOp::Int64NotEqual;
-    predicate.double_arg0_ = 3.5;
+    exec::FloatCandidatePredicate predicate;
+    predicate.op = exec::NumericCandidatePredicateOp::NotEqual;
+    predicate.arg0 = 3.5F;
     check(predicate, [](float value) { return value != 3.5; });
 
-    predicate.op_ = CardinalDownpushPredicateOp::ScalarRange;
-    predicate.double_arg0_ = -3.5;
-    predicate.double_arg1_ = 3.5;
-    predicate.lower_inclusive_ = false;
-    predicate.upper_inclusive_ = true;
+    predicate.op = exec::NumericCandidatePredicateOp::Range;
+    predicate.arg0 = -3.5F;
+    predicate.arg1 = 3.5F;
+    predicate.lower_inclusive = false;
+    predicate.upper_inclusive = true;
     check(predicate, [](float value) { return value > -3.5 && value <= 3.5; });
 
-    predicate.op_ = CardinalDownpushPredicateOp::ScalarTerm;
-    predicate.double_terms_ = {
-        std::numeric_limits<double>::quiet_NaN(), -3.5, 0.0, 8.0};
+    predicate.op = exec::NumericCandidatePredicateOp::Term;
+    predicate.terms = {
+        std::numeric_limits<float>::quiet_NaN(), -3.5F, 0.0F, 8.0F};
     check(predicate, [](float value) {
         return value == -3.5F || value == 0.0F || value == 8.0F;
     });
 
-    predicate.double_terms_.clear();
-    predicate.op_ = CardinalDownpushPredicateOp::ScalarAddLessThan;
-    predicate.double_arg0_ = 2.0;
-    predicate.double_arg1_ = 5.0;
-    check(predicate, [](float value) { return value + 2.0F < 5.0F; });
+    auto check_arithmetic =
+        [&](exec::FloatArithmeticCandidatePredicate arithmetic,
+            const std::function<bool(float)>& expected) {
+            for (const auto& source : {contiguous, chunked}) {
+                auto prepared =
+                    exec::PrepareFloatArithmeticCandidateEvaluator(
+                        source, arithmetic);
+                ASSERT_TRUE(prepared.has_value());
+                uint64_t valid_mask = 0;
+                EXPECT_EQ(prepared->view.eval_batch(prepared->view.context,
+                                                    row_ids.data(),
+                                                    row_ids.size(),
+                                                    UINT64_MAX,
+                                                    &valid_mask),
+                          0);
+                uint64_t expected_mask = 0;
+                for (size_t lane = 0; lane < row_ids.size(); ++lane) {
+                    if (expected(values[row_ids[lane]])) {
+                        expected_mask |= uint64_t{1} << lane;
+                    }
+                }
+                EXPECT_EQ(valid_mask, expected_mask);
+            }
+        };
+    check_arithmetic({FieldId{},
+                      DataType::FLOAT,
+                      proto::plan::ArithOpType::Add,
+                      2.0F,
+                      5.0F},
+                     [](float value) { return value + 2.0F < 5.0F; });
+    check_arithmetic({FieldId{},
+                      DataType::FLOAT,
+                      proto::plan::ArithOpType::Div,
+                      -2.0F,
+                      1.0F},
+                     [](float value) { return value / -2.0F < 1.0F; });
 
-    predicate.op_ = CardinalDownpushPredicateOp::ScalarDivLessThan;
-    predicate.double_arg0_ = -2.0;
-    predicate.double_arg1_ = 1.0;
-    check(predicate, [](float value) { return value / -2.0F < 1.0F; });
-
-    predicate.double_arg0_ = -0.0;
-    EXPECT_FALSE(exec::PrepareFloatCandidateEvaluator(contiguous, predicate)
+    exec::FloatArithmeticCandidatePredicate float_divide_by_zero{
+        FieldId{},
+        DataType::FLOAT,
+        proto::plan::ArithOpType::Div,
+        -0.0F,
+        1.0F};
+    EXPECT_FALSE(exec::PrepareFloatArithmeticCandidateEvaluator(
+                     contiguous, float_divide_by_zero)
                      .has_value());
 }
 

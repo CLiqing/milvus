@@ -7,9 +7,10 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <vector>
 
-#include "common/Downpush.h"
+#include "exec/expression/CandidateEvaluator.h"
 
 namespace milvus {
 class OpContext;
@@ -31,37 +32,51 @@ struct CandidatePredicateNode {
     size_t right{0};
 };
 
-// Milvus-internal logical program. Leaves retain the existing type-owned
-// predicate descriptions; logical nodes only compose their prepared batch
-// results. This program never crosses into Knowhere or Cardinal.
-struct CardinalDownpushPredicateProgram {
-    std::vector<CardinalDownpushPredicate> leaves;
-    std::vector<bool> leaf_nullable;
+// Opaque, query-scoped owner for every pin and converted value buffer used by
+// a fused scalar predicate. Preparing this context is part of the FilterBits
+// eligibility decision, so an advisory hint can always fall back before the
+// normal bitmap is skipped.
+struct PreparedFusingBundle;
+
+// Type-erased Milvus-internal leaf plan. The owning expression module keeps
+// its typed immutable state and supplies the preparation callback; the logical
+// composer never needs to know the value type, opcode, or literal layout.
+struct PreparedCandidateLeaf {
+    PreparedCandidateEvaluator evaluator;
+    std::vector<std::shared_ptr<const void>> resource_owners;
+};
+
+using PrepareCandidateLeafFn = std::optional<PreparedCandidateLeaf> (*)(
+    const segcore::SegmentInternalInterface* segment,
+    OpContext* op_context,
+    const void* typed_state);
+
+struct CandidateLeafPlan {
+    std::shared_ptr<const void> typed_state;
+    PrepareCandidateLeafFn prepare = nullptr;
+
+    explicit operator bool() const noexcept {
+        return typed_state != nullptr && prepare != nullptr;
+    }
+};
+
+// Milvus-internal logical program. Logical nodes compose opaque prepared
+// leaves; neither the program nor lower layers inspect typed leaf state.
+struct AnnFilterFusingProgram {
+    std::vector<CandidateLeafPlan> leaves;
     std::vector<CandidatePredicateNode> nodes;
     size_t root{0};
     int64_t estimated_filtered_out_count{0};
 };
 
-// Opaque, query-scoped owner for every pin and converted value buffer used by
-// a fused scalar predicate. Preparing this context is part of the FilterBits
-// eligibility decision, so an advisory hint can always fall back before the
-// normal bitmap is skipped.
-struct CardinalDownpushSearchContext;
-
-std::shared_ptr<CardinalDownpushSearchContext>
-PrepareCardinalDownpushSearchContext(
+std::shared_ptr<PreparedFusingBundle>
+PrepareAnnFilterFusingBundle(
     const segcore::SegmentInternalInterface* segment,
     OpContext* op_context,
-    const CardinalDownpushPredicate& predicate);
-
-std::shared_ptr<CardinalDownpushSearchContext>
-PrepareCardinalDownpushSearchContext(
-    const segcore::SegmentInternalInterface* segment,
-    OpContext* op_context,
-    const CardinalDownpushPredicateProgram& program);
+    const AnnFilterFusingProgram& program);
 
 const char*
-CardinalDownpushSourceName(const CardinalDownpushSearchContext& context);
+AnnFilterFusingSourceName(const PreparedFusingBundle& context);
 
 }  // namespace exec
 }  // namespace milvus

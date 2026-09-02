@@ -83,166 +83,9 @@ BuildSampleOffsets(int64_t active_count,
     return offsets;
 }
 
-std::optional<CardinalDownpushPredicateOp>
-ToDownpushRangeOp(proto::plan::OpType op_type) {
-    switch (op_type) {
-        case proto::plan::OpType::GreaterEqual:
-            return CardinalDownpushPredicateOp::Int64GreaterEqual;
-        case proto::plan::OpType::GreaterThan:
-            return CardinalDownpushPredicateOp::Int64GreaterThan;
-        case proto::plan::OpType::LessEqual:
-            return CardinalDownpushPredicateOp::Int64LessEqual;
-        case proto::plan::OpType::LessThan:
-            return CardinalDownpushPredicateOp::Int64LessThan;
-        case proto::plan::OpType::Equal:
-            return CardinalDownpushPredicateOp::Int64Equal;
-        case proto::plan::OpType::NotEqual:
-            return CardinalDownpushPredicateOp::Int64NotEqual;
-        case proto::plan::OpType::PrefixMatch:
-            return CardinalDownpushPredicateOp::StringPrefixMatch;
-        case proto::plan::OpType::PostfixMatch:
-            return CardinalDownpushPredicateOp::StringPostfixMatch;
-        case proto::plan::OpType::InnerMatch:
-            return CardinalDownpushPredicateOp::StringInnerMatch;
-        case proto::plan::OpType::Match:
-            return CardinalDownpushPredicateOp::StringLikeMatch;
-        default:
-            return std::nullopt;
-    }
-}
-
-bool
-IsStringMatchOp(CardinalDownpushPredicateOp op) {
-    return op == CardinalDownpushPredicateOp::StringPrefixMatch ||
-           op == CardinalDownpushPredicateOp::StringPostfixMatch ||
-           op == CardinalDownpushPredicateOp::StringInnerMatch ||
-           op == CardinalDownpushPredicateOp::StringLikeMatch;
-}
-
-bool
-TryFoldInt64TermsToRange(CardinalDownpushPredicate& predicate) {
-    if (predicate.value_type_ != CardinalDownpushPredicateValueType::Int64 ||
-        predicate.int64_terms_.empty()) {
-        return false;
-    }
-
-    const auto first = predicate.int64_terms_.front();
-    const auto last = predicate.int64_terms_.back();
-    if (last < first) {
-        return false;
-    }
-
-    const auto expected_size =
-        static_cast<__int128>(last) - static_cast<__int128>(first) + 1;
-    if (expected_size <= 0 ||
-        expected_size != static_cast<__int128>(predicate.int64_terms_.size())) {
-        return false;
-    }
-
-    predicate.arg0_ = first;
-    predicate.arg1_ = last;
-    predicate.lower_inclusive_ = true;
-    predicate.upper_inclusive_ = true;
-    predicate.int64_terms_.clear();
-    predicate.op_ = CardinalDownpushPredicateOp::ScalarRange;
-    return true;
-}
-
-std::optional<CardinalDownpushPredicate>
-TryCompileCardinalDownpushLeaf(const expr::TypedExprPtr& filter,
-                               QueryContext* query_context) {
-    if (query_context == nullptr || filter == nullptr) {
-        return std::nullopt;
-    }
-    auto* segment = query_context->get_segment();
-    if (segment == nullptr || segment->type() != SegmentType::Sealed) {
-        return std::nullopt;
-    }
-
-    struct ProviderPredicate {
-        CardinalDownpushPredicate predicate;
-        const DownpushPredicateProvider* provider;
-    };
-    auto try_field = [&](const expr::ColumnInfo& column)
-        -> std::optional<ProviderPredicate> {
-        auto field_id = column.field_id_;
-        const auto* provider = FindDownpushPredicateProvider(column);
-        if (provider == nullptr) {
-            return std::nullopt;
-        }
-        if (!segment->HasFieldData(field_id) && !segment->HasIndex(field_id)) {
-            return std::nullopt;
-        }
-        return ProviderPredicate{provider->NewPredicate(column), provider};
-    };
-
-    if (auto unary =
-            std::dynamic_pointer_cast<const expr::UnaryRangeFilterExpr>(
-                filter)) {
-        auto predicate = try_field(unary->column_);
-        auto op = ToDownpushRangeOp(unary->op_type_);
-        if (!predicate.has_value() || !op.has_value() ||
-            !predicate->provider->SupportsRangeOp(*op) ||
-            !predicate->provider->FillArg(
-                predicate->predicate, unary->val_, false)) {
-            return std::nullopt;
-        }
-        predicate->predicate.op_ = op.value();
-        if (!predicate->provider->FinalizeUnary(predicate->predicate)) {
-            return std::nullopt;
-        }
-        return std::move(predicate->predicate);
-    }
-
-    if (auto binary =
-            std::dynamic_pointer_cast<const expr::BinaryRangeFilterExpr>(
-                filter)) {
-        auto predicate = try_field(binary->column_);
-        if (!predicate.has_value() ||
-            !predicate->provider->FillArg(
-                predicate->predicate, binary->lower_val_, false) ||
-            !predicate->provider->FillArg(
-                predicate->predicate, binary->upper_val_, true)) {
-            return std::nullopt;
-        }
-        predicate->predicate.op_ = CardinalDownpushPredicateOp::ScalarRange;
-        predicate->predicate.lower_inclusive_ = binary->lower_inclusive_;
-        predicate->predicate.upper_inclusive_ = binary->upper_inclusive_;
-        return std::move(predicate->predicate);
-    }
-
-    if (auto term =
-            std::dynamic_pointer_cast<const expr::TermFilterExpr>(filter)) {
-        auto predicate = try_field(term->column_);
-        if (!predicate.has_value() || !predicate->provider->FillTerms(
-                                          predicate->predicate, term->vals_)) {
-            return std::nullopt;
-        }
-        if (TryFoldInt64TermsToRange(predicate->predicate)) {
-            return std::move(predicate->predicate);
-        }
-        predicate->predicate.op_ = CardinalDownpushPredicateOp::ScalarTerm;
-        return std::move(predicate->predicate);
-    }
-
-    if (auto arith =
-            std::dynamic_pointer_cast<const expr::BinaryArithOpEvalRangeExpr>(
-                filter)) {
-        auto predicate = try_field(arith->column_);
-        if (!predicate.has_value() || !predicate->provider->FillArithmetic(
-                                          predicate->predicate, *arith)) {
-            return std::nullopt;
-        }
-        return std::move(predicate->predicate);
-    }
-
-    return std::nullopt;
-}
-
 std::optional<size_t>
 CompileCandidatePredicateNode(const expr::TypedExprPtr& filter,
-                              QueryContext* query_context,
-                              CardinalDownpushPredicateProgram& program) {
+                              AnnFilterFusingProgram& program) {
     if (auto logical =
             std::dynamic_pointer_cast<const expr::LogicalBinaryExpr>(filter)) {
         if (logical->inputs().size() != 2 ||
@@ -250,10 +93,9 @@ CompileCandidatePredicateNode(const expr::TypedExprPtr& filter,
              logical->op_type_ != expr::LogicalBinaryExpr::OpType::Or)) {
             return std::nullopt;
         }
-        auto left = CompileCandidatePredicateNode(
-            logical->inputs()[0], query_context, program);
-        auto right = CompileCandidatePredicateNode(
-            logical->inputs()[1], query_context, program);
+        auto left = CompileCandidatePredicateNode(logical->inputs()[0], program);
+        auto right =
+            CompileCandidatePredicateNode(logical->inputs()[1], program);
         if (!left.has_value() || !right.has_value()) {
             return std::nullopt;
         }
@@ -272,8 +114,8 @@ CompileCandidatePredicateNode(const expr::TypedExprPtr& filter,
             logical->inputs().size() != 1) {
             return std::nullopt;
         }
-        auto child = CompileCandidatePredicateNode(
-            logical->inputs()[0], query_context, program);
+        auto child =
+            CompileCandidatePredicateNode(logical->inputs()[0], program);
         if (!child.has_value()) {
             return std::nullopt;
         }
@@ -282,29 +124,44 @@ CompileCandidatePredicateNode(const expr::TypedExprPtr& filter,
         return program.nodes.size() - 1;
     }
 
-    auto predicate = TryCompileCardinalDownpushLeaf(filter, query_context);
-    if (!predicate.has_value()) {
-        return std::nullopt;
+    if (auto arithmetic =
+            std::dynamic_pointer_cast<const expr::BinaryArithOpEvalRangeExpr>(
+                filter)) {
+        auto leaf_plan = TryCompileNumericArithmeticCandidateLeaf(*arithmetic);
+        if (!leaf_plan.has_value()) {
+            return std::nullopt;
+        }
+        const auto leaf = program.leaves.size();
+        program.leaves.emplace_back(std::move(*leaf_plan));
+        program.nodes.push_back(
+            CandidatePredicateNode{CandidatePredicateNodeType::Leaf, leaf, 0});
+        return program.nodes.size() - 1;
     }
-    // Numeric raw/bulk source views do not yet carry scalar validity. Avoid
-    // claiming SQL three-valued semantics for nullable Numeric leaves.
-    if (predicate->field_nullable_ &&
-        predicate->value_type_ != CardinalDownpushPredicateValueType::String) {
-        return std::nullopt;
+
+    if (auto leaf_plan = TryCompileNumericCandidateLeaf(filter);
+        leaf_plan.has_value()) {
+        const auto leaf = program.leaves.size();
+        program.leaves.emplace_back(std::move(*leaf_plan));
+        program.nodes.push_back(
+            CandidatePredicateNode{CandidatePredicateNodeType::Leaf, leaf, 0});
+        return program.nodes.size() - 1;
     }
-    const auto leaf = program.leaves.size();
-    program.leaf_nullable.push_back(predicate->field_nullable_);
-    program.leaves.push_back(std::move(*predicate));
-    program.nodes.push_back(
-        CandidatePredicateNode{CandidatePredicateNodeType::Leaf, leaf, 0});
-    return program.nodes.size() - 1;
+
+    if (auto leaf_plan = TryCompileStringCandidateLeaf(filter);
+        leaf_plan.has_value()) {
+        const auto leaf = program.leaves.size();
+        program.leaves.emplace_back(std::move(*leaf_plan));
+        program.nodes.push_back(
+            CandidatePredicateNode{CandidatePredicateNodeType::Leaf, leaf, 0});
+        return program.nodes.size() - 1;
+    }
+    return std::nullopt;
 }
 
-std::optional<CardinalDownpushPredicateProgram>
-TryCompileCardinalDownpushProgram(const expr::TypedExprPtr& filter,
-                                  QueryContext* query_context) {
-    CardinalDownpushPredicateProgram program;
-    auto root = CompileCandidatePredicateNode(filter, query_context, program);
+std::optional<AnnFilterFusingProgram>
+TryCompileAnnFilterFusingProgram(const expr::TypedExprPtr& filter) {
+    AnnFilterFusingProgram program;
+    auto root = CompileCandidatePredicateNode(filter, program);
     if (!root.has_value() || program.leaves.empty()) {
         return std::nullopt;
     }
@@ -422,10 +279,10 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     num_processed_rows_ = 0;
 
     const auto& search_info = query_context_->get_search_info();
-    if (search_info.cardinal_downpush_fallback_reason.has_value()) {
+    if (search_info.ann_filter_fusing_fallback_reason.has_value()) {
         milvus::monitor::internal_core_downpush_fallback_count_family
             .Add({{"reason",
-                   search_info.cardinal_downpush_fallback_reason.value()}})
+                   search_info.ann_filter_fusing_fallback_reason.value()}})
             .Increment();
     } else if (search_info.ann_filter_request_mode !=
                    AnnFilterRequestMode::Disabled &&
@@ -433,18 +290,18 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                !query_context_->get_placeholder_group()->empty()) {
         // Explicit fusing and default AUTO share the same loaded-index planner.
         // Any rejected or incomplete Prepare stays on the normal ExprSet path.
-        TryEnableCardinalDownpush(*filter, exec_context);
+        TryEnableAnnFilterFusing(*filter, exec_context);
     }
 
     enable_expr_cache_ = query_context_->get_enable_expr_cache();
-    if (enable_expr_cache_ && !cardinal_downpush_enabled_) {
+    if (enable_expr_cache_ && !ann_filter_fusing_enabled_) {
         expr_cache_key_ = BuildExprCacheKey(*filter, query_context_);
     }
 }
 
 void
-PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
-                                             ExecContext* exec_context) {
+PhyFilterBitsNode::TryEnableAnnFilterFusing(const plan::FilterBitsNode& filter,
+                                            ExecContext* exec_context) {
     const auto& search_info = query_context_->get_search_info();
 
     const bool explicit_fusing =
@@ -540,7 +397,7 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
               {"reason", plan_reason}})
         .Increment();
     if (plan.abi_major != knowhere::kAnnFilterPlannerAbiMajor ||
-        plan.struct_size < sizeof(knowhere::AnnFilterPlanResultV1) ||
+        plan.struct_size < knowhere::kAnnFilterPlanResultV1MinimumSize ||
         plan.policy != knowhere::AnnFilterPolicy::kFusing) {
         LOG_DEBUG(
             "downpush fallback: Cardinal pre-plan rejected request, reason={}",
@@ -551,25 +408,10 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
     AssertInfo(vector_index_lease != nullptr && planned_vector_index != nullptr,
                "fusing planner accepted without an index lease");
 
-    auto program =
-        TryCompileCardinalDownpushProgram(filter.filter(), query_context_);
+    auto program = TryCompileAnnFilterFusingProgram(filter.filter());
     if (!program.has_value()) {
         LOG_DEBUG(
             "downpush fallback: unsupported predicate operation or scalar source");
-        fallback("unsupported_predicate");
-        return;
-    }
-
-    // A LIKE predicate requires raw varchar values. A sealed segment backed by
-    // STL_SORT may expose dictionary IDs without the raw string chunk required
-    // by LIKE. This remains inside the pre-commit Prepare transaction.
-    if (std::any_of(
-            program->leaves.begin(),
-            program->leaves.end(),
-            [](const auto& leaf) { return IsStringMatchOp(leaf.op_); })) {
-        LOG_DEBUG(
-            "downpush fallback: varchar match needs a raw value source that "
-            "is unavailable for some sealed scalar-index layouts");
         fallback("unsupported_predicate");
         return;
     }
@@ -582,11 +424,11 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
             std::vector<expr::TypedExprPtr>{ttl_expr}, exec_context, false);
     }
 
-    auto downpush_search_context =
-        PrepareCardinalDownpushSearchContext(query_context_->get_segment(),
-                                             query_context_->get_op_context(),
-                                             program.value());
-    if (downpush_search_context == nullptr) {
+    auto fusing_bundle =
+        PrepareAnnFilterFusingBundle(query_context_->get_segment(),
+                                     query_context_->get_op_context(),
+                                     program.value());
+    if (fusing_bundle == nullptr) {
         LOG_DEBUG("downpush fallback: scalar value source unavailable");
         fallback("source_unavailable");
         return;
@@ -596,11 +438,11 @@ PhyFilterBitsNode::TryEnableCardinalDownpush(const plan::FilterBitsNode& filter,
         need_process_rows_ > 0
             ? std::max<int64_t>(1, estimated_filtered_out_count.value())
             : 0;
-    cardinal_downpush_program_ = std::move(program);
-    cardinal_downpush_search_context_ = std::move(downpush_search_context);
+    ann_filter_fusing_program_ = std::move(program);
+    ann_filter_fusing_bundle_ = std::move(fusing_bundle);
     query_context_->set_ann_filter_vector_index_lease(
         std::move(vector_index_lease), planned_vector_index);
-    cardinal_downpush_enabled_ = true;
+    ann_filter_fusing_enabled_ = true;
 }
 
 void
@@ -661,11 +503,11 @@ PhyFilterBitsNode::GetOutput() {
         "PhyFilterBitsNode::Execute", tracer::GetRootSpan(), true);
     tracer::AddEvent(fmt::format("input_rows: {}", need_process_rows_));
 
-    if (cardinal_downpush_enabled_) {
-        query_context_->set_cardinal_downpush_program(
-            cardinal_downpush_program_.value());
-        query_context_->set_cardinal_downpush_search_context(
-            cardinal_downpush_search_context_);
+    if (ann_filter_fusing_enabled_) {
+        query_context_->set_ann_filter_fusing_program(
+            ann_filter_fusing_program_.value());
+        query_context_->set_ann_filter_fusing_bundle(
+            ann_filter_fusing_bundle_);
         num_processed_rows_ = need_process_rows_;
         std::vector<VectorPtr> col_res;
         if (ttl_exprs_ != nullptr) {

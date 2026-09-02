@@ -111,7 +111,7 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
             (search_info.search_params_.contains(HINTS) &&
              search_info.search_params_[HINTS] == DOWNPUSH);
         if (downpush_requested) {
-            search_info.cardinal_downpush_fallback_reason = "range_search";
+            search_info.ann_filter_fusing_fallback_reason = "range_search";
         }
     } else {
         if (query_info_proto.hints() != "") {

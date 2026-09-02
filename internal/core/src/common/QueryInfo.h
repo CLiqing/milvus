@@ -63,7 +63,7 @@ struct SearchInfo {
     // An explicit downpush hint can be rejected before FilterBitsNode is able
     // to run its normal eligibility checks (for example, range search). Carry
     // the reason to FilterBitsNode so the baseline fallback stays observable.
-    std::optional<std::string> cardinal_downpush_fallback_reason = std::nullopt;
+    std::optional<std::string> ann_filter_fusing_fallback_reason = std::nullopt;
     std::optional<SearchIteratorV2Info> iterator_v2_info_ = std::nullopt;
     std::optional<std::string> json_path_;
     std::optional<milvus::DataType> json_type_;

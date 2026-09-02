@@ -27,7 +27,6 @@
 #include <folly/CancellationToken.h>
 
 #include "common/Common.h"
-#include "common/Downpush.h"
 #include "common/Types.h"
 #include "common/Exception.h"
 #include "common/ArrayOffsets.h"
@@ -38,7 +37,7 @@
 
 namespace milvus::exec {
 
-struct CardinalDownpushSearchContext;
+struct PreparedFusingBundle;
 
 enum class ContextScope { GLOBAL = 0, SESSION = 1, QUERY = 2, Executor = 3 };
 
@@ -414,30 +413,30 @@ class QueryContext : public Context {
     }
 
     void
-    set_cardinal_downpush_program(CardinalDownpushPredicateProgram program) {
-        cardinal_downpush_program_ = std::move(program);
+    set_ann_filter_fusing_program(AnnFilterFusingProgram program) {
+        ann_filter_fusing_program_ = std::move(program);
     }
 
-    const std::optional<CardinalDownpushPredicateProgram>&
-    get_cardinal_downpush_program() const {
-        return cardinal_downpush_program_;
-    }
-
-    void
-    clear_cardinal_downpush_program() {
-        cardinal_downpush_program_.reset();
-        cardinal_downpush_search_context_.reset();
+    const std::optional<AnnFilterFusingProgram>&
+    get_ann_filter_fusing_program() const {
+        return ann_filter_fusing_program_;
     }
 
     void
-    set_cardinal_downpush_search_context(
-        std::shared_ptr<CardinalDownpushSearchContext> context) {
-        cardinal_downpush_search_context_ = std::move(context);
+    clear_ann_filter_fusing_program() {
+        ann_filter_fusing_program_.reset();
+        ann_filter_fusing_bundle_.reset();
     }
 
-    const std::shared_ptr<CardinalDownpushSearchContext>&
-    get_cardinal_downpush_search_context() const {
-        return cardinal_downpush_search_context_;
+    void
+    set_ann_filter_fusing_bundle(
+        std::shared_ptr<PreparedFusingBundle> context) {
+        ann_filter_fusing_bundle_ = std::move(context);
+    }
+
+    const std::shared_ptr<PreparedFusingBundle>&
+    get_ann_filter_fusing_bundle() const {
+        return ann_filter_fusing_bundle_;
     }
 
     void
@@ -509,9 +508,8 @@ class QueryContext : public Context {
     // bitmaps in the same request path.
     bool enable_sub_expr_cache_write_ = true;
 
-    std::optional<CardinalDownpushPredicateProgram> cardinal_downpush_program_;
-    std::shared_ptr<CardinalDownpushSearchContext>
-        cardinal_downpush_search_context_;
+    std::optional<AnnFilterFusingProgram> ann_filter_fusing_program_;
+    std::shared_ptr<PreparedFusingBundle> ann_filter_fusing_bundle_;
     std::shared_ptr<void> ann_filter_vector_index_lease_;
     void* ann_filter_vector_index_{nullptr};
 };
