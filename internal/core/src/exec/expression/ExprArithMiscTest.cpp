@@ -26,6 +26,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <ostream>
 #include <stdexcept>
@@ -146,6 +147,77 @@ TEST(CandidateEvaluatorTest,
         exec::PrepareInt64ModCandidateEvaluator(contiguous, 0, 1).has_value());
     EXPECT_FALSE(
         exec::PrepareInt64ModCandidateEvaluator(contiguous, 5, 6).has_value());
+}
+
+TEST(OffsetExpressionE0, IterativeOffsetAndCandidateModAgree) {
+    auto schema = std::make_shared<Schema>();
+    const auto id_fid = schema->AddDebugField("id", DataType::INT64);
+    const auto bucket_fid = schema->AddDebugField("bucket", DataType::INT64);
+    schema->set_primary_field_id(id_fid);
+
+    static constexpr std::array<int64_t, 16> values = {
+        -13, -9, -5, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 17};
+    std::vector<int64_t> ids(values.size());
+    std::iota(ids.begin(), ids.end(), int64_t{0});
+
+    auto insert_data = std::make_unique<InsertRecordProto>();
+    InsertCol(insert_data.get(), ids, (*schema)[id_fid], false);
+    InsertCol(insert_data.get(),
+              std::vector<int64_t>(values.begin(), values.end()),
+              (*schema)[bucket_fid],
+              false);
+    GeneratedData raw_data;
+    raw_data.schema_ = schema;
+    raw_data.raw_ = insert_data.release();
+    raw_data.raw_->set_num_rows(values.size());
+    raw_data.row_ids_ = ids;
+    raw_data.timestamps_.assign(values.size(), 0);
+
+    auto segment = CreateSealedSegment(schema);
+    LoadGeneratedDataIntoSegment(raw_data, segment.get(), true);
+
+    proto::plan::GenericValue threshold;
+    threshold.set_int64_val(2);
+    proto::plan::GenericValue divisor;
+    divisor.set_int64_val(5);
+    auto expression = std::make_shared<expr::BinaryArithOpEvalRangeExpr>(
+        expr::ColumnInfo(bucket_fid, DataType::INT64),
+        proto::plan::OpType::LessThan,
+        proto::plan::ArithOpType::Mod,
+        threshold,
+        divisor);
+    auto plan =
+        std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expression);
+
+    exec::OffsetVector offsets = {15, 0, 7, 3, 9, 4, 12, 1, 14, 6, 10};
+    const auto iterative_result = milvus::test::gen_filter_res(
+        plan.get(), segment.get(), values.size(), MAX_TIMESTAMP, &offsets);
+    const BitsetTypeView iterative_truth(iterative_result->GetRawData(),
+                                         iterative_result->size());
+
+    exec::Int64CandidateSourceView source;
+    source.row_values = values.data();
+    source.row_count = values.size();
+    const auto candidate =
+        exec::PrepareInt64ModCandidateEvaluator(source, 5, 2);
+    ASSERT_TRUE(candidate.has_value());
+    std::array<int64_t, 11> candidate_ids{};
+    std::copy(offsets.begin(), offsets.end(), candidate_ids.begin());
+    uint64_t candidate_truth = 0;
+    const uint64_t active = (uint64_t{1} << offsets.size()) - 1;
+    ASSERT_EQ(candidate->view.eval_batch(candidate->view.context,
+                                         candidate_ids.data(),
+                                         candidate_ids.size(),
+                                         active,
+                                         &candidate_truth),
+              0);
+
+    ASSERT_EQ(iterative_truth.size(), offsets.size());
+    for (size_t lane = 0; lane < offsets.size(); ++lane) {
+        EXPECT_EQ(iterative_truth[lane],
+                  (candidate_truth & (uint64_t{1} << lane)) != 0)
+            << "lane=" << lane << " row=" << offsets[lane];
+    }
 }
 
 TEST(CandidateEvaluatorTest, Int64ComparisonRangeAndTermStayMilvusOwned) {
