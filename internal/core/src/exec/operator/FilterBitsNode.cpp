@@ -318,7 +318,15 @@ PhyFilterBitsNode::TryEnableAnnFilterFusing(const plan::FilterBitsNode& filter,
     };
 
     // Fusion is not implemented for element-level (array-of-vectors) search.
-    if (search_info.element_level()) {
+    // SearchInfo::array_offsets_ is initialized later by VectorSearchNode, so
+    // the immutable placeholder flag is the authoritative planning-time gate.
+    const auto* placeholder_group = query_context_->get_placeholder_group();
+    if (placeholder_group == nullptr || placeholder_group->empty()) {
+        LOG_DEBUG("downpush fallback: vector placeholder is unavailable");
+        fallback("missing_placeholder");
+        return;
+    }
+    if (placeholder_group->at(0).element_level_) {
         LOG_DEBUG("downpush fallback: element-level vector search unsupported");
         fallback("element_level");
         return;
@@ -354,12 +362,6 @@ PhyFilterBitsNode::TryEnableAnnFilterFusing(const plan::FilterBitsNode& filter,
         std::max<int64_t>(0, need_process_rows_));
     plan_request.estimated_filtered_out_count = static_cast<uint64_t>(
         std::max<int64_t>(0, estimated_filtered_out_count.value()));
-    const auto* placeholder_group = query_context_->get_placeholder_group();
-    if (placeholder_group == nullptr || placeholder_group->empty()) {
-        LOG_DEBUG("downpush fallback: vector placeholder is unavailable");
-        fallback("missing_placeholder");
-        return;
-    }
     plan_request.nq = static_cast<uint64_t>(std::max<int64_t>(
         0, placeholder_group->at(0).num_of_queries_));
     plan_request.topk = static_cast<uint64_t>(

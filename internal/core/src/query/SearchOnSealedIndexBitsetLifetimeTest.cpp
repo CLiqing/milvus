@@ -481,6 +481,58 @@ TEST(SearchOnGrowingBitsetLifetime,
     AssertVectorIteratorUsableAfterSearchReturns(search_result, valid_count);
 }
 
+TEST(SearchOnGrowingAllVisible, EmptyBitsetSearchesActiveRows) {
+    constexpr int64_t total_count = 128;
+
+    auto schema = std::make_shared<Schema>();
+    auto vector_field = schema->AddDebugField(
+        "vector", DataType::VECTOR_FLOAT, kDim, knowhere::metric::L2);
+    auto primary_field = schema->AddDebugField("primary", DataType::INT64);
+    schema->set_primary_field_id(primary_field);
+
+    auto dataset = segcore::DataGen(schema, total_count, /*seed=*/42);
+    auto segment = segcore::CreateGrowingSegment(schema, empty_index_meta);
+    auto reserved_offset = segment->PreInsert(total_count);
+    segment->Insert(reserved_offset,
+                    total_count,
+                    dataset.row_ids_.data(),
+                    dataset.timestamps_.data(),
+                    dataset.raw_);
+    auto* growing_segment =
+        dynamic_cast<segcore::SegmentGrowingImpl*>(segment.get());
+    ASSERT_NE(growing_segment, nullptr);
+
+    const auto& vector_data = FindFieldData(dataset, vector_field);
+    const auto& vectors = vector_data.vectors().float_vector().data();
+    ASSERT_GE(vectors.size(), kDim);
+
+    SearchInfo search_info;
+    search_info.field_id_ = vector_field;
+    search_info.topk_ = kTopK;
+    search_info.round_decimal_ = -1;
+    search_info.metric_type_ = knowhere::metric::L2;
+    search_info.search_params_ = knowhere::Json{
+        {knowhere::indexparam::NPROBE, "32"},
+    };
+
+    SearchResult search_result;
+    SearchOnGrowing(*growing_segment,
+                    search_info,
+                    vectors.data(),
+                    nullptr,
+                    1,
+                    MAX_TIMESTAMP,
+                    BitsetView{},
+                    nullptr,
+                    search_result);
+
+    ASSERT_EQ(search_result.seg_offsets_.size(), kTopK);
+    EXPECT_TRUE(std::any_of(
+        search_result.seg_offsets_.begin(),
+        search_result.seg_offsets_.end(),
+        [](int64_t offset) { return offset != INVALID_SEG_OFFSET; }));
+}
+
 TEST(SearchOnSealedColumnBitsetLifetime,
      GroupByIteratorMustNotKeepDanglingTransformedBitset) {
     constexpr int64_t total_count = 512;

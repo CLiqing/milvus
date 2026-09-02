@@ -1040,6 +1040,14 @@ TryCompileNumericArithmeticCandidateLeaf(
         column.data_type_ != DataType::TIMESTAMPTZ) {
         return std::nullopt;
     }
+    // Until sequential SIMD, random offsets, scalar-index lookup and
+    // SkipIndex share one explicit overflow contract, integral fusing admits
+    // only the constrained MOD form below.  TIMESTAMPTZ arithmetic is also
+    // excluded; it must not inherit numeric MOD semantics accidentally.
+    if (column.data_type_ == DataType::TIMESTAMPTZ ||
+        expression.arith_op_type_ != proto::plan::ArithOpType::Mod) {
+        return std::nullopt;
+    }
     const auto operand = AsInt64(expression.right_operand_);
     const auto target = AsInt64(expression.value_);
     if (!operand.has_value() || !target.has_value() ||

@@ -203,10 +203,17 @@ SearchOnGrowing(const segcore::SegmentGrowingImpl& segment,
             }
         }
 
-        auto active_count = has_offset_mapping
-                                ? offset_mapping.GetValidCount()
-                                : std::min(int64_t(bitset.size()),
-                                           segment.get_active_count(timestamp));
+        // An empty BitsetView is the all-visible fast-path contract used by
+        // VectorSearchNode.  It must not be interpreted as a zero-row search.
+        // A non-empty view still bounds the searchable prefix, while nullable
+        // vector compaction is governed by the physical offset mapping.
+        auto active_count =
+            has_offset_mapping
+                ? offset_mapping.GetValidCount()
+                : (bitset.empty()
+                       ? segment.get_active_count(timestamp)
+                       : std::min(int64_t(bitset.size()),
+                                  segment.get_active_count(timestamp)));
 
         // Check for nullable vector field with all null values
         if (active_count == 0) {

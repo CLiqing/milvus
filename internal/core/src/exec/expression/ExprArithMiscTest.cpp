@@ -49,6 +49,7 @@
 #include "exec/Task.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/CandidateEvaluator.h"
+#include "exec/expression/DownpushPredicateProvider.h"
 #include "exec/expression/NumericCandidateEvaluator.h"
 #include "exec/expression/StringCandidateEvaluator.h"
 #include "expr/ITypeExpr.h"
@@ -563,6 +564,43 @@ TEST(CandidateEvaluatorTest, Int64ArithmeticUsesWideIntermediate) {
     EXPECT_FALSE(exec::PrepareInt64ArithmeticCandidateEvaluator(
                      source, divide_by_zero)
                      .has_value());
+}
+
+TEST(CandidateEvaluatorTest,
+     IntegralFusingCompilationAdmitsOnlyConstrainedMod) {
+    auto compile = [](DataType data_type,
+                      proto::plan::ArithOpType arithmetic_op,
+                      int64_t operand,
+                      int64_t threshold) {
+        proto::plan::GenericValue value;
+        value.set_int64_val(threshold);
+        proto::plan::GenericValue right_operand;
+        right_operand.set_int64_val(operand);
+        expr::BinaryArithOpEvalRangeExpr expression(
+            expr::ColumnInfo(FieldId{100}, data_type),
+            proto::plan::OpType::LessThan,
+            arithmetic_op,
+            value,
+            right_operand);
+        return exec::TryCompileNumericArithmeticCandidateLeaf(expression);
+    };
+
+    EXPECT_TRUE(compile(DataType::INT64, proto::plan::ArithOpType::Mod, 5, 2)
+                    .has_value());
+    EXPECT_FALSE(compile(DataType::INT64, proto::plan::ArithOpType::Mod, 0, 0)
+                     .has_value());
+    EXPECT_FALSE(compile(DataType::INT64, proto::plan::ArithOpType::Mod, 5, 6)
+                     .has_value());
+
+    for (auto arithmetic_op : {proto::plan::ArithOpType::Add,
+                               proto::plan::ArithOpType::Sub,
+                               proto::plan::ArithOpType::Mul,
+                               proto::plan::ArithOpType::Div}) {
+        EXPECT_FALSE(compile(DataType::INT64, arithmetic_op, 2, 1).has_value());
+    }
+    EXPECT_FALSE(
+        compile(DataType::TIMESTAMPTZ, proto::plan::ArithOpType::Mod, 5, 2)
+            .has_value());
 }
 
 TEST(CandidateEvaluatorTest, FloatLeavesPreserveIeeeSemantics) {
