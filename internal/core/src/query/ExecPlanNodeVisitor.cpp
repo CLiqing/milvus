@@ -12,6 +12,7 @@
 #include "query/ExecPlanNodeVisitor.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <memory>
 #include <string>
@@ -43,6 +44,90 @@ empty_search_result(int64_t num_queries, bool element_level = false) {
     final_result.element_level_ = element_level;
     return final_result;
 }
+
+namespace {
+
+// Normal Retrieve returns rows in primary-key order and de-duplicates primary
+// keys.  Sparse FilterMap storage is deliberately unordered, so this consumer
+// fetches only the accepted rows' PKs, sorts a request-local O(V) array, and
+// applies the existing limit semantics.  No ordering cost is imposed on the
+// producer or on BF/search consumers that only enumerate IDs.
+std::pair<std::vector<int64_t>, bool>
+FindFirstNFromFilterMap(int64_t limit,
+                        const FilterMap& filter_map,
+                        const segcore::SegmentInternalInterface* segment,
+                        OpContext& op_context) {
+    const auto expected = filter_map.size() - filter_map.count();
+    std::vector<int64_t> offsets;
+    offsets.reserve(expected);
+    FilterMapCursor cursor;
+    std::array<int32_t, 256> batch{};
+    while (const auto n = filter_map.ReadUnsetBatch(cursor, batch)) {
+        for (size_t i = 0; i < n; ++i) {
+            offsets.push_back(batch[i]);
+        }
+    }
+    AssertInfo(offsets.size() == expected,
+               "FilterMap produced {} accepted offsets, expected {}",
+               offsets.size(),
+               expected);
+    if (offsets.empty()) {
+        return {{}, false};
+    }
+
+    const auto schema = segment->get_schema_snapshot();
+    const auto pk_field = schema->get_primary_field_id();
+    AssertInfo(pk_field.has_value(),
+               "normal Retrieve requires a primary key field");
+    auto pk_data = segment->bulk_subscript(
+        &op_context, *pk_field, offsets.data(), offsets.size());
+    std::vector<PkType> pks(offsets.size());
+    segcore::ParsePksFromFieldData(pks, *pk_data);
+    AssertInfo(pks.size() == offsets.size(),
+               "primary-key lookup returned {} values for {} Sparse offsets",
+               pks.size(),
+               offsets.size());
+
+    struct Entry {
+        PkType pk;
+        int64_t offset;
+    };
+    std::vector<Entry> entries;
+    entries.reserve(offsets.size());
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        entries.push_back({std::move(pks[i]), offsets[i]});
+    }
+    std::sort(entries.begin(), entries.end(), [](const Entry& lhs,
+                                                  const Entry& rhs) {
+        if (lhs.pk != rhs.pk) {
+            return lhs.pk < rhs.pk;
+        }
+        // Growing offsets increase with insertion order.  This matches the
+        // established PK map behavior of selecting the newest visible row.
+        return lhs.offset > rhs.offset;
+    });
+    entries.erase(std::unique(entries.begin(),
+                              entries.end(),
+                              [](const Entry& lhs, const Entry& rhs) {
+                                  return lhs.pk == rhs.pk;
+                              }),
+                  entries.end());
+
+    if (limit == segcore::Unlimited || limit == segcore::NoLimit) {
+        limit = entries.size();
+    }
+    const auto selected = std::min<size_t>(
+        entries.size(), static_cast<size_t>(std::max<int64_t>(limit, 0)));
+    const bool has_more = entries.size() > selected;
+    offsets.clear();
+    offsets.reserve(selected);
+    for (size_t i = 0; i < selected; ++i) {
+        offsets.push_back(entries[i].offset);
+    }
+    return {std::move(offsets), has_more};
+}
+
+}  // namespace
 
 RowVectorPtr
 ExecPlanNodeVisitor::ExecuteTask(
@@ -333,7 +418,7 @@ ExecPlanNodeVisitor::visit(RetrievePlanNode& node) {
 void
 ExecPlanNodeVisitor::setupRetrieveResult(
     const milvus::RowVectorPtr& result,
-    const OpContext& op_context,
+    OpContext& op_context,
     const RetrievePlanNode& node,
     RetrieveResult& tmp_retrieve_result,
     const segcore::SegmentInternalInterface* segment,
@@ -362,13 +447,25 @@ ExecPlanNodeVisitor::setupRetrieveResult(
         std::dynamic_pointer_cast<ColumnVector>(result->child(0));
     AssertInfo(first_column,
                "children inside row vector must be of column vector for now");
-    tmp_retrieve_result.total_data_cnt_ = first_column->size();
+    auto filter_map = query_context->get_filter_map();
+    tmp_retrieve_result.total_data_cnt_ =
+        filter_map != nullptr ? filter_map->size() : first_column->size();
     if (first_column->IsBitmap()) {
-        AssertInfo(query_context->get_filter_map() == nullptr,
-                   "FilterMap retrieve output currently requires a native "
-                   "consumer such as count(*); bitmap fallback would consume "
-                   "the one-row Sparse placeholder");
-        BitsetTypeView view(first_column->GetRawData(), first_column->size());
+        // A Sparse FilterMap is represented by a one-row placeholder in the
+        // operator RowVector.  Normal Retrieve still relies on the segment's
+        // established find_first_n implementation for PK ordering,
+        // de-duplication, growing-segment and pagination semantics.  Convert
+        // exactly once at this legacy boundary instead of consuming the
+        // placeholder as though it were the real filter bitmap.
+        std::optional<BitsetTypeView> filter_map_view;
+        BitsetTypeView column_view(first_column->GetRawData(),
+                                   first_column->size());
+        const BitsetTypeView* view = &column_view;
+        if (filter_map != nullptr && query_context->bitset_is_element_level()) {
+            auto& dense = filter_map->EnsureDense();
+            filter_map_view.emplace(dense.data(), dense.size());
+            view = &*filter_map_view;
+        }
         if (query_context->bitset_is_element_level()) {
             // Element-level query: bitset is element-level, need to convert to (doc_id, element_index)
             tmp_retrieve_result.element_level_ = true;
@@ -377,7 +474,7 @@ ExecPlanNodeVisitor::setupRetrieveResult(
             auto array_offsets = query_context->get_array_offsets();
             auto [doc_offsets, element_indices, has_more] =
                 segment->find_first_n_element(node.limit_,
-                                              view,
+                                              *view,
                                               array_offsets.get(),
                                               node.query_iterator_cursor_);
             tmp_retrieve_result.result_offsets_ = std::move(doc_offsets);
@@ -385,7 +482,13 @@ ExecPlanNodeVisitor::setupRetrieveResult(
             tmp_retrieve_result.has_more_result = has_more;
         } else {
             tracer::AutoSpan _("Find Limit Pk", tracer::GetRootSpan());
-            auto results_pair = segment->find_first_n(node.limit_, view);
+            auto results_pair =
+                filter_map != nullptr
+                    ? FindFirstNFromFilterMap(node.limit_,
+                                              *filter_map,
+                                              segment,
+                                              op_context)
+                    : segment->find_first_n(node.limit_, *view);
             tmp_retrieve_result.result_offsets_ = std::move(results_pair.first);
             tmp_retrieve_result.has_more_result = results_pair.second;
         }

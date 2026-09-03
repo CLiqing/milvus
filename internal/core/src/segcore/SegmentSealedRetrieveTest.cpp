@@ -13,12 +13,14 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "common/Consts.h"
+#include "common/Common.h"
 #include "common/EasyAssert.h"
 #include "common/LoadInfo.h"
 #include "common/Schema.h"
@@ -185,6 +187,74 @@ TEST_P(RetrieveTest, AutoID2) {
     } else {
         auto field1_data = field1.vectors().sparse_float_vector();
         ASSERT_EQ(field1_data.contents_size(), req_size);
+    }
+}
+
+TEST_P(RetrieveTest, AdaptiveFilterMapRetrieveMatchesDenseLimitAndPkOrder) {
+    struct ScopedSparseFilterConfig {
+        ScopedSparseFilterConfig() {
+            SetSparseFilterResultConfig(true, 101, 1, 1.0);
+        }
+        ~ScopedSparseFilterConfig() {
+            SetSparseFilterResultConfig(false, 6000, 50000, 0.006);
+        }
+    } sparse_filter_config;
+
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto value = schema->AddDebugField("value", DataType::INT64);
+    auto vector = schema->AddDebugField(
+        "vector", data_type, 16, metric_type);
+    schema->set_primary_field_id(pk);
+
+    constexpr int64_t kRows = 101;
+    constexpr int64_t kLimit = 10;
+    auto dataset = DataGen(schema, kRows, 1732);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+
+    proto::plan::GenericValue bound;
+    bound.set_int64_val(std::numeric_limits<int64_t>::min());
+    auto predicate = std::make_shared<expr::UnaryRangeFilterExpr>(
+        milvus::expr::ColumnInfo(
+            value, DataType::INT64, std::vector<std::string>()),
+        OpType::GreaterEqual,
+        bound,
+        std::vector<proto::plan::GenericValue>{});
+
+    auto make_plan = [&](const std::string& representation) {
+        auto plan = std::make_unique<query::RetrievePlan>(schema);
+        plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
+        plan->plan_node_->plannodes_ =
+            milvus::test::CreateRetrievePlanByExpr(predicate);
+        plan->plan_node_->limit_ = kLimit;
+        plan->plan_node_->plan_options_.filter_result_representation =
+            representation;
+        plan->plan_node_->plan_options_.sparse_result_max_cardinality = kRows;
+        plan->field_ids_ = {pk, value, vector};
+        return plan;
+    };
+
+    auto dense_plan = make_plan("dense");
+    auto adaptive_plan = make_plan("adaptive");
+    auto dense = RetrieveUsingDefaultOutputSize(
+        segment.get(), dense_plan.get(), MAX_TIMESTAMP);
+    auto adaptive = RetrieveUsingDefaultOutputSize(
+        segment.get(), adaptive_plan.get(), MAX_TIMESTAMP);
+
+    ASSERT_EQ(dense->offset_size(), kLimit);
+    ASSERT_EQ(adaptive->offset_size(), kLimit);
+    EXPECT_EQ(dense->has_more_result(), adaptive->has_more_result());
+    EXPECT_TRUE(adaptive->has_more_result());
+    EXPECT_EQ(dense->ids().SerializeAsString(),
+              adaptive->ids().SerializeAsString());
+    ASSERT_EQ(dense->offset_size(), adaptive->offset_size());
+    for (int i = 0; i < dense->offset_size(); ++i) {
+        EXPECT_EQ(dense->offset(i), adaptive->offset(i));
+    }
+    ASSERT_EQ(dense->fields_data_size(), adaptive->fields_data_size());
+    for (int i = 0; i < dense->fields_data_size(); ++i) {
+        EXPECT_EQ(dense->fields_data(i).SerializeAsString(),
+                  adaptive->fields_data(i).SerializeAsString());
     }
 }
 
