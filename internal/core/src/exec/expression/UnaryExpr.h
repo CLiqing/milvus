@@ -34,6 +34,7 @@
 #include "common/Volnitsky.h"
 #include "index/NgramInvertedIndex.h"
 #include "exec/expression/Utils.h"
+#include "exec/expression/UnaryPredicateUtils.h"
 #include "common/bson_view.h"
 #include "index/json_stats/bson_inverted.h"
 #include "cachinglayer/CacheSlot.h"
@@ -378,18 +379,13 @@ struct UnaryElementFunc {
         if constexpr (filter_type == FilterType::random) {
             for (int i = 0; i < size; ++i) {
                 auto offset = (offsets != nullptr) ? offsets[i] : i;
-                if constexpr (op == proto::plan::OpType::Equal) {
-                    res[i] = src[offset] == val;
-                } else if constexpr (op == proto::plan::OpType::NotEqual) {
-                    res[i] = src[offset] != val;
-                } else if constexpr (op == proto::plan::OpType::GreaterThan) {
-                    res[i] = src[offset] > val;
-                } else if constexpr (op == proto::plan::OpType::LessThan) {
-                    res[i] = src[offset] < val;
-                } else if constexpr (op == proto::plan::OpType::GreaterEqual) {
-                    res[i] = src[offset] >= val;
-                } else if constexpr (op == proto::plan::OpType::LessEqual) {
-                    res[i] = src[offset] <= val;
+                if constexpr (op == proto::plan::OpType::Equal ||
+                              op == proto::plan::OpType::NotEqual ||
+                              op == proto::plan::OpType::GreaterThan ||
+                              op == proto::plan::OpType::LessThan ||
+                              op == proto::plan::OpType::GreaterEqual ||
+                              op == proto::plan::OpType::LessEqual) {
+                    res[i] = EvaluateUnaryPredicate<op>(src[offset], val);
                 } else if constexpr (op == proto::plan::OpType::PrefixMatch ||
                                      op == proto::plan::OpType::PostfixMatch ||
                                      op == proto::plan::OpType::InnerMatch) {

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -218,6 +219,320 @@ TEST(OffsetExpressionE0, IterativeOffsetAndCandidateModAgree) {
                   (candidate_truth & (uint64_t{1} << lane)) != 0)
             << "lane=" << lane << " row=" << offsets[lane];
     }
+
+    OpContext op_context;
+    auto shared = exec::PrepareNumericOffsetExpressionEvaluator(
+        segment.get(), &op_context, expression);
+    ASSERT_NE(shared, nullptr);
+    auto workspace = shared->CreateWorkspace();
+    ASSERT_NE(workspace, nullptr);
+    exec::OffsetTruthMask shared_truth;
+    ASSERT_EQ(shared->EvalBatch(*workspace,
+                                candidate_ids.data(),
+                                candidate_ids.size(),
+                                active,
+                                &shared_truth),
+              exec::OffsetEvalStatus::Success);
+    EXPECT_EQ(shared_truth.true_mask & shared_truth.known_mask,
+              candidate_truth);
+}
+
+TEST(OffsetExpressionE0, ComparisonVarcharAndLogicalTreesAgree) {
+    auto schema = std::make_shared<Schema>();
+    const auto id_fid = schema->AddDebugField("id", DataType::INT64);
+    const auto bucket_fid = schema->AddDebugField("bucket", DataType::INT64);
+    const auto tag_fid = schema->AddDebugField("tag", DataType::VARCHAR);
+    schema->set_primary_field_id(id_fid);
+
+    const std::vector<int64_t> ids = {0, 1, 2, 3, 4, 5, 6, 7};
+    const std::vector<int64_t> buckets = {-2, -1, 0, 2, 3, 5, 7, 9};
+    const std::vector<std::string> tags = {
+        "ant", "bee", "cat", "dog", "eel", "fox", "gnu", "猫"};
+    auto insert_data = std::make_unique<InsertRecordProto>();
+    InsertCol(insert_data.get(), ids, (*schema)[id_fid], false);
+    InsertCol(insert_data.get(), buckets, (*schema)[bucket_fid], false);
+    InsertCol(insert_data.get(), tags, (*schema)[tag_fid], false);
+    GeneratedData raw_data;
+    raw_data.schema_ = schema;
+    raw_data.raw_ = insert_data.release();
+    raw_data.raw_->set_num_rows(ids.size());
+    raw_data.row_ids_ = ids;
+    raw_data.timestamps_.assign(ids.size(), 0);
+    auto segment = CreateSealedSegment(schema);
+    LoadGeneratedDataIntoSegment(raw_data, segment.get(), true);
+
+    exec::OffsetVector offsets = {7, 0, 5, 2, 6, 1, 4, 3};
+    std::array<int64_t, 8> candidate_ids{};
+    std::copy(offsets.begin(), offsets.end(), candidate_ids.begin());
+    constexpr uint64_t active = 0xff;
+    auto assert_same = [&](const expr::TypedExprPtr& expression,
+                           const exec::PreparedCandidateEvaluator& candidate) {
+        auto plan = std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID,
+                                                           expression);
+        const auto iterative_result = milvus::test::gen_filter_res(
+            plan.get(), segment.get(), ids.size(), MAX_TIMESTAMP, &offsets);
+        const BitsetTypeView iterative_truth(iterative_result->GetRawData(),
+                                             iterative_result->size());
+        uint64_t candidate_truth = 0;
+        ASSERT_EQ(candidate.view.eval_batch(candidate.view.context,
+                                            candidate_ids.data(),
+                                            candidate_ids.size(),
+                                            active,
+                                            &candidate_truth),
+                  0);
+        ASSERT_EQ(iterative_truth.size(), offsets.size());
+        for (size_t lane = 0; lane < offsets.size(); ++lane) {
+            EXPECT_EQ(iterative_truth[lane],
+                      (candidate_truth & (uint64_t{1} << lane)) != 0)
+                << "lane=" << lane << " row=" << offsets[lane];
+        }
+    };
+
+    proto::plan::GenericValue three;
+    three.set_int64_val(3);
+    auto greater_equal = std::make_shared<expr::UnaryRangeFilterExpr>(
+        expr::ColumnInfo(bucket_fid, DataType::INT64),
+        proto::plan::OpType::GreaterEqual,
+        three);
+    exec::Int64CandidateSourceView numeric_source;
+    numeric_source.row_values = buckets.data();
+    numeric_source.row_count = buckets.size();
+    exec::Int64CandidatePredicate ge_predicate;
+    ge_predicate.op = exec::NumericCandidatePredicateOp::GreaterEqual;
+    ge_predicate.arg0 = 3;
+    auto ge_candidate =
+        exec::PrepareInt64CandidateEvaluator(numeric_source, ge_predicate);
+    ASSERT_TRUE(ge_candidate.has_value());
+    assert_same(greater_equal, *ge_candidate);
+    OpContext op_context;
+    auto shared_ge = exec::PrepareNumericOffsetExpressionEvaluator(
+        segment.get(), &op_context, greater_equal);
+    ASSERT_NE(shared_ge, nullptr);
+    auto shared_ge_workspace = shared_ge->CreateWorkspace();
+    exec::OffsetTruthMask shared_ge_truth;
+    ASSERT_EQ(shared_ge->EvalBatch(*shared_ge_workspace,
+                                   candidate_ids.data(),
+                                   candidate_ids.size(),
+                                   active,
+                                   &shared_ge_truth),
+              exec::OffsetEvalStatus::Success);
+    uint64_t ge_truth = 0;
+    ASSERT_EQ(ge_candidate->view.eval_batch(ge_candidate->view.context,
+                                            candidate_ids.data(),
+                                            candidate_ids.size(),
+                                            active,
+                                            &ge_truth),
+              0);
+    EXPECT_EQ(shared_ge_truth.true_mask & shared_ge_truth.known_mask, ge_truth);
+
+    proto::plan::GenericValue fox;
+    fox.set_string_val("fox");
+    auto not_fox = std::make_shared<expr::UnaryRangeFilterExpr>(
+        expr::ColumnInfo(tag_fid, DataType::VARCHAR),
+        proto::plan::OpType::NotEqual,
+        fox);
+    std::string string_storage;
+    std::array<uint32_t, 9> string_offsets{};
+    for (size_t i = 0; i < tags.size(); ++i) {
+        string_storage.append(tags[i]);
+        string_offsets[i + 1] = string_storage.size();
+    }
+    const std::array<const char*, 1> string_bases = {string_storage.data()};
+    const std::array<const uint32_t*, 1> value_offsets = {
+        string_offsets.data()};
+    const std::array<size_t, 1> row_counts = {tags.size()};
+    const std::array<int64_t, 2> row_offsets = {
+        0, static_cast<int64_t>(tags.size())};
+    exec::StringCandidateSourceView string_source;
+    string_source.chunk_bases = string_bases.data();
+    string_source.chunk_value_offsets = value_offsets.data();
+    string_source.chunk_row_counts = row_counts.data();
+    string_source.chunk_row_offsets = row_offsets.data();
+    string_source.num_chunks = 1;
+    string_source.row_count = tags.size();
+    string_source.uniform_chunk_rows = tags.size();
+    exec::StringCandidatePredicate ne_predicate =
+        exec::StringComparisonCandidatePredicate{
+            tag_fid,
+            DataType::VARCHAR,
+            false,
+            exec::StringCandidateComparisonOp::NotEqual,
+            "fox"};
+    auto ne_candidate =
+        exec::PrepareStringCandidateEvaluator(string_source, ne_predicate);
+    ASSERT_TRUE(ne_candidate.has_value());
+    assert_same(not_fox, *ne_candidate);
+
+    proto::plan::GenericValue five;
+    five.set_int64_val(5);
+    auto equal_five = std::make_shared<expr::UnaryRangeFilterExpr>(
+        expr::ColumnInfo(bucket_fid, DataType::INT64),
+        proto::plan::OpType::Equal,
+        five);
+    proto::plan::GenericValue zero;
+    zero.set_int64_val(0);
+    auto less_zero = std::make_shared<expr::UnaryRangeFilterExpr>(
+        expr::ColumnInfo(bucket_fid, DataType::INT64),
+        proto::plan::OpType::LessThan,
+        zero);
+    auto not_equal_five = std::make_shared<expr::LogicalUnaryExpr>(
+        expr::LogicalUnaryExpr::OpType::LogicalNot, equal_five);
+    auto ge_and_not_five = std::make_shared<expr::LogicalBinaryExpr>(
+        expr::LogicalBinaryExpr::OpType::And, greater_equal, not_equal_five);
+    auto logical = std::make_shared<expr::LogicalBinaryExpr>(
+        expr::LogicalBinaryExpr::OpType::Or, ge_and_not_five, less_zero);
+
+    exec::Int64CandidatePredicate eq_predicate;
+    eq_predicate.op = exec::NumericCandidatePredicateOp::Equal;
+    eq_predicate.arg0 = 5;
+    exec::Int64CandidatePredicate lt_predicate;
+    lt_predicate.op = exec::NumericCandidatePredicateOp::LessThan;
+    lt_predicate.arg0 = 0;
+    auto eq_candidate =
+        exec::PrepareInt64CandidateEvaluator(numeric_source, eq_predicate);
+    auto lt_candidate =
+        exec::PrepareInt64CandidateEvaluator(numeric_source, lt_predicate);
+    ASSERT_TRUE(eq_candidate.has_value());
+    ASSERT_TRUE(lt_candidate.has_value());
+    auto composed = exec::ComposeCandidateEvaluators(
+        {std::move(*ge_candidate),
+         std::move(*eq_candidate),
+         std::move(*lt_candidate)},
+        {{exec::CandidatePredicateNodeType::Leaf, 0, 0},
+         {exec::CandidatePredicateNodeType::Leaf, 1, 0},
+         {exec::CandidatePredicateNodeType::Not, 1, 0},
+         {exec::CandidatePredicateNodeType::And, 0, 2},
+         {exec::CandidatePredicateNodeType::Leaf, 2, 0},
+         {exec::CandidatePredicateNodeType::Or, 3, 4}},
+        5);
+    ASSERT_TRUE(composed.has_value());
+    assert_same(logical, *composed);
+}
+
+TEST(OffsetExpressionE2Benchmark, DISABLED_ModBatch32) {
+    constexpr size_t row_count = 8192;
+    constexpr size_t batch_count = 2048;
+    constexpr size_t repeats = 20;
+    constexpr size_t width = 32;
+
+    auto schema = std::make_shared<Schema>();
+    const auto id_fid = schema->AddDebugField("id", DataType::INT64);
+    const auto bucket_fid = schema->AddDebugField("bucket", DataType::INT64);
+    schema->set_primary_field_id(id_fid);
+    std::vector<int64_t> ids(row_count);
+    std::vector<int64_t> buckets(row_count);
+    std::iota(ids.begin(), ids.end(), int64_t{0});
+    for (size_t row = 0; row < row_count; ++row) {
+        buckets[row] = static_cast<int64_t>(row % 10000);
+    }
+    auto insert_data = std::make_unique<InsertRecordProto>();
+    InsertCol(insert_data.get(), ids, (*schema)[id_fid], false);
+    InsertCol(insert_data.get(), buckets, (*schema)[bucket_fid], false);
+    GeneratedData raw_data;
+    raw_data.schema_ = schema;
+    raw_data.raw_ = insert_data.release();
+    raw_data.raw_->set_num_rows(row_count);
+    raw_data.row_ids_ = ids;
+    raw_data.timestamps_.assign(row_count, 0);
+    auto segment = CreateSealedSegment(schema);
+    LoadGeneratedDataIntoSegment(raw_data, segment.get(), true);
+
+    proto::plan::GenericValue threshold;
+    threshold.set_int64_val(3);
+    proto::plan::GenericValue divisor;
+    divisor.set_int64_val(5);
+    auto expression = std::make_shared<expr::BinaryArithOpEvalRangeExpr>(
+        expr::ColumnInfo(bucket_fid, DataType::INT64),
+        proto::plan::OpType::LessThan,
+        proto::plan::ArithOpType::Mod,
+        threshold,
+        divisor);
+
+    auto query_context = std::make_shared<exec::QueryContext>(
+        DEAFULT_QUERY_ID, segment.get(), row_count, MAX_TIMESTAMP);
+    auto exec_context =
+        std::make_unique<exec::ExecContext>(query_context.get());
+    exec::ExprSet legacy({expression}, exec_context.get());
+    exec::OffsetVector legacy_offsets;
+    legacy_offsets.reserve(width);
+    exec::EvalCtx eval_ctx(exec_context.get(), &legacy_offsets);
+    std::vector<VectorPtr> legacy_results;
+
+    OpContext op_context;
+    auto shared = exec::PrepareNumericOffsetExpressionEvaluator(
+        segment.get(), &op_context, expression);
+    ASSERT_NE(shared, nullptr);
+    auto workspace = shared->CreateWorkspace();
+    ASSERT_NE(workspace, nullptr);
+
+    std::vector<std::array<int32_t, width>> batches(batch_count);
+    uint64_t state = 0x9e3779b97f4a7c15ULL;
+    for (auto& batch : batches) {
+        for (auto& row : batch) {
+            state ^= state << 7;
+            state ^= state >> 9;
+            row = static_cast<int32_t>(state % row_count);
+        }
+    }
+
+    auto run_legacy = [&] {
+        uint64_t checksum = 0;
+        const auto start = std::chrono::steady_clock::now();
+        for (size_t repeat = 0; repeat < repeats; ++repeat) {
+            for (const auto& batch : batches) {
+                legacy_offsets.assign(batch.begin(), batch.end());
+                legacy.Eval(0, 1, true, eval_ctx, legacy_results);
+                auto result =
+                    std::dynamic_pointer_cast<ColumnVector>(legacy_results[0]);
+                const BitsetTypeView truth(result->GetRawData(), width);
+                for (size_t lane = 0; lane < width; ++lane) {
+                    checksum += truth[lane];
+                }
+            }
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        return std::pair{
+            checksum,
+            std::chrono::duration<double, std::nano>(elapsed).count() /
+                (repeats * batch_count * width)};
+    };
+    auto run_shared = [&] {
+        uint64_t checksum = 0;
+        std::array<int64_t, width> widened{};
+        const auto start = std::chrono::steady_clock::now();
+        for (size_t repeat = 0; repeat < repeats; ++repeat) {
+            for (const auto& batch : batches) {
+                std::copy(batch.begin(), batch.end(), widened.begin());
+                exec::OffsetTruthMask truth;
+                const auto status = shared->EvalBatch(
+                    *workspace, widened.data(), width, 0xffffffffU, &truth);
+                if (status != exec::OffsetEvalStatus::Success) {
+                    throw std::runtime_error("shared evaluator failed");
+                }
+                checksum += std::popcount(truth.true_mask & truth.known_mask);
+            }
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        return std::pair{
+            checksum,
+            std::chrono::duration<double, std::nano>(elapsed).count() /
+                (repeats * batch_count * width)};
+    };
+
+    run_legacy();
+    run_shared();
+    const auto [legacy_checksum_a, legacy_ns_a] = run_legacy();
+    const auto [shared_checksum_b1, shared_ns_b1] = run_shared();
+    const auto [shared_checksum_b2, shared_ns_b2] = run_shared();
+    const auto [legacy_checksum_a2, legacy_ns_a2] = run_legacy();
+    EXPECT_EQ(legacy_checksum_a2, legacy_checksum_a);
+    EXPECT_EQ(shared_checksum_b1, legacy_checksum_a);
+    EXPECT_EQ(shared_checksum_b2, legacy_checksum_a);
+    const auto legacy_ns = (legacy_ns_a + legacy_ns_a2) / 2.0;
+    const auto shared_ns = (shared_ns_b1 + shared_ns_b2) / 2.0;
+    std::cout << "offset_evaluator_mod_batch32 legacy_ns_per_candidate="
+              << legacy_ns << " shared_ns_per_candidate=" << shared_ns
+              << " ratio=" << shared_ns / legacy_ns << std::endl;
 }
 
 TEST(CandidateEvaluatorTest, Int64ComparisonRangeAndTermStayMilvusOwned) {

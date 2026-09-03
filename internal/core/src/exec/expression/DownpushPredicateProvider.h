@@ -5,6 +5,7 @@
 
 #include <optional>
 
+#include "exec/expression/OffsetExpressionEvaluator.h"
 #include "exec/operator/DownpushSearchContext.h"
 #include "expr/ITypeExpr.h"
 
@@ -21,6 +22,15 @@ TryCompileNumericArithmeticCandidateLeaf(
 // literals.
 std::optional<CandidateLeafPlan>
 TryCompileNumericCandidateLeaf(const expr::TypedExprPtr& expression);
+
+// Stage-8E vertical slice: prepare one sealed, non-nullable INT64 comparison
+// or constrained MOD leaf as the shared random-offset evaluator. Unsupported
+// layouts and expressions return nullptr so iterative keeps its existing path.
+std::shared_ptr<const PreparedOffsetExpressionEvaluator>
+PrepareNumericOffsetExpressionEvaluator(
+    const segcore::SegmentInternalInterface* segment,
+    OpContext* op_context,
+    const expr::TypedExprPtr& expression);
 
 std::optional<CandidateLeafPlan>
 TryCompileStringCandidateLeaf(const expr::TypedExprPtr& expression);

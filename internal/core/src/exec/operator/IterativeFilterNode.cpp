@@ -18,6 +18,7 @@
 
 #include <string.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -40,6 +41,7 @@
 #include "common/Utils.h"
 #include "exec/QueryContext.h"
 #include "exec/expression/EvalCtx.h"
+#include "exec/expression/DownpushPredicateProvider.h"
 #include "expr/ITypeExpr.h"
 #include "fmt/core.h"
 #include "folly/FBVector.h"
@@ -69,6 +71,18 @@ PhyIterativeFilterNode::PhyIterativeFilterNode(
     for (const auto& expr : exprs) {
         is_native_supported_ =
             (is_native_supported_ && (expr->SupportOffsetInput()));
+    }
+    if (is_native_supported_) {
+        offset_evaluator_ = PrepareNumericOffsetExpressionEvaluator(
+            query_context_->get_segment(),
+            query_context_->get_op_context(),
+            filter->filter());
+        if (offset_evaluator_ != nullptr) {
+            offset_eval_workspace_ = offset_evaluator_->CreateWorkspace();
+            if (offset_eval_workspace_ == nullptr) {
+                offset_evaluator_.reset();
+            }
+        }
     }
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
@@ -279,7 +293,56 @@ PhyIterativeFilterNode::GetOutput() {
                     eval_offsets = &offsets;
                 }
 
-                if (is_native_supported_) {
+                if (offset_evaluator_ != nullptr) {
+                    Assert(!element_level);
+                    std::array<int64_t, 64> row_ids{};
+                    for (size_t begin = 0; begin < eval_offsets->size();
+                         begin += row_ids.size()) {
+                        const auto count = static_cast<uint32_t>(std::min(
+                            row_ids.size(), eval_offsets->size() - begin));
+                        for (uint32_t lane = 0; lane < count; ++lane) {
+                            row_ids[lane] = (*eval_offsets)[begin + lane];
+                        }
+                        const auto active =
+                            count == 64
+                                ? ~uint64_t{0}
+                                : ((uint64_t{1} << count) - uint64_t{1});
+                        OffsetTruthMask truth;
+                        const auto status = offset_evaluator_->EvalBatch(
+                            *offset_eval_workspace_,
+                            row_ids.data(),
+                            count,
+                            active,
+                            &truth);
+                        AssertInfo(
+                            status == OffsetEvalStatus::Success,
+                            "shared offset expression evaluation failed: {}",
+                            static_cast<int32_t>(status));
+                        const auto accepted =
+                            truth.true_mask & truth.known_mask;
+                        for (uint32_t lane = 0; lane < count; ++lane) {
+                            if ((accepted & (uint64_t{1} << lane)) == 0) {
+                                continue;
+                            }
+                            const auto index = static_cast<int>(begin + lane);
+                            insert_helper(search_result,
+                                          topk,
+                                          large_is_better,
+                                          distances,
+                                          nq_index,
+                                          unity_topk,
+                                          index,
+                                          offsets[index],
+                                          std::nullopt);
+                            if (topk == unity_topk) {
+                                break;
+                            }
+                        }
+                        if (topk == unity_topk) {
+                            break;
+                        }
+                    }
+                } else if (is_native_supported_) {
                     eval_ctx.set_offset_input(eval_offsets);
                     std::vector<VectorPtr> results;
                     exprs_->Eval(0, 1, true, eval_ctx, results);

@@ -94,7 +94,7 @@ TEST(IterativeFilter, SealedIndex) {
     schema->AddDebugField("int8", DataType::INT8);
     auto int16_fid = schema->AddDebugField("int16", DataType::INT16);
     schema->AddDebugField("int32", DataType::INT32);
-    schema->AddDebugField("int64", DataType::INT64);
+    auto int64_fid = schema->AddDebugField("int64", DataType::INT64);
     auto str_fid = schema->AddDebugField("string1", DataType::VARCHAR);
     schema->AddDebugField("bool", DataType::BOOL);
     schema->set_primary_field_id(str_fid);
@@ -123,6 +123,20 @@ TEST(IterativeFilter, SealedIndex) {
                 for (auto v : int16_vals) int_data->add_data(v);
                 break;
             }
+        }
+    }
+
+    // Keep the Stage 8E INT64 predicates deterministic and ensure both have
+    // more than topK matches.
+    for (int i = 0; i < raw_data.raw_->fields_data_size(); ++i) {
+        auto* fd = raw_data.raw_->mutable_fields_data(i);
+        if (fd->field_id() == int64_fid.get()) {
+            auto* long_data = fd->mutable_scalars()->mutable_long_data();
+            long_data->clear_data();
+            for (size_t row = 0; row < N; ++row) {
+                long_data->add_data(static_cast<int64_t>(row));
+            }
+            break;
         }
     }
 
@@ -199,6 +213,36 @@ TEST(IterativeFilter, SealedIndex) {
             segment->Search(plan2.get(), ph_group.get(), MAX_TIMESTAMP);
         CheckFilterSearchResult(
             *search_result, *search_result2, topK, num_queries);
+    }
+
+    // Stage 8E shared evaluator vertical slice: these sealed, non-nullable
+    // INT64 root leaves use PreparedOffsetExpressionEvaluator in iterative
+    // execution and must remain identical to pre-filter search.
+    for (const auto& predicate : {"int64 >= 10", "int64 % 5 < 3"}) {
+        auto iterative_bytes = handle.ParseSearch(predicate,
+                                                  "fakevec",
+                                                  topK,
+                                                  "L2",
+                                                  "{\"ef\": 50}",
+                                                  -1,
+                                                  "iterative_filter");
+        auto iterative_plan = CreateSearchPlanByExpr(
+            schema, iterative_bytes.data(), iterative_bytes.size());
+        constexpr int num_queries = 1;
+        auto placeholder_raw = CreatePlaceholderGroup(num_queries, dim, 1024);
+        auto placeholder = ParsePlaceholderGroup(
+            iterative_plan.get(), placeholder_raw.SerializeAsString());
+        auto iterative_result = segment->Search(
+            iterative_plan.get(), placeholder.get(), MAX_TIMESTAMP);
+
+        auto baseline_bytes = handle.ParseSearch(
+            predicate, "fakevec", topK, "L2", "{\"ef\": 50}");
+        auto baseline_plan = CreateSearchPlanByExpr(
+            schema, baseline_bytes.data(), baseline_bytes.size());
+        auto baseline_result = segment->Search(
+            baseline_plan.get(), placeholder.get(), MAX_TIMESTAMP);
+        CheckFilterSearchResult(
+            *iterative_result, *baseline_result, topK, num_queries);
     }
 
     // no expr

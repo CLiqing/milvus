@@ -10,6 +10,7 @@
 
 #include "exec/expression/NumericCandidateEvaluator.h"
 #include "exec/expression/BinaryArithOpEvalRangeExprUtils.h"
+#include "exec/expression/UnaryPredicateUtils.h"
 #include "exec/operator/NumericCandidateSourceOwner.h"
 #include "segcore/SegmentInterface.h"
 
@@ -51,6 +52,45 @@ struct FloatEvaluatorState {
     bool upper_inclusive = true;
     std::vector<float> terms;
 };
+
+struct NumericOffsetWorkspace : OffsetEvalWorkspace {};
+
+struct NumericOffsetProgram {
+    PreparedCandidateLeaf leaf;
+};
+
+std::unique_ptr<OffsetEvalWorkspace>
+CreateNumericOffsetWorkspace(const void*) {
+    return std::make_unique<NumericOffsetWorkspace>();
+}
+
+int32_t
+EvaluateNumericOffsetBatch(const void* opaque,
+                           OffsetEvalWorkspace&,
+                           const int64_t* row_ids,
+                           uint32_t count,
+                           uint64_t active_mask,
+                           OffsetTruthMask* result) {
+    const auto& program = *static_cast<const NumericOffsetProgram*>(opaque);
+    const auto& evaluator = program.leaf.evaluator;
+    if (evaluator.eval_truth_batch != nullptr) {
+        return evaluator.eval_truth_batch(evaluator.view.context,
+                                          row_ids,
+                                          count,
+                                          active_mask,
+                                          &result->true_mask,
+                                          &result->known_mask);
+    }
+    const auto status = evaluator.view.eval_batch(evaluator.view.context,
+                                                  row_ids,
+                                                  count,
+                                                  active_mask,
+                                                  &result->true_mask);
+    if (status == 0) {
+        result->known_mask = active_mask;
+    }
+    return status;
+}
 
 const int64_t*
 ResolveInt64CandidateValue(const Int64CandidateSourceView& source,
@@ -127,20 +167,26 @@ bool
 EvaluateInt64ValueSpecialized(const Int64EvaluatorState& state,
                               int64_t value) noexcept {
     if constexpr (Op == Int64EvaluatorOp::GreaterEqual) {
-        return value >= state.arg0;
+        return EvaluateUnaryPredicate<proto::plan::OpType::GreaterEqual>(
+            value, state.arg0);
     } else if constexpr (Op == Int64EvaluatorOp::ModLessThan) {
         return EvaluateNumericArithmeticLessThan<
             proto::plan::ArithOpType::Mod>(value, state.arg0, state.arg1);
     } else if constexpr (Op == Int64EvaluatorOp::GreaterThan) {
-        return value > state.arg0;
+        return EvaluateUnaryPredicate<proto::plan::OpType::GreaterThan>(
+            value, state.arg0);
     } else if constexpr (Op == Int64EvaluatorOp::LessEqual) {
-        return value <= state.arg0;
+        return EvaluateUnaryPredicate<proto::plan::OpType::LessEqual>(
+            value, state.arg0);
     } else if constexpr (Op == Int64EvaluatorOp::LessThan) {
-        return value < state.arg0;
+        return EvaluateUnaryPredicate<proto::plan::OpType::LessThan>(
+            value, state.arg0);
     } else if constexpr (Op == Int64EvaluatorOp::Equal) {
-        return value == state.arg0;
+        return EvaluateUnaryPredicate<proto::plan::OpType::Equal>(value,
+                                                                  state.arg0);
     } else if constexpr (Op == Int64EvaluatorOp::NotEqual) {
-        return value != state.arg0;
+        return EvaluateUnaryPredicate<proto::plan::OpType::NotEqual>(
+            value, state.arg0);
     } else if constexpr (Op == Int64EvaluatorOp::Range) {
         const bool lower_ok =
             state.lower_inclusive ? value >= state.arg0 : value > state.arg0;
@@ -999,6 +1045,58 @@ TryCompileNumericCandidateLeaf(const expr::TypedExprPtr& expression) {
         predicate.terms.clear();
     }
     return make_int_plan(std::move(predicate));
+}
+
+std::shared_ptr<const PreparedOffsetExpressionEvaluator>
+PrepareNumericOffsetExpressionEvaluator(
+    const segcore::SegmentInternalInterface* segment,
+    OpContext* op_context,
+    const expr::TypedExprPtr& expression) {
+    if (segment == nullptr || segment->type() != SegmentType::Sealed ||
+        segment->get_schema().get_ttl_field_id().has_value()) {
+        return nullptr;
+    }
+
+    bool is_int64 = false;
+    if (const auto unary =
+            std::dynamic_pointer_cast<const expr::UnaryRangeFilterExpr>(
+                expression)) {
+        is_int64 = unary->column_.data_type_ == DataType::INT64;
+    } else if (const auto arithmetic = std::dynamic_pointer_cast<
+                   const expr::BinaryArithOpEvalRangeExpr>(expression)) {
+        is_int64 = arithmetic->column_.data_type_ == DataType::INT64 &&
+                   arithmetic->arith_op_type_ == proto::plan::ArithOpType::Mod;
+    }
+    if (!is_int64) {
+        return nullptr;
+    }
+
+    std::optional<CandidateLeafPlan> plan;
+    if (const auto arithmetic =
+            std::dynamic_pointer_cast<const expr::BinaryArithOpEvalRangeExpr>(
+                expression)) {
+        plan = TryCompileNumericArithmeticCandidateLeaf(*arithmetic);
+    } else {
+        plan = TryCompileNumericCandidateLeaf(expression);
+    }
+    if (!plan.has_value()) {
+        return nullptr;
+    }
+    std::optional<PreparedCandidateLeaf> leaf;
+    try {
+        leaf = plan->prepare(segment, op_context, plan->typed_state.get());
+    } catch (...) {
+        return nullptr;
+    }
+    if (!leaf.has_value() || !static_cast<bool>(leaf->evaluator)) {
+        return nullptr;
+    }
+    auto program = std::make_shared<const NumericOffsetProgram>(
+        NumericOffsetProgram{std::move(*leaf)});
+    return PreparedOffsetExpressionEvaluator::Create(
+        std::move(program),
+        &CreateNumericOffsetWorkspace,
+        &EvaluateNumericOffsetBatch);
 }
 
 std::optional<CandidateLeafPlan>
