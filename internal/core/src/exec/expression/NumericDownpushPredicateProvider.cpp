@@ -882,15 +882,17 @@ PrepareInt64PredicateLeaf(const segcore::SegmentInternalInterface* segment,
         [&](const Int64CandidateSourceView& source) {
             return PrepareInt64CandidateEvaluator(source, predicate);
         });
-    const bool is_comparison =
+    const bool supports_shared_offset =
         predicate.op == NumericCandidatePredicateOp::Equal ||
         predicate.op == NumericCandidatePredicateOp::NotEqual ||
         predicate.op == NumericCandidatePredicateOp::LessThan ||
         predicate.op == NumericCandidatePredicateOp::LessEqual ||
         predicate.op == NumericCandidatePredicateOp::GreaterThan ||
-        predicate.op == NumericCandidatePredicateOp::GreaterEqual;
+        predicate.op == NumericCandidatePredicateOp::GreaterEqual ||
+        predicate.op == NumericCandidatePredicateOp::Range ||
+        predicate.op == NumericCandidatePredicateOp::Term;
     if (leaf.has_value() && predicate.field_data_type == DataType::INT64 &&
-        is_comparison &&
+        supports_shared_offset &&
         !segment->get_schema().get_ttl_field_id().has_value()) {
         leaf->offset_evaluator = MakeNumericOffsetEvaluator(*leaf);
     }
@@ -1091,6 +1093,14 @@ PrepareNumericOffsetExpressionEvaluator(
             std::dynamic_pointer_cast<const expr::UnaryRangeFilterExpr>(
                 expression)) {
         is_int64 = unary->column_.data_type_ == DataType::INT64;
+    } else if (const auto range =
+                   std::dynamic_pointer_cast<const expr::BinaryRangeFilterExpr>(
+                       expression)) {
+        is_int64 = range->column_.data_type_ == DataType::INT64;
+    } else if (const auto term =
+                   std::dynamic_pointer_cast<const expr::TermFilterExpr>(
+                       expression)) {
+        is_int64 = term->column_.data_type_ == DataType::INT64;
     } else if (const auto arithmetic = std::dynamic_pointer_cast<
                    const expr::BinaryArithOpEvalRangeExpr>(expression)) {
         is_int64 = arithmetic->column_.data_type_ == DataType::INT64 &&

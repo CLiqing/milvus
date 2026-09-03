@@ -297,33 +297,78 @@ TEST(OffsetExpressionE0, ComparisonVarcharAndLogicalTreesAgree) {
     exec::Int64CandidateSourceView numeric_source;
     numeric_source.row_values = buckets.data();
     numeric_source.row_count = buckets.size();
+    OpContext op_context;
+    auto assert_numeric_shared =
+        [&](const expr::TypedExprPtr& expression,
+            const exec::PreparedCandidateEvaluator& candidate) {
+            assert_same(expression, candidate);
+            auto shared = exec::PrepareNumericOffsetExpressionEvaluator(
+                segment.get(), &op_context, expression);
+            ASSERT_NE(shared, nullptr);
+            auto workspace = shared->CreateWorkspace();
+            ASSERT_NE(workspace, nullptr);
+            exec::OffsetTruthMask shared_truth;
+            ASSERT_EQ(shared->EvalBatch(*workspace,
+                                        candidate_ids.data(),
+                                        candidate_ids.size(),
+                                        active,
+                                        &shared_truth),
+                      exec::OffsetEvalStatus::Success);
+            uint64_t candidate_truth = 0;
+            ASSERT_EQ(candidate.view.eval_batch(candidate.view.context,
+                                                candidate_ids.data(),
+                                                candidate_ids.size(),
+                                                active,
+                                                &candidate_truth),
+                      0);
+            EXPECT_EQ(shared_truth.true_mask & shared_truth.known_mask,
+                      candidate_truth);
+        };
+
     exec::Int64CandidatePredicate ge_predicate;
     ge_predicate.op = exec::NumericCandidatePredicateOp::GreaterEqual;
     ge_predicate.arg0 = 3;
     auto ge_candidate =
         exec::PrepareInt64CandidateEvaluator(numeric_source, ge_predicate);
     ASSERT_TRUE(ge_candidate.has_value());
-    assert_same(greater_equal, *ge_candidate);
-    OpContext op_context;
-    auto shared_ge = exec::PrepareNumericOffsetExpressionEvaluator(
-        segment.get(), &op_context, greater_equal);
-    ASSERT_NE(shared_ge, nullptr);
-    auto shared_ge_workspace = shared_ge->CreateWorkspace();
-    exec::OffsetTruthMask shared_ge_truth;
-    ASSERT_EQ(shared_ge->EvalBatch(*shared_ge_workspace,
-                                   candidate_ids.data(),
-                                   candidate_ids.size(),
-                                   active,
-                                   &shared_ge_truth),
-              exec::OffsetEvalStatus::Success);
-    uint64_t ge_truth = 0;
-    ASSERT_EQ(ge_candidate->view.eval_batch(ge_candidate->view.context,
-                                            candidate_ids.data(),
-                                            candidate_ids.size(),
-                                            active,
-                                            &ge_truth),
-              0);
-    EXPECT_EQ(shared_ge_truth.true_mask & shared_ge_truth.known_mask, ge_truth);
+    assert_numeric_shared(greater_equal, *ge_candidate);
+
+    proto::plan::GenericValue lower;
+    lower.set_int64_val(-1);
+    proto::plan::GenericValue upper;
+    upper.set_int64_val(7);
+    auto range = std::make_shared<expr::BinaryRangeFilterExpr>(
+        expr::ColumnInfo(bucket_fid, DataType::INT64),
+        lower,
+        upper,
+        false,
+        true);
+    exec::Int64CandidatePredicate range_predicate;
+    range_predicate.op = exec::NumericCandidatePredicateOp::Range;
+    range_predicate.arg0 = -1;
+    range_predicate.arg1 = 7;
+    range_predicate.lower_inclusive = false;
+    range_predicate.upper_inclusive = true;
+    auto range_candidate = exec::PrepareInt64CandidateEvaluator(
+        numeric_source, range_predicate);
+    ASSERT_TRUE(range_candidate.has_value());
+    assert_numeric_shared(range, *range_candidate);
+
+    std::vector<proto::plan::GenericValue> term_values;
+    for (const auto value : {-2, 2, 7}) {
+        proto::plan::GenericValue term_value;
+        term_value.set_int64_val(value);
+        term_values.push_back(std::move(term_value));
+    }
+    auto term = std::make_shared<expr::TermFilterExpr>(
+        expr::ColumnInfo(bucket_fid, DataType::INT64), term_values);
+    exec::Int64CandidatePredicate term_predicate;
+    term_predicate.op = exec::NumericCandidatePredicateOp::Term;
+    term_predicate.terms = {-2, 2, 7};
+    auto term_candidate =
+        exec::PrepareInt64CandidateEvaluator(numeric_source, term_predicate);
+    ASSERT_TRUE(term_candidate.has_value());
+    assert_numeric_shared(term, *term_candidate);
 
     proto::plan::GenericValue fox;
     fox.set_string_val("fox");
