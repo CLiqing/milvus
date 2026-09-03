@@ -41,6 +41,7 @@
 #include "common/Utils.h"
 #include "exec/QueryContext.h"
 #include "exec/expression/CandidateEvaluator.h"
+#include "exec/expression/OffsetExpressionEvaluator.h"
 #include "exec/expression/Utils.h"
 #include "exec/operator/Utils.h"
 #include "exec/operator/DownpushSearchContext.h"
@@ -58,6 +59,7 @@ namespace exec {
 
 struct PreparedFusingBundle {
     std::optional<PreparedCandidateEvaluator> candidate_evaluator_;
+    bool uses_shared_offset_evaluator_{false};
     std::vector<std::shared_ptr<const void>> opaque_resource_owners_;
     std::weak_ptr<PreparedFusingBundle> self_;
 };
@@ -71,8 +73,7 @@ AcquireAnnFilterFusingLease(const void* opaque) noexcept {
     }
     try {
         const auto& weak =
-            *static_cast<const std::weak_ptr<PreparedFusingBundle>*>(
-                opaque);
+            *static_cast<const std::weak_ptr<PreparedFusingBundle>*>(opaque);
         auto owner = weak.lock();
         if (owner == nullptr) {
             return nullptr;
@@ -92,10 +93,9 @@ ReleaseAnnFilterFusingLease(void* opaque) noexcept {
 }  // namespace
 
 std::shared_ptr<PreparedFusingBundle>
-PrepareAnnFilterFusingBundle(
-    const segcore::SegmentInternalInterface* segment,
-    OpContext* op_context,
-    const AnnFilterFusingProgram& program) {
+PrepareAnnFilterFusingBundle(const segcore::SegmentInternalInterface* segment,
+                             OpContext* op_context,
+                             const AnnFilterFusingProgram& program) {
     if (program.leaves.empty() || program.nodes.empty() ||
         program.root >= program.nodes.size()) {
         return nullptr;
@@ -104,6 +104,10 @@ PrepareAnnFilterFusingBundle(
     context->self_ = context;
     std::vector<PreparedCandidateEvaluator> evaluators;
     evaluators.reserve(program.leaves.size());
+    std::vector<std::shared_ptr<const PreparedOffsetExpressionEvaluator>>
+        offset_evaluators;
+    offset_evaluators.reserve(program.leaves.size());
+    bool all_leaves_use_shared_offset_evaluator = true;
     for (const auto& plan : program.leaves) {
         if (!static_cast<bool>(plan)) {
             return nullptr;
@@ -119,27 +123,63 @@ PrepareAnnFilterFusingBundle(
             LOG_WARN("typed fusing leaf preparation failed with unknown error");
             return nullptr;
         }
-        if (!prepared.has_value() ||
-            !static_cast<bool>(prepared->evaluator)) {
+        if (!prepared.has_value() || !static_cast<bool>(prepared->evaluator)) {
             return nullptr;
         }
+        all_leaves_use_shared_offset_evaluator &=
+            prepared->offset_evaluator != nullptr;
+        offset_evaluators.push_back(prepared->offset_evaluator);
         evaluators.push_back(std::move(prepared->evaluator));
         context->opaque_resource_owners_.insert(
             context->opaque_resource_owners_.end(),
             std::make_move_iterator(prepared->resource_owners.begin()),
             std::make_move_iterator(prepared->resource_owners.end()));
     }
-    auto composite = ComposeCandidateEvaluators(
-        std::move(evaluators), program.nodes, program.root);
-    if (!composite.has_value()) {
-        return nullptr;
+    if (all_leaves_use_shared_offset_evaluator) {
+        std::vector<OffsetExpressionNode> nodes;
+        nodes.reserve(program.nodes.size());
+        for (const auto& node : program.nodes) {
+            OffsetExpressionNodeType type;
+            switch (node.type) {
+                case CandidatePredicateNodeType::Leaf:
+                    type = OffsetExpressionNodeType::Leaf;
+                    break;
+                case CandidatePredicateNodeType::Not:
+                    type = OffsetExpressionNodeType::Not;
+                    break;
+                case CandidatePredicateNodeType::And:
+                    type = OffsetExpressionNodeType::And;
+                    break;
+                case CandidatePredicateNodeType::Or:
+                    type = OffsetExpressionNodeType::Or;
+                    break;
+            }
+            nodes.push_back(OffsetExpressionNode{type, node.left, node.right});
+        }
+        auto shared = ComposeOffsetExpressionEvaluators(
+            std::move(offset_evaluators), std::move(nodes), program.root);
+        auto adapted = AdaptOffsetExpressionEvaluator(std::move(shared));
+        if (!adapted.has_value()) {
+            return nullptr;
+        }
+        context->candidate_evaluator_ = std::move(*adapted);
+        context->uses_shared_offset_evaluator_ = true;
+    } else {
+        auto composite = ComposeCandidateEvaluators(
+            std::move(evaluators), program.nodes, program.root);
+        if (!composite.has_value()) {
+            return nullptr;
+        }
+        context->candidate_evaluator_ = std::move(*composite);
     }
-    context->candidate_evaluator_ = std::move(*composite);
     return context;
 }
 
 const char*
 AnnFilterFusingSourceName(const PreparedFusingBundle& context) {
+    if (context.uses_shared_offset_evaluator_) {
+        return "shared_offset_evaluator";
+    }
     if (!context.opaque_resource_owners_.empty()) {
         return "typed_candidate_evaluator";
     }

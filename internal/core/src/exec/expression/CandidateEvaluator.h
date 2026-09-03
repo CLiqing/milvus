@@ -14,6 +14,7 @@
 namespace milvus::exec {
 
 struct CandidatePredicateNode;
+class PreparedOffsetExpressionEvaluator;
 
 using CandidateEvaluatorV1 = knowhere::CandidateEvaluatorV1;
 using CandidateEvalBatchFn = knowhere::CandidateEvalBatchFn;
@@ -58,5 +59,12 @@ std::optional<PreparedCandidateEvaluator>
 ComposeCandidateEvaluators(std::vector<PreparedCandidateEvaluator> leaves,
                            const std::vector<CandidatePredicateNode>& nodes,
                            size_t root);
+
+// Exposes a Milvus-owned shared offset evaluator through Knowhere's opaque
+// callback ABI. Cardinal creates one independent workspace per NQ worker or
+// iterator and never observes expression types, operations, or literals.
+std::optional<PreparedCandidateEvaluator>
+AdaptOffsetExpressionEvaluator(
+    std::shared_ptr<const PreparedOffsetExpressionEvaluator> evaluator);
 
 }  // namespace milvus::exec

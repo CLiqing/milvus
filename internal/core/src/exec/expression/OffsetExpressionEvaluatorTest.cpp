@@ -2,6 +2,7 @@
 // license agreements. Licensed under the Apache License, Version 2.0.
 
 #include "exec/expression/OffsetExpressionEvaluator.h"
+#include "exec/expression/CandidateEvaluator.h"
 
 #include <array>
 #include <atomic>
@@ -240,6 +241,41 @@ TEST(OffsetExpressionEvaluatorTest, UsesOneWorkspacePerConcurrentWorker) {
     for (auto& worker : workers) {
         EXPECT_EQ(worker.get(), 1000);
     }
+}
+
+TEST(OffsetExpressionEvaluatorTest,
+     CandidateAdapterUsesCallerOwnedIndependentWorkspaces) {
+    auto adapted = AdaptOffsetExpressionEvaluator(MakeFakeEvaluator());
+    ASSERT_TRUE(adapted.has_value());
+    const auto& view = adapted->view;
+    EXPECT_NE(view.abi_capabilities &
+                  knowhere::kCandidateEvaluatorCapabilityWorkerWorkspace,
+              0);
+    ASSERT_NE(view.create_workspace, nullptr);
+    ASSERT_NE(view.release_workspace, nullptr);
+    ASSERT_NE(view.eval_batch_with_workspace, nullptr);
+    ASSERT_NE(view.eval_contiguous_with_workspace, nullptr);
+
+    void* first = view.create_workspace(view.context);
+    void* second = view.create_workspace(view.context);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    EXPECT_NE(first, second);
+
+    const std::array<int64_t, 8> ids{0, 1, 2, 3, 4, 5, 6, 7};
+    uint64_t accepted = 0;
+    EXPECT_EQ(view.eval_batch_with_workspace(
+                  view.context, first, ids.data(), ids.size(), 0xff, &accepted),
+              0);
+    EXPECT_EQ(accepted, uint64_t{0b01001001});
+    accepted = 0;
+    EXPECT_EQ(view.eval_contiguous_with_workspace(
+                  view.context, second, 0, 8, 0xff, &accepted),
+              0);
+    EXPECT_EQ(accepted, uint64_t{0b01001001});
+
+    view.release_workspace(first);
+    view.release_workspace(second);
 }
 
 }  // namespace

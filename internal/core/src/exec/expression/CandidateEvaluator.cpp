@@ -6,6 +6,7 @@
 #include <array>
 #include <utility>
 
+#include "exec/expression/OffsetExpressionEvaluator.h"
 #include "exec/operator/DownpushSearchContext.h"
 
 namespace milvus::exec {
@@ -22,11 +23,114 @@ struct CompositeEvaluatorState {
     size_t root{0};
 };
 
+struct OffsetEvaluatorAdapterState {
+    std::shared_ptr<const PreparedOffsetExpressionEvaluator> evaluator;
+};
+
 uint64_t
 LaneMask(uint32_t count) noexcept {
     return count == 64
                ? ~uint64_t{0}
                : (count == 0 ? uint64_t{0} : ((uint64_t{1} << count) - 1));
+}
+
+int32_t
+EvalOffsetWithWorkspace(const void* opaque,
+                        void* opaque_workspace,
+                        const int64_t* ids,
+                        uint32_t count,
+                        uint64_t active_mask,
+                        uint64_t* accepted_mask) noexcept {
+    if (opaque == nullptr || opaque_workspace == nullptr ||
+        accepted_mask == nullptr) {
+        return -1;
+    }
+    const auto& state =
+        *static_cast<const OffsetEvaluatorAdapterState*>(opaque);
+    auto& workspace = *static_cast<OffsetEvalWorkspace*>(opaque_workspace);
+    OffsetTruthMask truth;
+    const auto status =
+        state.evaluator->EvalBatch(workspace, ids, count, active_mask, &truth);
+    if (status != OffsetEvalStatus::Success) {
+        *accepted_mask = 0;
+        return -1;
+    }
+    *accepted_mask = truth.true_mask & truth.known_mask;
+    return 0;
+}
+
+int32_t
+EvalOffsetContiguousWithWorkspace(const void* opaque,
+                                  void* opaque_workspace,
+                                  int64_t first_id,
+                                  uint32_t count,
+                                  uint64_t active_mask,
+                                  uint64_t* accepted_mask) noexcept {
+    if (first_id < 0 || count > 64) {
+        return -1;
+    }
+    std::array<int64_t, 64> ids{};
+    for (uint32_t lane = 0; lane < count; ++lane) {
+        ids[lane] = first_id + static_cast<int64_t>(lane);
+    }
+    return EvalOffsetWithWorkspace(opaque,
+                                   opaque_workspace,
+                                   ids.data(),
+                                   count,
+                                   active_mask,
+                                   accepted_mask);
+}
+
+void*
+CreateOffsetWorkspace(const void* opaque) noexcept {
+    if (opaque == nullptr) {
+        return nullptr;
+    }
+    try {
+        const auto& state =
+            *static_cast<const OffsetEvaluatorAdapterState*>(opaque);
+        return state.evaluator->CreateWorkspace().release();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void
+ReleaseOffsetWorkspace(void* workspace) noexcept {
+    delete static_cast<OffsetEvalWorkspace*>(workspace);
+}
+
+// Compatibility callbacks are not used by workspace-aware Cardinal. They
+// keep generic Knowhere consumers safe and correct by creating one temporary
+// workspace for an isolated call.
+int32_t
+EvalOffsetCompatibility(const void* opaque,
+                        const int64_t* ids,
+                        uint32_t count,
+                        uint64_t active_mask,
+                        uint64_t* accepted_mask) noexcept {
+    std::unique_ptr<OffsetEvalWorkspace> workspace(
+        static_cast<OffsetEvalWorkspace*>(CreateOffsetWorkspace(opaque)));
+    if (workspace == nullptr) {
+        return -1;
+    }
+    return EvalOffsetWithWorkspace(
+        opaque, workspace.get(), ids, count, active_mask, accepted_mask);
+}
+
+int32_t
+EvalOffsetContiguousCompatibility(const void* opaque,
+                                  int64_t first_id,
+                                  uint32_t count,
+                                  uint64_t active_mask,
+                                  uint64_t* accepted_mask) noexcept {
+    std::unique_ptr<OffsetEvalWorkspace> workspace(
+        static_cast<OffsetEvalWorkspace*>(CreateOffsetWorkspace(opaque)));
+    if (workspace == nullptr) {
+        return -1;
+    }
+    return EvalOffsetContiguousWithWorkspace(
+        opaque, workspace.get(), first_id, count, active_mask, accepted_mask);
 }
 
 int32_t
@@ -196,6 +300,29 @@ ComposeCandidateEvaluators(std::vector<PreparedCandidateEvaluator> leaves,
     prepared.view.eval_batch = &EvaluateComposite;
     prepared.view.eval_contiguous = &EvaluateCompositeContiguous;
     prepared.eval_truth_batch = &EvaluateCompositeTruth;
+    return prepared;
+}
+
+std::optional<PreparedCandidateEvaluator>
+AdaptOffsetExpressionEvaluator(
+    std::shared_ptr<const PreparedOffsetExpressionEvaluator> evaluator) {
+    if (evaluator == nullptr) {
+        return std::nullopt;
+    }
+    auto owner = std::make_shared<OffsetEvaluatorAdapterState>(
+        OffsetEvaluatorAdapterState{std::move(evaluator)});
+    PreparedCandidateEvaluator prepared;
+    prepared.owner = owner;
+    prepared.view.context = owner.get();
+    prepared.view.eval_batch = &EvalOffsetCompatibility;
+    prepared.view.eval_contiguous = &EvalOffsetContiguousCompatibility;
+    prepared.view.abi_capabilities |=
+        knowhere::kCandidateEvaluatorCapabilityWorkerWorkspace;
+    prepared.view.create_workspace = &CreateOffsetWorkspace;
+    prepared.view.release_workspace = &ReleaseOffsetWorkspace;
+    prepared.view.eval_batch_with_workspace = &EvalOffsetWithWorkspace;
+    prepared.view.eval_contiguous_with_workspace =
+        &EvalOffsetContiguousWithWorkspace;
     return prepared;
 }
 

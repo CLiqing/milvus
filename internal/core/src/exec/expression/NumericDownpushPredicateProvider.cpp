@@ -92,6 +92,19 @@ EvaluateNumericOffsetBatch(const void* opaque,
     return status;
 }
 
+std::shared_ptr<const PreparedOffsetExpressionEvaluator>
+MakeNumericOffsetEvaluator(const PreparedCandidateLeaf& leaf) {
+    if (!static_cast<bool>(leaf.evaluator)) {
+        return nullptr;
+    }
+    auto program = std::make_shared<const NumericOffsetProgram>(
+        NumericOffsetProgram{leaf});
+    return PreparedOffsetExpressionEvaluator::Create(
+        std::move(program),
+        &CreateNumericOffsetWorkspace,
+        &EvaluateNumericOffsetBatch);
+}
+
 const int64_t*
 ResolveInt64CandidateValue(const Int64CandidateSourceView& source,
                            int64_t row_id) noexcept {
@@ -170,8 +183,8 @@ EvaluateInt64ValueSpecialized(const Int64EvaluatorState& state,
         return EvaluateUnaryPredicate<proto::plan::OpType::GreaterEqual>(
             value, state.arg0);
     } else if constexpr (Op == Int64EvaluatorOp::ModLessThan) {
-        return EvaluateNumericArithmeticLessThan<
-            proto::plan::ArithOpType::Mod>(value, state.arg0, state.arg1);
+        return EvaluateNumericArithmeticLessThan<proto::plan::ArithOpType::Mod>(
+            value, state.arg0, state.arg1);
     } else if constexpr (Op == Int64EvaluatorOp::GreaterThan) {
         return EvaluateUnaryPredicate<proto::plan::OpType::GreaterThan>(
             value, state.arg0);
@@ -197,17 +210,17 @@ EvaluateInt64ValueSpecialized(const Int64EvaluatorState& state,
         return std::binary_search(
             state.terms.begin(), state.terms.end(), value);
     } else if constexpr (Op == Int64EvaluatorOp::AddLessThan) {
-        return EvaluateNumericArithmeticLessThan<
-            proto::plan::ArithOpType::Add>(value, state.arg0, state.arg1);
+        return EvaluateNumericArithmeticLessThan<proto::plan::ArithOpType::Add>(
+            value, state.arg0, state.arg1);
     } else if constexpr (Op == Int64EvaluatorOp::SubLessThan) {
-        return EvaluateNumericArithmeticLessThan<
-            proto::plan::ArithOpType::Sub>(value, state.arg0, state.arg1);
+        return EvaluateNumericArithmeticLessThan<proto::plan::ArithOpType::Sub>(
+            value, state.arg0, state.arg1);
     } else if constexpr (Op == Int64EvaluatorOp::MulLessThan) {
-        return EvaluateNumericArithmeticLessThan<
-            proto::plan::ArithOpType::Mul>(value, state.arg0, state.arg1);
+        return EvaluateNumericArithmeticLessThan<proto::plan::ArithOpType::Mul>(
+            value, state.arg0, state.arg1);
     } else if constexpr (Op == Int64EvaluatorOp::DivLessThan) {
-        return EvaluateNumericArithmeticLessThan<
-            proto::plan::ArithOpType::Div>(value, state.arg0, state.arg1);
+        return EvaluateNumericArithmeticLessThan<proto::plan::ArithOpType::Div>(
+            value, state.arg0, state.arg1);
     }
     return false;
 }
@@ -653,8 +666,7 @@ MaterializeInt64CandidateValues(
         values->assign(data.begin(), data.end());
         return values;
     }
-    if (scalars.has_int_data() &&
-        scalars.int_data().data_size() == row_count) {
+    if (scalars.has_int_data() && scalars.int_data().data_size() == row_count) {
         for (const auto value : scalars.int_data().data()) {
             values->push_back(static_cast<int64_t>(value));
         }
@@ -818,15 +830,20 @@ PrepareInt64ArithmeticLeaf(const segcore::SegmentInternalInterface* segment,
     }
     const auto& predicate =
         *static_cast<const Int64ArithmeticCandidatePredicate*>(typed_state);
-    return PrepareInt64SourceLeaf(
+    auto leaf = PrepareInt64SourceLeaf(
         segment,
         op_context,
         predicate.field_id,
         predicate.field_data_type,
         [&](const Int64CandidateSourceView& source) {
-            return PrepareInt64ArithmeticCandidateEvaluator(source,
-                                                             predicate);
+            return PrepareInt64ArithmeticCandidateEvaluator(source, predicate);
         });
+    if (leaf.has_value() && predicate.field_data_type == DataType::INT64 &&
+        predicate.arithmetic_op == proto::plan::ArithOpType::Mod &&
+        !segment->get_schema().get_ttl_field_id().has_value()) {
+        leaf->offset_evaluator = MakeNumericOffsetEvaluator(*leaf);
+    }
+    return leaf;
 }
 
 std::optional<PreparedCandidateLeaf>
@@ -844,8 +861,7 @@ PrepareFloatArithmeticLeaf(const segcore::SegmentInternalInterface* segment,
         predicate.field_id,
         predicate.field_data_type,
         [&](const FloatCandidateSourceView& source) {
-            return PrepareFloatArithmeticCandidateEvaluator(source,
-                                                             predicate);
+            return PrepareFloatArithmeticCandidateEvaluator(source, predicate);
         });
 }
 
@@ -858,7 +874,7 @@ PrepareInt64PredicateLeaf(const segcore::SegmentInternalInterface* segment,
     }
     const auto& predicate =
         *static_cast<const Int64CandidatePredicate*>(typed_state);
-    return PrepareInt64SourceLeaf(
+    auto leaf = PrepareInt64SourceLeaf(
         segment,
         op_context,
         predicate.field_id,
@@ -866,6 +882,19 @@ PrepareInt64PredicateLeaf(const segcore::SegmentInternalInterface* segment,
         [&](const Int64CandidateSourceView& source) {
             return PrepareInt64CandidateEvaluator(source, predicate);
         });
+    const bool is_comparison =
+        predicate.op == NumericCandidatePredicateOp::Equal ||
+        predicate.op == NumericCandidatePredicateOp::NotEqual ||
+        predicate.op == NumericCandidatePredicateOp::LessThan ||
+        predicate.op == NumericCandidatePredicateOp::LessEqual ||
+        predicate.op == NumericCandidatePredicateOp::GreaterThan ||
+        predicate.op == NumericCandidatePredicateOp::GreaterEqual;
+    if (leaf.has_value() && predicate.field_data_type == DataType::INT64 &&
+        is_comparison &&
+        !segment->get_schema().get_ttl_field_id().has_value()) {
+        leaf->offset_evaluator = MakeNumericOffsetEvaluator(*leaf);
+    }
+    return leaf;
 }
 
 std::optional<PreparedCandidateLeaf>
@@ -877,14 +906,14 @@ PrepareFloatPredicateLeaf(const segcore::SegmentInternalInterface* segment,
     }
     const auto& predicate =
         *static_cast<const FloatCandidatePredicate*>(typed_state);
-    return PrepareFloatSourceLeaf(
-        segment,
-        op_context,
-        predicate.field_id,
-        predicate.field_data_type,
-        [&](const FloatCandidateSourceView& source) {
-            return PrepareFloatCandidateEvaluator(source, predicate);
-        });
+    return PrepareFloatSourceLeaf(segment,
+                                  op_context,
+                                  predicate.field_id,
+                                  predicate.field_data_type,
+                                  [&](const FloatCandidateSourceView& source) {
+                                      return PrepareFloatCandidateEvaluator(
+                                          source, predicate);
+                                  });
 }
 
 }  // namespace
@@ -1091,12 +1120,7 @@ PrepareNumericOffsetExpressionEvaluator(
     if (!leaf.has_value() || !static_cast<bool>(leaf->evaluator)) {
         return nullptr;
     }
-    auto program = std::make_shared<const NumericOffsetProgram>(
-        NumericOffsetProgram{std::move(*leaf)});
-    return PreparedOffsetExpressionEvaluator::Create(
-        std::move(program),
-        &CreateNumericOffsetWorkspace,
-        &EvaluateNumericOffsetBatch);
+    return MakeNumericOffsetEvaluator(*leaf);
 }
 
 std::optional<CandidateLeafPlan>
@@ -1127,8 +1151,7 @@ TryCompileNumericArithmeticCandidateLeaf(
                                               expression.arith_op_type_,
                                               static_cast<float>(*operand),
                                               static_cast<float>(*target)});
-        return CandidateLeafPlan{std::move(state),
-                                 &PrepareFloatArithmeticLeaf};
+        return CandidateLeafPlan{std::move(state), &PrepareFloatArithmeticLeaf};
     }
 
     if (column.data_type_ != DataType::INT8 &&
@@ -1219,13 +1242,7 @@ PrepareFloatArithmeticCandidateEvaluator(
         return std::nullopt;
     }
     auto owner = std::make_shared<FloatEvaluatorState>(FloatEvaluatorState{
-        source,
-        *op,
-        predicate.operand,
-        predicate.target,
-        true,
-        true,
-        {}});
+        source, *op, predicate.operand, predicate.target, true, true, {}});
     PreparedCandidateEvaluator prepared;
     prepared.owner = owner;
     prepared.view.context = owner.get();

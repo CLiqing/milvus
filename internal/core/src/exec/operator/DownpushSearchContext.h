@@ -43,6 +43,9 @@ struct PreparedFusingBundle;
 // composer never needs to know the value type, opcode, or literal layout.
 struct PreparedCandidateLeaf {
     PreparedCandidateEvaluator evaluator;
+    // Populated only after this leaf has migrated to the Milvus shared offset
+    // evaluator. Unmigrated expression families keep using evaluator above.
+    std::shared_ptr<const PreparedOffsetExpressionEvaluator> offset_evaluator;
     std::vector<std::shared_ptr<const void>> resource_owners;
 };
 
@@ -70,10 +73,9 @@ struct AnnFilterFusingProgram {
 };
 
 std::shared_ptr<PreparedFusingBundle>
-PrepareAnnFilterFusingBundle(
-    const segcore::SegmentInternalInterface* segment,
-    OpContext* op_context,
-    const AnnFilterFusingProgram& program);
+PrepareAnnFilterFusingBundle(const segcore::SegmentInternalInterface* segment,
+                             OpContext* op_context,
+                             const AnnFilterFusingProgram& program);
 
 const char*
 AnnFilterFusingSourceName(const PreparedFusingBundle& context);
