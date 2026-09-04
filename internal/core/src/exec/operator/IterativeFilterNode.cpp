@@ -40,6 +40,7 @@
 #include "common/Utils.h"
 #include "exec/QueryContext.h"
 #include "exec/expression/EvalCtx.h"
+#include "exec/expression/OffsetExpressionEvaluator.h"
 #include "expr/ITypeExpr.h"
 #include "fmt/core.h"
 #include "folly/FBVector.h"
@@ -67,13 +68,10 @@ PhyIterativeFilterNode::PhyIterativeFilterNode(
     // This operator reads only the data bits of the predicate output, so
     // UNKNOWN rows are excluded exactly like FALSE — a null-rejecting
     // consumer.
-    exprs_ = std::make_unique<ExprSet>(
-        filters, exec_context, /*null_rejecting=*/true);
-    const auto& exprs = exprs_->exprs();
-    for (const auto& expr : exprs) {
-        is_native_supported_ =
-            (is_native_supported_ && (expr->SupportOffsetInput()));
-    }
+    offset_evaluator_ = std::make_shared<PreparedOffsetExpressionEvaluator>(
+        std::move(filters), exec_context, /*null_rejecting=*/true);
+    offset_workspace_ = offset_evaluator_->CreateWorkspace();
+    is_native_supported_ = offset_workspace_->SupportsOffsetInput();
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
 }
@@ -121,7 +119,10 @@ PhyIterativeFilterNode::GetOutput() {
         // UNKNOWN into FALSE (data &= valid), which is what makes this
         // operator a null-rejecting consumer by construction.
         bitset = EvalExprSetOverAllBatches(
-            *exprs_, eval_ctx, need_process_rows_, "PhyIterativeFilterNode");
+            offset_workspace_->expr_set(),
+            eval_ctx,
+            need_process_rows_,
+            "PhyIterativeFilterNode");
         num_processed_rows_ = need_process_rows_;
     }
     if (search_result.vector_iterators_.has_value()) {
@@ -169,7 +170,6 @@ PhyIterativeFilterNode::GetOutput() {
         int32_t cached_last_elem = 0;  // empty: first lookup always misses
 
         for (auto& iterator : search_result.vector_iterators_.value()) {
-            EvalCtx eval_ctx(operator_context_->get_exec_context());
             int64_t topk = 0;
             while (iterator->HasNext() && topk < unity_topk) {
                 offsets.clear();
@@ -252,22 +252,13 @@ PhyIterativeFilterNode::GetOutput() {
                 }
 
                 if (is_native_supported_) {
-                    eval_ctx.set_offset_input(eval_offsets);
-                    std::vector<VectorPtr> results;
-                    exprs_->Eval(0, 1, true, eval_ctx, results);
-                    AssertInfo(
-                        results.size() == 1 && results[0] != nullptr,
-                        "PhyIterativeFilterNode result size should be size "
-                        "one and not "
-                        "be nullptr");
-
                     auto col_vec =
-                        std::dynamic_pointer_cast<ColumnVector>(results[0]);
-                    auto col_vec_size = col_vec->size();
+                        offset_workspace_->EvalOffsets(*eval_offsets);
+                    const auto col_vec_size = col_vec->size();
                     TargetBitmapView bitsetview(col_vec->GetRawData(),
                                                 col_vec_size);
-                    // Fold UNKNOWN into FALSE explicitly (data &= valid):
-                    // rows are included below on the data bit alone.
+                    // Iterative filtering is a null-rejecting consumer:
+                    // UNKNOWN rows are rejected exactly like FALSE.
                     TargetBitmapView validview(col_vec->GetValidRawData(),
                                                col_vec_size);
                     bitsetview.inplace_and(validview, col_vec_size);
@@ -276,7 +267,7 @@ PhyIterativeFilterNode::GetOutput() {
                         Assert(bitsetview.size() == doc_offsets.size());
                         for (size_t i = 0; i < doc_offsets.size(); ++i) {
                             doc_eval_cache[doc_offsets[i]] =
-                                (bitsetview[i] > 0);
+                                bitsetview[i] > 0;
                         }
 
                         for (size_t i = 0; i < offsets.size(); ++i) {

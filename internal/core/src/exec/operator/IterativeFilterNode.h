@@ -26,6 +26,7 @@
 #include "exec/Driver.h"
 #include "exec/QueryContext.h"
 #include "exec/expression/Expr.h"
+#include "exec/expression/OffsetExpressionEvaluator.h"
 #include "exec/operator/Operator.h"
 #include "plan/PlanNode.h"
 
@@ -63,7 +64,7 @@ class PhyIterativeFilterNode : public Operator {
     void
     Close() override {
         Operator::Close();
-        exprs_->Clear();
+        offset_workspace_->expr_set().Clear();
     }
 
     BlockingReason
@@ -77,7 +78,9 @@ class PhyIterativeFilterNode : public Operator {
     }
 
  private:
-    std::unique_ptr<ExprSet> exprs_;
+    std::shared_ptr<const PreparedOffsetExpressionEvaluator>
+        offset_evaluator_;
+    std::unique_ptr<OffsetExpressionWorkspace> offset_workspace_;
     QueryContext* query_context_;
     int64_t num_processed_rows_;
     int64_t need_process_rows_;
