@@ -21,6 +21,32 @@
 namespace milvus {
 namespace exec {
 
+namespace {
+
+template <typename T, typename StopPredicate>
+void
+ConsumeGroupByIteratorUntil(const std::shared_ptr<VectorIterator>& iterator,
+                            const std::shared_ptr<DataGetter<T>>& data_getter,
+                            GroupByMap<T>& group_map,
+                            GroupByResultCollector<T>& collector,
+                            StopPredicate&& should_stop) {
+    while (iterator->HasNext() && !should_stop()) {
+        auto offset_dis_pair = iterator->Next();
+        AssertInfo(
+            offset_dis_pair.has_value(),
+            "Wrong state! iterator cannot return valid result whereas it "
+            "still tells hasNext, terminate groupBy operation");
+        auto offset = offset_dis_pair->first;
+        auto distance = offset_dis_pair->second;
+        auto group = data_getter->Get(offset);
+        if (group_map.Push(group)) {
+            collector.Add(offset, distance, std::move(group));
+        }
+    }
+}
+
+}  // namespace
+
 void
 SearchGroupBy(milvus::OpContext* op_ctx,
               const std::vector<std::shared_ptr<VectorIterator>>& iterators,
@@ -355,40 +381,18 @@ GroupIteratorResult(const std::shared_ptr<VectorIterator>& iterator,
                     std::vector<int64_t>& offsets,
                     std::vector<float>& distances,
                     const knowhere::MetricType& metrics_type) {
-    //1.
-    GroupByMap<T> groupMap(topK, group_size, strict_group_size);
+    GroupByMap<T> group_map(topK, group_size, strict_group_size);
+    GroupByResultCollector<T> collector;
 
-    //2. do iteration until fill the whole map or run out of all data
+    // Do iteration until fill the whole map or run out of all data.
     //note it may enumerate all data inside a segment and can block following
     //query and search possibly
-    std::vector<std::tuple<int64_t, float, std::optional<T>>> res;
-    while (iterator->HasNext() && !groupMap.IsGroupResEnough()) {
-        auto offset_dis_pair = iterator->Next();
-        AssertInfo(
-            offset_dis_pair.has_value(),
-            "Wrong state! iterator cannot return valid result whereas it still"
-            "tells hasNext, terminate groupBy operation");
-        auto offset = offset_dis_pair.value().first;
-        auto dis = offset_dis_pair.value().second;
-        std::optional<T> row_data = data_getter->Get(offset);
-        if (groupMap.Push(row_data)) {
-            res.emplace_back(offset, dis, row_data);
-        }
-    }
+    ConsumeGroupByIteratorUntil(
+        iterator, data_getter, group_map, collector, [&] {
+            return group_map.IsGroupResEnough();
+        });
 
-    //3. sorted based on distances and metrics
-    auto customComparator = [&](const auto& lhs, const auto& rhs) {
-        return milvus::query::dis_closer(
-            std::get<1>(lhs), std::get<1>(rhs), metrics_type);
-    };
-    std::sort(res.begin(), res.end(), customComparator);
-
-    //4. save groupBy results
-    for (auto iter = res.begin(); iter != res.end(); ++iter) {
-        offsets.emplace_back(std::get<0>(*iter));
-        distances.emplace_back(std::get<1>(*iter));
-        group_by_values.emplace_back(std::move(std::get<2>(*iter)));
-    }
+    collector.SortAndAppend(metrics_type, group_by_values, offsets, distances);
 }
 
 }  // namespace exec
