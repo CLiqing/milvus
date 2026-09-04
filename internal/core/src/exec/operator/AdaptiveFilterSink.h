@@ -27,7 +27,7 @@
 #include <vector>
 
 #include "common/EasyAssert.h"
-#include "exec/expression/FilterResult.h"
+#include "common/FilterBitmap.h"
 
 namespace milvus::exec {
 
@@ -89,10 +89,9 @@ class AdaptiveFilterSink {
                    "adaptive filter Sparse cap {} is outside the int32 "
                    "row-ID range",
                    sparse_cap_);
-
-        accepted_ids_ = std::make_shared<std::vector<int32_t>>();
-        accepted_ids_->reserve(
-            static_cast<size_t>(std::min(universe_, sparse_cap_)));
+        filter_map_ = FilterMap::Adaptive(static_cast<size_t>(universe_),
+                                          /*default_bit=*/true,
+                                          static_cast<size_t>(sparse_cap_));
     }
 
     AdaptiveFilterSink(const AdaptiveFilterSink&) = delete;
@@ -120,7 +119,7 @@ class AdaptiveFilterSink {
         ConsumeBatchImpl(predicate_data, nullptr, batch_offset);
     }
 
-    SparseFilterResult
+    FilterMap
     Finish() {
         AssertInfo(!finished_, "adaptive filter sink was already finished");
         AssertInfo(next_offset_ == universe_,
@@ -129,10 +128,7 @@ class AdaptiveFilterSink {
                    universe_);
         finished_ = true;
 
-        if (dense_ != nullptr) {
-            return SparseFilterResult{nullptr, std::move(dense_), universe_};
-        }
-        return SparseFilterResult{std::move(accepted_ids_), nullptr, universe_};
+        return std::move(filter_map_);
     }
 
     const AdaptiveFilterSinkStats&
@@ -144,28 +140,10 @@ class AdaptiveFilterSink {
 
     bool
     IsDense() const {
-        return dense_ != nullptr;
+        return filter_map_.IsDense();
     }
 
  private:
-    using Policy = TargetBitmapView::policy_type;
-    using Word = TargetBitmapView::data_type;
-    static constexpr size_t kWordBits = sizeof(Word) * 8;
-
-    static Word
-    ReadWord(TargetBitmapView bitmap, size_t offset, size_t size) {
-        return Policy::op_read(bitmap.data(), bitmap.offset() + offset, size);
-    }
-
-    static uint64_t
-    DestinationWordsTouched(int64_t offset, size_t size) {
-        if (size == 0) {
-            return 0;
-        }
-        const auto start_in_word = static_cast<size_t>(offset) % kWordBits;
-        return (start_in_word + size + kWordBits - 1) / kWordBits;
-    }
-
     void
     ValidateBatch(TargetBitmapView predicate_data, int64_t batch_offset) const {
         AssertInfo(!finished_,
@@ -194,103 +172,28 @@ class AdaptiveFilterSink {
             stats_.processed_rows += batch_size;
         }
 
-        if (dense_ != nullptr) {
-            WriteDenseBatch(predicate_data, valid_data, batch_offset);
-            next_offset_ += static_cast<int64_t>(batch_size);
-            return;
-        }
-
-        // Record the prefix boundary so candidates from this batch can be
-        // discarded in O(1) if it triggers the switch.  The retained vector
-        // is reserved to sparse_cap in the constructor, so this path neither
-        // allocates a per-batch scratch vector nor writes a successful batch
-        // twice.
-        const auto retained_prefix_size = accepted_ids_->size();
-        bool exceeds_cap = false;
-        for (size_t word_offset = 0; word_offset < batch_size;
-             word_offset += kWordBits) {
-            const auto bits = std::min(kWordBits, batch_size - word_offset);
-            Word accepted = ReadWord(predicate_data, word_offset, bits);
-            if (valid_data != nullptr) {
-                accepted &= ReadWord(*valid_data, word_offset, bits);
-            }
-
-            while (accepted != 0) {
-                const auto bit =
-                    static_cast<size_t>(std::countr_zero(accepted));
-                if (accepted_ids_->size() == static_cast<size_t>(sparse_cap_)) {
-                    exceeds_cap = true;
-                    break;
-                }
-                accepted_ids_->push_back(static_cast<int32_t>(
-                    batch_offset + static_cast<int64_t>(word_offset + bit)));
-                if constexpr (CollectStats) {
-                    ++stats_.ids_appended;
-                }
-                accepted &= accepted - 1;
-            }
-            if (exceeds_cap) {
-                break;
-            }
-        }
-
-        if (!exceeds_cap) {
-            next_offset_ += static_cast<int64_t>(batch_size);
-            return;
-        }
-
+        const auto batch_result =
+            filter_map_.AssignBatch(predicate_data,
+                                    valid_data,
+                                    static_cast<size_t>(batch_offset),
+                                    /*invert=*/true);
         if constexpr (CollectStats) {
+            stats_.ids_appended += batch_result.ids_appended;
             stats_.ids_discarded_on_switch +=
-                accepted_ids_->size() - retained_prefix_size;
+                batch_result.ids_discarded_on_promotion;
+            stats_.backfill_count += batch_result.backfill_count;
+            if (batch_result.promoted) {
+                ++stats_.dense_allocations;
+                stats_.dense_words_initialized +=
+                    (static_cast<uint64_t>(universe_) + 63) / 64;
+                ++stats_.switch_count;
+            }
+            if (batch_result.dense_batch_written) {
+                ++stats_.dense_batch_writes;
+                stats_.dense_words_written += batch_result.dense_words_written;
+            }
         }
-        accepted_ids_->resize(retained_prefix_size);
-        SwitchToDense();
-        WriteDenseBatch(predicate_data, valid_data, batch_offset);
         next_offset_ += static_cast<int64_t>(batch_size);
-    }
-
-    void
-    SwitchToDense() {
-        AssertInfo(dense_ == nullptr,
-                   "adaptive filter sink attempted a second Dense switch");
-        dense_ = std::make_shared<TargetBitmap>(static_cast<size_t>(universe_),
-                                                true);
-        if constexpr (CollectStats) {
-            ++stats_.dense_allocations;
-            stats_.dense_words_initialized +=
-                (static_cast<uint64_t>(universe_) + kWordBits - 1) / kWordBits;
-            ++stats_.switch_count;
-        }
-
-        for (const auto id : *accepted_ids_) {
-            dense_->reset(static_cast<size_t>(id));
-        }
-        if constexpr (CollectStats) {
-            stats_.backfill_count += accepted_ids_->size();
-        }
-        accepted_ids_.reset();
-    }
-
-    void
-    WriteDenseBatch(TargetBitmapView predicate_data,
-                    const TargetBitmapView* valid_data,
-                    int64_t batch_offset) {
-        const auto batch_size = predicate_data.size();
-        if (valid_data != nullptr) {
-            predicate_data.inplace_and(*valid_data, batch_size);
-        }
-        predicate_data.flip();
-
-        Policy::op_copy(predicate_data.data(),
-                        predicate_data.offset(),
-                        dense_->data(),
-                        static_cast<size_t>(batch_offset),
-                        batch_size);
-        if constexpr (CollectStats) {
-            ++stats_.dense_batch_writes;
-            stats_.dense_words_written +=
-                DestinationWordsTouched(batch_offset, batch_size);
-        }
     }
 
  private:
@@ -298,8 +201,7 @@ class AdaptiveFilterSink {
     int64_t sparse_cap_;
     int64_t next_offset_ = 0;
     bool finished_ = false;
-    std::shared_ptr<std::vector<int32_t>> accepted_ids_;
-    std::shared_ptr<TargetBitmap> dense_;
+    FilterMap filter_map_;
     [[no_unique_address]] std::conditional_t<CollectStats,
                                              AdaptiveFilterSinkStats,
                                              AdaptiveFilterSinkNoStats> stats_;

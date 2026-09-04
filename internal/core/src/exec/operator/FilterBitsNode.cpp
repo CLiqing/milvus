@@ -149,7 +149,7 @@ PhyFilterBitsNode::GetOutput() {
     // QueryContext is query-owned today, but FilterBits may be re-entered or
     // reused by future plan shapes.  Never let a Dense result inherit a Sparse
     // payload produced by an earlier execution of the same context.
-    query_context_->clear_sparse_id_payload();
+    query_context_->clear_filter_map();
 
     const auto search_info = query_context_->get_search_info();
     // Retrieve plans have no vector-search params.  They still pass through
@@ -177,7 +177,7 @@ PhyFilterBitsNode::GetOutput() {
     }
     const auto configured_sparse_max_cardinality =
         search_info.SparseResultMaxCardinality(
-        milvus::SPARSE_FILTER_RESULT_MAX_CARDINALITY.load());
+            milvus::SPARSE_FILTER_RESULT_MAX_CARDINALITY.load());
     const auto sparse_max_cardinality = ComputeSparseFilterResultCap(
         need_process_rows_,
         configured_sparse_max_cardinality,
@@ -233,8 +233,9 @@ PhyFilterBitsNode::GetOutput() {
                 milvus::monitor::internal_core_adaptive_filter_cache_sparse_hit
                     .Increment();
                 num_processed_rows_ = need_process_rows_;
-                query_context_->set_sparse_id_payload(
-                    sparse_cached.accepted_ids, need_process_rows_);
+                auto filter_map = std::make_shared<FilterMap>(
+                    sparse_cached.filter_map->Clone());
+                query_context_->set_filter_map(std::move(filter_map));
                 milvus::monitor::internal_core_adaptive_filter_output_sparse
                     .Increment();
                 std::vector<VectorPtr> col_res;
@@ -257,6 +258,13 @@ PhyFilterBitsNode::GetOutput() {
             if (adaptive_output_eligible) {
                 milvus::monitor::internal_core_adaptive_filter_output_dense
                     .Increment();
+                auto filter_map = std::make_shared<FilterMap>(
+                    FilterMap::FromDense(std::make_shared<TargetBitmap>(
+                        cached.result->clone())));
+                query_context_->set_filter_map(std::move(filter_map));
+                col_res.push_back(std::make_shared<ColumnVector>(
+                    TargetBitmap(1, false), TargetBitmap(1, true)));
+                return std::make_shared<RowVector>(col_res);
             }
             col_res.push_back(std::make_shared<ColumnVector>(
                 cached.result->clone(),
@@ -289,50 +297,46 @@ PhyFilterBitsNode::GetOutput() {
 
     // Centralize Adaptive cache/counter/payload ownership. Dense cache state
     // is cloned because the returned ColumnVector takes the original bitmap.
-    const auto finalize_adaptive = [&](SparseFilterResult result) {
-        AssertInfo(result.universe == need_process_rows_,
+    const auto finalize_adaptive = [&](FilterMap result) {
+        AssertInfo(result.size() == static_cast<size_t>(need_process_rows_),
                    "adaptive predicate universe {} does not match filter "
                    "universe {}",
-                   result.universe,
+                   result.size(),
                    need_process_rows_);
-        AssertInfo(result.IsSparse() != result.IsDense(),
-                   "adaptive predicate must return exactly one representation");
 
         std::vector<VectorPtr> col_res;
-        if (result.IsSparse()) {
-            AssertInfo(result.accepted_ids->size() <=
+        if (result.capability() == FilterCapability::EnumerateOnly) {
+            AssertInfo(result.size() - result.count() <=
                            static_cast<size_t>(sparse_max_cardinality),
                        "adaptive Sparse result {} exceeds cap {}",
-                       result.accepted_ids->size(),
+                       result.size() - result.count(),
                        sparse_max_cardinality);
             if (can_use_cache) {
                 ExprResCacheManager::Key key{cache_segment->get_segment_id(),
                                              cache_signature};
                 ExprResCacheManager::SparseValue cached;
-                cached.accepted_ids = result.accepted_ids;
-                cached.active_count = result.universe;
+                cached.filter_map =
+                    std::make_shared<const FilterMap>(result.Clone());
+                cached.active_count = result.size();
                 ExprResCacheManager::Instance().PutSparse(key, cached);
                 milvus::monitor::internal_core_adaptive_filter_cache_sparse_put
                     .Increment();
             }
-            query_context_->set_sparse_id_payload(result.accepted_ids,
-                                                  result.universe);
             milvus::monitor::internal_core_adaptive_filter_output_sparse
                 .Increment();
-            col_res.push_back(std::make_shared<ColumnVector>(
-                TargetBitmap(1, false), TargetBitmap(1, true)));
         } else {
-            AssertInfo(result.filtered->size() ==
-                           static_cast<size_t>(need_process_rows_),
-                       "adaptive Dense result size {} does not match {}",
-                       result.filtered->size(),
-                       need_process_rows_);
+            const auto dense = result.DenseData();
+            AssertInfo(
+                dense != nullptr &&
+                    dense->size() == static_cast<size_t>(need_process_rows_),
+                "adaptive Dense result size {} does not match {}",
+                dense == nullptr ? 0 : dense->size(),
+                need_process_rows_);
             if (can_use_cache) {
                 ExprResCacheManager::Key key{cache_segment->get_segment_id(),
                                              cache_signature};
                 ExprResCacheManager::Value cached;
-                cached.result =
-                    std::make_shared<TargetBitmap>(result.filtered->clone());
+                cached.result = std::make_shared<TargetBitmap>(dense->clone());
                 cached.valid_result =
                     std::make_shared<TargetBitmap>(need_process_rows_, true);
                 cached.active_count = need_process_rows_;
@@ -342,10 +346,11 @@ PhyFilterBitsNode::GetOutput() {
             }
             milvus::monitor::internal_core_adaptive_filter_output_dense
                 .Increment();
-            col_res.push_back(std::make_shared<ColumnVector>(
-                std::move(*result.filtered),
-                TargetBitmap(need_process_rows_, true)));
         }
+        query_context_->set_filter_map(
+            std::make_shared<FilterMap>(std::move(result)));
+        col_res.push_back(std::make_shared<ColumnVector>(
+            TargetBitmap(1, false), TargetBitmap(1, true)));
         num_processed_rows_ = need_process_rows_;
         observe_scalar_cost();
         return std::make_shared<RowVector>(col_res);
@@ -365,20 +370,20 @@ PhyFilterBitsNode::GetOutput() {
     if (native_list_eligible) {
         EvalCtx native_eval_ctx(operator_context_->get_exec_context());
         auto native_expr = exprs_->expr(0);
-        const auto preflight = native_expr->PreflightSparseFilter(
-            native_eval_ctx,
-            /*has_sparse_input=*/false,
-            sparse_max_cardinality);
+        const auto preflight =
+            native_expr->PreflightSparseFilter(native_eval_ctx,
+                                               /*has_sparse_input=*/false,
+                                               sparse_max_cardinality);
         if (preflight == SparseFilterPreflight::Sparse) {
             auto native_result = native_expr->TryApplySparseFilter(
                 native_eval_ctx, std::nullopt, sparse_max_cardinality);
             AssertInfo(native_result.has_value(),
                        "Sparse capability preflight succeeded but root "
                        "predicate declined execution");
-            AssertInfo(native_result->IsDense() ||
-                           (native_result->IsSparse() &&
-                            native_result->accepted_ids->size() <=
-                                static_cast<size_t>(sparse_max_cardinality)),
+            AssertInfo(native_result->capability() ==
+                               FilterCapability::RandomMembership ||
+                           native_result->size() - native_result->count() <=
+                               static_cast<size_t>(sparse_max_cardinality),
                        "native Sparse predicate violated result cap {}",
                        sparse_max_cardinality);
             return finalize_adaptive(std::move(*native_result));

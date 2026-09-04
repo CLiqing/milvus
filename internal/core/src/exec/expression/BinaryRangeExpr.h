@@ -298,12 +298,11 @@ class PhyBinaryRangeFilterExpr : public SegmentExpr {
     void
     DetermineExecPath() override;
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetNativeValidIds() override;
 
-    std::shared_ptr<const std::vector<int32_t>>
-    TryGetNativeValidIds(EvalCtx& context,
-                         int64_t max_cardinality) override;
+    std::shared_ptr<std::vector<int32_t>>
+    TryGetNativeValidIds(EvalCtx& context, int64_t max_cardinality) override;
 
     bool
     CanApplySparseFilter(EvalCtx& context,
@@ -315,10 +314,9 @@ class PhyBinaryRangeFilterExpr : public SegmentExpr {
                           bool has_sparse_input,
                           int64_t max_cardinality) override;
 
-    std::shared_ptr<const std::vector<int32_t>>
-    TryFilterNativeValidIds(
-        EvalCtx& context,
-        const std::shared_ptr<const std::vector<int32_t>>& input) override;
+    std::shared_ptr<std::vector<int32_t>>
+    TryFilterNativeValidIds(EvalCtx& context,
+                            std::span<const int32_t> input) override;
 
     std::string
     ToString() const override {
@@ -336,7 +334,7 @@ class PhyBinaryRangeFilterExpr : public SegmentExpr {
     }
 
  private:
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetNativeValidIdsWithCap(size_t max_cardinality);
 
     // Check overflow and cache result for performace

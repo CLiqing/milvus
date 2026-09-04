@@ -38,11 +38,12 @@ namespace {
 bool
 ApplyPredicateToDenseResult(const ExprPtr& predicate,
                             EvalCtx& context,
-                            SparseFilterResult& result) {
-    AssertInfo(result.IsDense(), "expected a Dense adaptive filter result");
+                            FilterMap& result) {
+    AssertInfo(result.capability() == FilterCapability::RandomMembership,
+               "expected a random-membership FilterMap");
     TargetBitmap predicate_filtered;
     int64_t processed = 0;
-    while (processed < result.universe) {
+    while (processed < static_cast<int64_t>(result.size())) {
         VectorPtr value;
         predicate->Eval(context, value);
         auto column = std::dynamic_pointer_cast<ColumnVector>(value);
@@ -50,7 +51,7 @@ ApplyPredicateToDenseResult(const ExprPtr& predicate,
             return false;
         }
         const auto rows = static_cast<int64_t>(column->size());
-        if (processed + rows > result.universe) {
+        if (processed + rows > static_cast<int64_t>(result.size())) {
             return false;
         }
         TargetBitmap accepted(
@@ -61,17 +62,17 @@ ApplyPredicateToDenseResult(const ExprPtr& predicate,
         predicate_filtered.append(accepted);
         processed += rows;
     }
-    result.filtered->inplace_or(TargetBitmapView(predicate_filtered),
-                                result.universe);
+    result.InplaceOr(TargetBitmapView(predicate_filtered));
     return true;
 }
 
-std::optional<SparseFilterResult>
+std::optional<FilterMap>
 IntersectDenseWithAdaptivePredicate(const ExprPtr& predicate,
                                     EvalCtx& context,
                                     int64_t max_cardinality,
-                                    SparseFilterResult current) {
-    AssertInfo(current.IsDense(), "expected a Dense adaptive filter result");
+                                    FilterMap current) {
+    AssertInfo(current.capability() == FilterCapability::RandomMembership,
+               "expected a random-membership FilterMap");
 
     // Do not speculatively call a native producer and then re-run the same
     // predicate through Eval when it declines. Capability is a side-effect-
@@ -85,38 +86,41 @@ IntersectDenseWithAdaptivePredicate(const ExprPtr& predicate,
         return current;
     }
 
-    auto next = predicate->TryApplySparseFilter(
-        context, std::nullopt, max_cardinality);
+    auto next =
+        predicate->TryApplySparseFilter(context, std::nullopt, max_cardinality);
     AssertInfo(next.has_value(),
                "Sparse capability preflight succeeded but predicate {} "
                "declined execution",
                predicate->name());
-    if (next->universe != current.universe) {
+    if (next->size() != current.size()) {
         return std::nullopt;
     }
-    if (next->IsDense()) {
-        if (next->filtered->size() != current.filtered->size()) {
+    if (next->capability() == FilterCapability::RandomMembership) {
+        const auto next_dense = next->DenseOwner();
+        if (next_dense == nullptr || next_dense->size() != current.size()) {
             return std::nullopt;
         }
-        current.filtered->inplace_or(TargetBitmapView(*next->filtered),
-                                     current.universe);
+        current.InplaceOr(*next_dense);
         return current;
-    }
-    if (!next->IsSparse()) {
-        return std::nullopt;
     }
 
     auto accepted = std::make_shared<std::vector<int32_t>>();
-    accepted->reserve(next->accepted_ids->size());
-    for (const auto id : *next->accepted_ids) {
-        if (id < 0 || id >= current.universe) {
+    const auto next_ids = next->TryGetUnsetIdsView();
+    if (!next_ids.has_value()) {
+        return std::nullopt;
+    }
+    accepted->reserve(next_ids->size());
+    for (const auto id : *next_ids) {
+        if (id < 0 || static_cast<size_t>(id) >= current.size()) {
             return std::nullopt;
         }
-        if (!(*current.filtered)[id]) {
+        if (!current.test(static_cast<size_t>(id))) {
             accepted->push_back(id);
         }
     }
-    return SparseFilterResult{std::move(accepted), nullptr, current.universe};
+    return FilterMap::AdoptUnsetIds(current.size(),
+                                    std::move(accepted),
+                                    static_cast<size_t>(max_cardinality));
 }
 
 }  // namespace
@@ -170,7 +174,7 @@ PhyConjunctFilterExpr::BuildActiveBitmap(const ColumnVectorPtr& vec) {
     return active_rows;
 }
 
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 PhyConjunctFilterExpr::TryGetNativeValidIds(EvalCtx& context) {
     auto max_cardinality = SPARSE_FILTER_RESULT_MAX_CARDINALITY.load();
     if (auto* exec_context = context.get_exec_context();
@@ -182,7 +186,14 @@ PhyConjunctFilterExpr::TryGetNativeValidIds(EvalCtx& context) {
     }
     const auto result =
         TryApplySparseFilter(context, std::nullopt, max_cardinality);
-    return result.has_value() ? result->accepted_ids : nullptr;
+    if (!result.has_value() ||
+        result->capability() != FilterCapability::EnumerateOnly) {
+        return nullptr;
+    }
+    const auto ids = result->TryGetUnsetIdsView();
+    return ids.has_value() ? std::make_shared<std::vector<int32_t>>(
+                                 ids->begin(), ids->end())
+                           : nullptr;
 }
 
 bool
@@ -216,18 +227,18 @@ PhyConjunctFilterExpr::CanApplySparseFilter(EvalCtx& context,
     return true;
 }
 
-std::optional<SparseFilterResult>
-PhyConjunctFilterExpr::TryApplySparseFilter(
-    EvalCtx& context,
-    std::optional<SparseFilterResult> input,
-    int64_t max_cardinality) {
+std::optional<FilterMap>
+PhyConjunctFilterExpr::TryApplySparseFilter(EvalCtx& context,
+                                            std::optional<FilterMap> input,
+                                            int64_t max_cardinality) {
     // AND is safe to evaluate as a chain of definite-TRUE candidate sets:
     // every step only removes rows.  Do not use input_order_ here.  That is a
     // Dense executor scheduling detail whose runtime LIKE/optimization slots
     // need not be a complete Sparse-safe order.  `inputs_` is the actual
     // expression tree and retains SQL conjunction semantics regardless of
     // order.  OR/NOT/null-sensitive cases still use the Dense evaluator.
-    if (input.has_value() && !input->IsSparse()) {
+    if (input.has_value() &&
+        input->capability() != FilterCapability::EnumerateOnly) {
         return std::nullopt;
     }
 
@@ -237,7 +248,7 @@ PhyConjunctFilterExpr::TryApplySparseFilter(
         return std::nullopt;
     }
 
-    std::optional<SparseFilterResult> result = std::move(input);
+    std::optional<FilterMap> result = std::move(input);
     size_t next_child = 0;
     if (!result.has_value()) {
         // Predicate order is an executor decision, not a request-by-request
@@ -253,10 +264,11 @@ PhyConjunctFilterExpr::TryApplySparseFilter(
     }
 
     for (size_t i = next_child; i < inputs_.size(); ++i) {
-        if (result->IsSparse() && result->accepted_ids->empty()) {
+        if (result->capability() == FilterCapability::EnumerateOnly &&
+            result->size() == result->count()) {
             break;
         }
-        if (result->IsDense()) {
+        if (result->capability() == FilterCapability::RandomMembership) {
             result = IntersectDenseWithAdaptivePredicate(
                 inputs_[i], context, max_cardinality, std::move(*result));
             if (!result.has_value()) {

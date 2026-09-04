@@ -193,6 +193,10 @@ GrowingOffsetMapping::GetTotalCount() const {
 OffsetMapping::BitsetTransformStatus
 GrowingOffsetMapping::TransformBitset(const BitsetView& bitset,
                                       TargetBitmap& result) const {
+    BitsetView random_access_bitset = bitset;
+    if (random_access_bitset.is_filter_map()) {
+        random_access_bitset.ensure_dense();
+    }
     const auto counts = LoadCounts();
     result.clear();
     if (counts.total == 0) {
@@ -206,10 +210,10 @@ GrowingOffsetMapping::TransformBitset(const BitsetView& bitset,
     // the check, which turned an unfiltered growing search into AllFiltered,
     // i.e. an empty result. Both call sites also guard on !bitset.empty(), but
     // the classification belongs here so a third caller cannot reintroduce it.
-    if (bitset.empty()) {
+    if (random_access_bitset.empty()) {
         return BitsetTransformStatus::NoFilter;
     }
-    if (bitset.all()) {
+    if (random_access_bitset.all()) {
         return BitsetTransformStatus::AllFiltered;
     }
 
@@ -217,13 +221,14 @@ GrowingOffsetMapping::TransformBitset(const BitsetView& bitset,
     // The bitmap is sized to valid_count from the SAME counts snapshot that
     // total_count came from, so callers get one consistent view instead of
     // pairing a NoFilter status with a separately (racily) read GetValidCount().
-    if (static_cast<int64_t>(bitset.size()) >= counts.total && bitset.none()) {
+    if (static_cast<int64_t>(random_access_bitset.size()) >= counts.total &&
+        random_access_bitset.none()) {
         result.resize(counts.valid, false);
         return BitsetTransformStatus::Transformed;
     }
 
     result.resize(counts.valid, true);
-    const auto bitset_size = static_cast<int64_t>(bitset.size());
+    const auto bitset_size = static_cast<int64_t>(random_access_bitset.size());
     for (int64_t physical_idx = 0; physical_idx < counts.valid;
          ++physical_idx) {
         const int64_t logical_offset = p2l_.Get(physical_idx);
@@ -234,7 +239,7 @@ GrowingOffsetMapping::TransformBitset(const BitsetView& bitset,
         if (logical_offset >= bitset_size) {
             break;
         }
-        result[physical_idx] = bitset.test(logical_offset);
+        result[physical_idx] = random_access_bitset.test(logical_offset);
     }
     return BitsetTransformStatus::Transformed;
 }

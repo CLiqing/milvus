@@ -77,9 +77,9 @@ ExecPlanNodeVisitor::ExecuteTask(
                 // Retrieve plans do not carry vector-search parameters.  Keep
                 // the normal bitmap result path usable for them instead of
                 // asking nlohmann::json::value() to read a null JSON value.
-                const bool native_valid_ids =
-                    query_context->get_sparse_id_payload() != nullptr;
-                if (first_column->IsBitmap() && !native_valid_ids) {
+                const bool has_filter_map =
+                    query_context->get_filter_map() != nullptr;
+                if (first_column->IsBitmap() && !has_filter_map) {
                     if (query_context->bitset_is_element_level()) {
                         Assert(processed_num ==
                                query_context->get_active_element_count());
@@ -364,8 +364,8 @@ ExecPlanNodeVisitor::setupRetrieveResult(
                "children inside row vector must be of column vector for now");
     tmp_retrieve_result.total_data_cnt_ = first_column->size();
     if (first_column->IsBitmap()) {
-        AssertInfo(query_context->get_sparse_id_payload() == nullptr,
-                   "Sparse retrieve output currently requires a native "
+        AssertInfo(query_context->get_filter_map() == nullptr,
+                   "FilterMap retrieve output currently requires a native "
                    "consumer such as count(*); bitmap fallback would consume "
                    "the one-row Sparse placeholder");
         BitsetTypeView view(first_column->GetRawData(), first_column->size());

@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -46,29 +47,28 @@ MakeBitmap(size_t size, std::initializer_list<size_t> set_bits) {
 }
 
 void
-ExpectSparseIds(const SparseFilterResult& result,
+ExpectSparseIds(const FilterMap& result,
                 std::initializer_list<int32_t> expected) {
-    ASSERT_TRUE(result.IsSparse());
+    ASSERT_EQ(result.capability(), FilterCapability::EnumerateOnly);
     ASSERT_FALSE(result.IsDense());
-    ASSERT_NE(result.accepted_ids, nullptr);
-    EXPECT_EQ(*result.accepted_ids, std::vector<int32_t>(expected));
+    EXPECT_EQ(*result.SnapshotUnsetIds(), std::vector<int32_t>(expected));
 }
 
 void
-ExpectDenseAccepted(const SparseFilterResult& result,
+ExpectDenseAccepted(const FilterMap& result,
                     std::initializer_list<size_t> accepted) {
     ASSERT_TRUE(result.IsDense());
-    ASSERT_FALSE(result.IsSparse());
-    ASSERT_NE(result.filtered, nullptr);
+    ASSERT_EQ(result.capability(), FilterCapability::RandomMembership);
+    ASSERT_NE(result.DenseData(), nullptr);
 
-    std::vector<bool> expected(result.universe, true);
+    std::vector<bool> expected(result.size(), true);
     for (const auto id : accepted) {
         ASSERT_LT(id, expected.size());
         expected[id] = false;
     }
-    ASSERT_EQ(result.filtered->size(), expected.size());
+    ASSERT_EQ(result.DenseData()->size(), expected.size());
     for (size_t i = 0; i < expected.size(); ++i) {
-        EXPECT_EQ((*result.filtered)[i], expected[i]) << "row " << i;
+        EXPECT_EQ((*result.DenseData())[i], expected[i]) << "row " << i;
     }
 }
 
@@ -87,7 +87,7 @@ TEST(AdaptiveFilterSinkTest, KeepsTMinusOneAndExactlyTSparse) {
         auto result = sink.Finish();
 
         ExpectSparseIds(result, {1, 7});
-        EXPECT_EQ(result.universe, 10);
+        EXPECT_EQ(result.size(), 10);
         EXPECT_EQ(sink.stats().processed_rows, 10);
         EXPECT_EQ(sink.stats().ids_appended, 2);
         EXPECT_EQ(sink.stats().switch_count, 0);
@@ -197,7 +197,7 @@ TEST(AdaptiveFilterSinkTest, AllTrueBatchHonorsCapAndAllFalseStaysSparse) {
         auto result = sink.Finish();
 
         ASSERT_TRUE(result.IsDense());
-        EXPECT_TRUE(result.filtered->none());
+        EXPECT_TRUE(result.DenseData()->none());
         EXPECT_EQ(sink.stats().switch_count, 1);
         EXPECT_EQ(sink.stats().dense_words_written, 2);
     }
@@ -212,6 +212,142 @@ TEST(AdaptiveFilterSinkTest, AllTrueBatchHonorsCapAndAllFalseStaysSparse) {
         EXPECT_EQ(sink.stats().ids_appended, 0);
         EXPECT_EQ(sink.stats().switch_count, 0);
     }
+}
+
+TEST(FilterMapTest, PreservesBitmapSemanticsForBothDefaultBits) {
+    auto default_zero = FilterMap::Adaptive(/*universe=*/8,
+                                            /*default_bit=*/false,
+                                            /*exception_cap=*/4);
+    EXPECT_TRUE(default_zero.none());
+    default_zero.set(6);
+    default_zero.set(2);
+    default_zero.set(6);  // Duplicate writes are idempotent.
+    EXPECT_TRUE(default_zero.test(2));
+    EXPECT_TRUE(default_zero.test(6));
+    EXPECT_EQ(default_zero.count(), 2);
+    default_zero.reset(2);
+    EXPECT_FALSE(default_zero.test(2));
+    EXPECT_EQ(default_zero.count(), 1);
+
+    auto default_one = FilterMap::Adaptive(/*universe=*/8,
+                                           /*default_bit=*/true,
+                                           /*exception_cap=*/4);
+    EXPECT_TRUE(default_one.all());
+    default_one.reset(5);
+    default_one.reset(1);
+    default_one.reset(5);
+    EXPECT_FALSE(default_one.test(1));
+    EXPECT_FALSE(default_one.test(5));
+    EXPECT_EQ(default_one.count(), 6);
+    default_one.set(1);
+    EXPECT_TRUE(default_one.test(1));
+    EXPECT_EQ(default_one.count(), 7);
+    EXPECT_EQ(*default_one.SnapshotUnsetIds(), (std::vector<int32_t>{5}));
+}
+
+TEST(FilterMapTest, PromotesAtTPlusOneAndBackfillsWithoutSemanticChange) {
+    auto map = FilterMap::Adaptive(/*universe=*/10,
+                                   /*default_bit=*/true,
+                                   /*exception_cap=*/2);
+    map.reset(8);
+    map.reset(2);
+    EXPECT_FALSE(map.IsDense());
+    EXPECT_EQ(map.peak_exception_count(), 2);
+
+    map.reset(6);
+    ASSERT_TRUE(map.IsDense());
+    EXPECT_EQ(map.promotion_count(), 1);
+    EXPECT_EQ(map.count(), 7);
+    for (size_t id = 0; id < map.size(); ++id) {
+        EXPECT_EQ(map.test(id), id != 2 && id != 6 && id != 8) << id;
+    }
+    EXPECT_EQ(*map.SnapshotUnsetIds(), (std::vector<int32_t>{2, 6, 8}));
+}
+
+TEST(FilterMapTest, CursorAndMvccOrPreserveSparseResult) {
+    auto ids = std::make_shared<const std::vector<int32_t>>(
+        std::initializer_list<int32_t>{7, 1, 5, 3});
+    auto map = FilterMap::FromUnsetIds(/*universe=*/9,
+                                       ids,
+                                       /*exception_cap=*/4);
+
+    FilterMapCursor cursor;
+    std::array<int32_t, 2> batch{};
+    std::vector<int32_t> observed;
+    while (const auto n = map.ReadUnsetBatch(cursor, batch)) {
+        observed.insert(observed.end(), batch.begin(), batch.begin() + n);
+    }
+    EXPECT_EQ(observed, *ids);
+
+    // MVCC/delete masks use logical 1=filtered. Invalidating rows 1 and 8
+    // removes only row 1 from the sparse valid-row exceptions.
+    auto invalid = MakeBitmap(9, {1, 8});
+    map.InplaceOr(TargetBitmapView(invalid));
+    EXPECT_EQ(*map.SnapshotUnsetIds(), (std::vector<int32_t>{7, 5, 3}));
+    EXPECT_FALSE(map.IsDense());
+}
+
+TEST(FilterMapTest, CopyOnWritePreservesCachedSparseOwner) {
+    auto ids = std::make_shared<std::vector<int32_t>>(
+        std::initializer_list<int32_t>{7, 1, 5});
+    auto cached = FilterMap::AdoptUnsetIds(/*universe=*/9, ids);
+    auto query = cached;
+
+    query.reset(3);
+    EXPECT_EQ(query.detach_copy_count(), 1);
+    EXPECT_EQ(*query.SnapshotUnsetIds(), (std::vector<int32_t>{7, 1, 5, 3}));
+    EXPECT_EQ(*cached.SnapshotUnsetIds(), (std::vector<int32_t>{7, 1, 5}));
+}
+
+TEST(FilterMapTest, EnsureDenseIsOneWayIdempotentAndCopyOnWriteSafe) {
+    auto ids = std::make_shared<std::vector<int32_t>>(
+        std::initializer_list<int32_t>{4, 2});
+    auto cached = FilterMap::AdoptUnsetIds(/*universe=*/8, ids);
+    auto query = cached;
+
+    auto* first = &query.EnsureDense();
+    auto* second = &query.EnsureDense();
+    EXPECT_EQ(first, second);
+    EXPECT_EQ(query.dense_materialization_count(), 1);
+    EXPECT_FALSE(query.test(2));
+    EXPECT_FALSE(query.test(4));
+    EXPECT_FALSE(cached.IsDense());
+
+    auto dense_copy = query;
+    dense_copy.set(2);
+    EXPECT_EQ(dense_copy.detach_copy_count(), 1);
+    EXPECT_TRUE(dense_copy.test(2));
+    EXPECT_FALSE(query.test(2));
+}
+
+TEST(FilterMapTest, PublicFactoryRejectsDuplicateAndOutOfRangeIds) {
+    auto duplicate = std::make_shared<const std::vector<int32_t>>(
+        std::initializer_list<int32_t>{1, 1});
+    EXPECT_THROW(FilterMap::FromUnsetIds(/*universe=*/4, duplicate),
+                 std::invalid_argument);
+
+    auto out_of_range = std::make_shared<const std::vector<int32_t>>(
+        std::initializer_list<int32_t>{4});
+    EXPECT_THROW(FilterMap::FromUnsetIds(/*universe=*/4, out_of_range),
+                 std::out_of_range);
+}
+
+TEST(FilterMapTest, DefaultZeroSparseMustMaterializeBeforeHandoff) {
+    auto map = FilterMap::Adaptive(/*universe=*/8,
+                                   /*default_bit=*/false,
+                                   /*exception_cap=*/4);
+    map.set(3);
+    EXPECT_THROW((void)map.capability(), std::logic_error);
+    map.EnsureDense();
+    EXPECT_EQ(map.capability(), FilterCapability::RandomMembership);
+    EXPECT_TRUE(map.test(3));
+}
+
+TEST(FilterMapTest, DefaultConstructedMapIsRejectedByCapabilityBoundary) {
+    FilterMap map;
+    EXPECT_FALSE(map.IsInitialized());
+    EXPECT_THROW((void)map.capability(), std::logic_error);
+    EXPECT_THROW((void)map.EnsureDense(), std::logic_error);
 }
 
 }  // namespace

@@ -36,7 +36,7 @@
 #include "common/Types.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/ExprCacheHelper.h"
-#include "exec/expression/FilterResult.h"
+#include "common/FilterBitmap.h"
 #include "exec/expression/Utils.h"
 #include "exec/QueryContext.h"
 #include "expr/ITypeExpr.h"
@@ -162,7 +162,7 @@ class Expr : public std::enable_shared_from_this<Expr> {
     // Opt-in Cardinal BF producer. The only native runtime payload is a
     // list of accepted row IDs; unsupported expressions retain the normal
     // dense evaluation path.
-    virtual std::shared_ptr<const std::vector<int32_t>>
+    virtual std::shared_ptr<std::vector<int32_t>>
     TryGetNativeValidIds() {
         return nullptr;
     }
@@ -171,7 +171,7 @@ class Expr : public std::enable_shared_from_this<Expr> {
     // evaluate a following predicate by offsets.  Leaf producers retain the
     // existing context-free implementation; compound expressions override
     // this overload when they can keep accepted row IDs sparse end to end.
-    virtual std::shared_ptr<const std::vector<int32_t>>
+    virtual std::shared_ptr<std::vector<int32_t>>
     TryGetNativeValidIds(EvalCtx& /* context */) {
         return TryGetNativeValidIds();
     }
@@ -180,7 +180,7 @@ class Expr : public std::enable_shared_from_this<Expr> {
     // producers inherit the old behavior, but native producers that can emit
     // a threshold-bounded list override this method so preflight and execution
     // consume the same request-frozen cap.
-    virtual std::shared_ptr<const std::vector<int32_t>>
+    virtual std::shared_ptr<std::vector<int32_t>>
     TryGetNativeValidIds(EvalCtx& context, int64_t /* max_cardinality */) {
         return TryGetNativeValidIds(context);
     }
@@ -189,10 +189,9 @@ class Expr : public std::enable_shared_from_this<Expr> {
     // return the subset accepted by this expression. Implementations must
     // keep the result Sparse end to end; returning nullptr asks the caller to
     // retain the established Dense executor.
-    virtual std::shared_ptr<const std::vector<int32_t>>
-    TryFilterNativeValidIds(
-        EvalCtx& /* context */,
-        const std::shared_ptr<const std::vector<int32_t>>& /* input */) {
+    virtual std::shared_ptr<std::vector<int32_t>>
+    TryFilterNativeValidIds(EvalCtx& /* context */,
+                            std::span<const int32_t> /* input */) {
         return nullptr;
     }
 
@@ -217,8 +216,7 @@ class Expr : public std::enable_shared_from_this<Expr> {
     PreflightSparseFilter(EvalCtx& context,
                           bool has_sparse_input,
                           int64_t max_cardinality) {
-        return CanApplySparseFilter(
-                   context, has_sparse_input, max_cardinality)
+        return CanApplySparseFilter(context, has_sparse_input, max_cardinality)
                    ? SparseFilterPreflight::Sparse
                    : SparseFilterPreflight::Unsupported;
     }
@@ -227,21 +225,31 @@ class Expr : public std::enable_shared_from_this<Expr> {
     // existing producer/consumer implementations behind this adapter;
     // compound expressions override it to compose children through one
     // representation instead of calling leaf-specific hooks directly.
-    virtual std::optional<SparseFilterResult>
+    virtual std::optional<FilterMap>
     TryApplySparseFilter(EvalCtx& context,
-                         std::optional<SparseFilterResult> input,
+                         std::optional<FilterMap> input,
                          int64_t max_cardinality) {
         if (max_cardinality < 0) {
             return std::nullopt;
         }
-        std::shared_ptr<const std::vector<int32_t>> ids;
+        std::shared_ptr<std::vector<int32_t>> ids;
         int64_t universe = 0;
         if (input.has_value()) {
-            if (!input->IsSparse()) {
+            if (input->capability() != FilterCapability::EnumerateOnly) {
                 return std::nullopt;
             }
-            ids = TryFilterNativeValidIds(context, input->accepted_ids);
-            universe = input->universe;
+            const auto view = input->TryGetUnsetIdsView();
+            if (!view.has_value()) {
+                return std::nullopt;
+            }
+            auto filtered = TryFilterNativeValidIds(context, *view);
+            if (filtered == nullptr) {
+                return std::nullopt;
+            }
+            return FilterMap::AdoptUnsetIds(
+                input->size(),
+                std::move(filtered),
+                static_cast<size_t>(max_cardinality));
         } else {
             ids = TryGetNativeValidIds(context, max_cardinality);
             auto* exec_context = context.get_exec_context();
@@ -253,7 +261,9 @@ class Expr : public std::enable_shared_from_this<Expr> {
         if (ids == nullptr) {
             return std::nullopt;
         }
-        return SparseFilterResult{std::move(ids), nullptr, universe};
+        return FilterMap::AdoptUnsetIds(static_cast<size_t>(universe),
+                                        std::move(ids),
+                                        static_cast<size_t>(max_cardinality));
     }
 
     // Only move cursor to next batch
@@ -587,18 +597,17 @@ class SegmentExpr : public Expr {
     }
 
     template <typename T, typename Match, typename CanSkip>
-    std::shared_ptr<const std::vector<int32_t>>
-    FilterNativeIdsByRawData(
-        const std::shared_ptr<const std::vector<int32_t>>& input,
-        Match&& match,
-        CanSkip&& can_skip) {
-        if (input == nullptr || !CanFilterNativeIdsByRawData()) {
+    std::shared_ptr<std::vector<int32_t>>
+    FilterNativeIdsByRawData(std::span<const int32_t> input,
+                             Match&& match,
+                             CanSkip&& can_skip) {
+        if (!CanFilterNativeIdsByRawData()) {
             return nullptr;
         }
 
         auto output = std::make_shared<std::vector<int32_t>>();
-        output->reserve(input->size());
-        if (input->empty()) {
+        output->reserve(input.size());
+        if (input.empty()) {
             return output;
         }
 
@@ -619,16 +628,16 @@ class SegmentExpr : public Expr {
         }
         if (segment_->is_chunked() && !has_skippable_chunk) {
             std::vector<int64_t> offsets;
-            offsets.reserve(input->size());
-            for (const auto id : *input) {
+            offsets.reserve(input.size());
+            for (const auto id : input) {
                 if (id < 0 || id >= active_count_) {
                     return nullptr;
                 }
                 offsets.push_back(id);
             }
 
-            std::vector<T> values(input->size());
-            TargetBitmap valid(input->size(), true);
+            std::vector<T> values(input.size());
+            TargetBitmap valid(input.size(), true);
             segment_->bulk_subscript(op_ctx_,
                                      field_id_,
                                      field_type_,
@@ -636,9 +645,9 @@ class SegmentExpr : public Expr {
                                      static_cast<int64_t>(offsets.size()),
                                      values.data(),
                                      valid);
-            for (size_t i = 0; i < input->size(); ++i) {
+            for (size_t i = 0; i < input.size(); ++i) {
                 if (valid[i] && match(values[i])) {
-                    output->push_back((*input)[i]);
+                    output->push_back(input[i]);
                 }
             }
             return output;
@@ -657,14 +666,14 @@ class SegmentExpr : public Expr {
         };
 
         std::vector<ResolvedCandidate> resolved;
-        resolved.reserve(input->size());
+        resolved.reserve(input.size());
         const bool known_single_chunk =
             !segment_->is_chunked() || available_chunk_count == 1;
         int64_t first_chunk_id = -1;
         bool all_in_one_chunk = true;
-        for (size_t input_position = 0; input_position < input->size();
-            ++input_position) {
-            const auto id = (*input)[input_position];
+        for (size_t input_position = 0; input_position < input.size();
+             ++input_position) {
+            const auto id = input[input_position];
             if (id < 0 || id >= active_count_) {
                 return nullptr;
             }
@@ -764,7 +773,7 @@ class SegmentExpr : public Expr {
             process_chunk(
                 first_chunk_id, resolved, 0, resolved.size(), nullptr);
         } else {
-            std::vector<uint8_t> accepted(input->size(), 0);
+            std::vector<uint8_t> accepted(input.size(), 0);
             for (int64_t chunk_id = 0; chunk_id < available_chunk_count;
                  ++chunk_id) {
                 const auto begin = group_offsets[chunk_id];
@@ -775,7 +784,7 @@ class SegmentExpr : public Expr {
             }
             for (size_t i = 0; i < accepted.size(); ++i) {
                 if (accepted[i]) {
-                    output->push_back((*input)[i]);
+                    output->push_back(input[i]);
                 }
             }
         }

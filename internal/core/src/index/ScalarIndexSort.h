@@ -123,21 +123,21 @@ class ScalarIndexSort : public ScalarIndex<T> {
           const T& upper_bound_value,
           bool ub_inclusive) override;
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdRange(const T& value, OpType op) const override;
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdRange(const T& value,
                        OpType op,
                        size_t max_cardinality) const override;
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdRange(const T& lower_bound_value,
                        bool lb_inclusive,
                        const T& upper_bound_value,
                        bool ub_inclusive) const override;
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdRange(const T& lower_bound_value,
                        bool lb_inclusive,
                        const T& upper_bound_value,
@@ -234,7 +234,7 @@ class ScalarIndexSort : public ScalarIndex<T> {
                     const T& upper_bound_value,
                     bool ub_inclusive) const;
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     BuildValidIdsFromBounds(const IndexStructure<T>* lb,
                             const IndexStructure<T>* ub,
                             size_t max_cardinality) const;

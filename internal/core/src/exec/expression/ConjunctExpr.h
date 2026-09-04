@@ -68,12 +68,12 @@ class PhyConjunctFilterExpr : public Expr {
     // following child filters that candidate set.  Unsupported children return
     // nullptr so FilterBitsNode can use the established Dense evaluator and
     // still convert its final result to Sparse at the representation boundary.
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetNativeValidIds(EvalCtx& context) override;
 
-    std::optional<SparseFilterResult>
+    std::optional<FilterMap>
     TryApplySparseFilter(EvalCtx& context,
-                         std::optional<SparseFilterResult> input,
+                         std::optional<FilterMap> input,
                          int64_t max_cardinality) override;
 
     bool

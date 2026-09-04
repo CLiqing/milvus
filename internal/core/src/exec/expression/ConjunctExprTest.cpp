@@ -76,10 +76,10 @@ class FixedSparseProducerExpr : public Expr {
  public:
     explicit FixedSparseProducerExpr(std::vector<int32_t> ids)
         : Expr(DataType::BOOL, {}, "FixedSparseProducerExpr", nullptr),
-          ids_(std::make_shared<const std::vector<int32_t>>(std::move(ids))) {
+          ids_(std::make_shared<std::vector<int32_t>>(std::move(ids))) {
     }
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetNativeValidIds() override {
         return ids_;
     }
@@ -100,7 +100,7 @@ class FixedSparseProducerExpr : public Expr {
     }
 
  private:
-    std::shared_ptr<const std::vector<int32_t>> ids_;
+    std::shared_ptr<std::vector<int32_t>> ids_;
 };
 
 class CountingAllTrueNativeExpr : public Expr {
@@ -125,9 +125,9 @@ class CountingAllTrueNativeExpr : public Expr {
         return !has_sparse_input;
     }
 
-    std::optional<SparseFilterResult>
+    std::optional<FilterMap>
     TryApplySparseFilter(EvalCtx&,
-                         std::optional<SparseFilterResult> input,
+                         std::optional<FilterMap> input,
                          int64_t max_cardinality) override {
         ++apply_count_;
         last_cap_ = max_cardinality;
@@ -139,7 +139,8 @@ class CountingAllTrueNativeExpr : public Expr {
         for (int32_t id = 0; id < universe_; ++id) {
             ids->push_back(id);
         }
-        return SparseFilterResult{std::move(ids), nullptr, universe_};
+        return FilterMap::FromUnsetIds(
+            universe_, std::move(ids), static_cast<size_t>(max_cardinality));
     }
 
     std::string
@@ -182,14 +183,12 @@ class OffsetMembershipExpr : public Expr {
             std::make_shared<ColumnVector>(std::move(data), std::move(valid));
     }
 
-    std::shared_ptr<const std::vector<int32_t>>
-    TryFilterNativeValidIds(
-        EvalCtx&,
-        const std::shared_ptr<const std::vector<int32_t>>& input) override {
-        seen_offsets_ = input->size();
+    std::shared_ptr<std::vector<int32_t>>
+    TryFilterNativeValidIds(EvalCtx&, std::span<const int32_t> input) override {
+        seen_offsets_ = input.size();
         auto output = std::make_shared<std::vector<int32_t>>();
-        output->reserve(input->size());
-        for (const auto id : *input) {
+        output->reserve(input.size());
+        for (const auto id : input) {
             if (accepted_.contains(id)) {
                 output->push_back(id);
             }
@@ -244,9 +243,9 @@ class AdaptiveMembershipExpr : public Expr {
             std::make_shared<ColumnVector>(std::move(data), std::move(valid));
     }
 
-    std::optional<SparseFilterResult>
+    std::optional<FilterMap>
     TryApplySparseFilter(EvalCtx& context,
-                         std::optional<SparseFilterResult> input,
+                         std::optional<FilterMap> input,
                          int64_t max_cardinality) override {
         ++apply_count_;
         last_cap_ = max_cardinality;
@@ -259,7 +258,7 @@ class AdaptiveMembershipExpr : public Expr {
             for (const auto id : accepted_) {
                 (*filtered)[id] = false;
             }
-            return SparseFilterResult{nullptr, std::move(filtered), universe_};
+            return FilterMap::FromDense(std::move(filtered));
         }
         auto ids = std::make_shared<std::vector<int32_t>>();
         ids->reserve(accepted_.size());
@@ -268,7 +267,8 @@ class AdaptiveMembershipExpr : public Expr {
                 ids->push_back(static_cast<int32_t>(id));
             }
         }
-        return SparseFilterResult{std::move(ids), nullptr, universe_};
+        return FilterMap::FromUnsetIds(
+            universe_, std::move(ids), static_cast<size_t>(max_cardinality));
     }
 
     bool
@@ -276,13 +276,11 @@ class AdaptiveMembershipExpr : public Expr {
         return true;
     }
 
-    std::shared_ptr<const std::vector<int32_t>>
-    TryFilterNativeValidIds(
-        EvalCtx&,
-        const std::shared_ptr<const std::vector<int32_t>>& input) override {
+    std::shared_ptr<std::vector<int32_t>>
+    TryFilterNativeValidIds(EvalCtx&, std::span<const int32_t> input) override {
         ++filter_count_;
         auto output = std::make_shared<std::vector<int32_t>>();
-        for (const auto id : *input) {
+        for (const auto id : input) {
             if (accepted_.contains(id)) {
                 output->push_back(id);
             }
@@ -566,32 +564,30 @@ TEST(ConjunctExprTest, SparseSelectorUsesPerSegmentRatioAndAbsoluteCap) {
     EXPECT_EQ(ComputeSparseFilterResultCap(
                   kMinRows - 1, kAbsoluteCap, kMinRows, kRatio),
               0);
-    EXPECT_EQ(ComputeSparseFilterResultCap(
-                  kMinRows, kAbsoluteCap, kMinRows, kRatio),
-              300);
+    EXPECT_EQ(
+        ComputeSparseFilterResultCap(kMinRows, kAbsoluteCap, kMinRows, kRatio),
+        300);
     EXPECT_EQ(ComputeSparseFilterResultCap(
                   kMinRows + 1, kAbsoluteCap, kMinRows, kRatio),
               300);
-    EXPECT_EQ(ComputeSparseFilterResultCap(
-                  100000, kAbsoluteCap, kMinRows, kRatio),
-              600);
-    EXPECT_EQ(ComputeSparseFilterResultCap(
-                  250000, kAbsoluteCap, kMinRows, kRatio),
-              1500);
-    EXPECT_EQ(ComputeSparseFilterResultCap(
-                  1000000, kAbsoluteCap, kMinRows, kRatio),
-              6000);
-    EXPECT_EQ(ComputeSparseFilterResultCap(
-                  10000000, kAbsoluteCap, kMinRows, kRatio),
-              kAbsoluteCap);
+    EXPECT_EQ(
+        ComputeSparseFilterResultCap(100000, kAbsoluteCap, kMinRows, kRatio),
+        600);
+    EXPECT_EQ(
+        ComputeSparseFilterResultCap(250000, kAbsoluteCap, kMinRows, kRatio),
+        1500);
+    EXPECT_EQ(
+        ComputeSparseFilterResultCap(1000000, kAbsoluteCap, kMinRows, kRatio),
+        6000);
+    EXPECT_EQ(
+        ComputeSparseFilterResultCap(10000000, kAbsoluteCap, kMinRows, kRatio),
+        kAbsoluteCap);
 
     // A request-level absolute cap may make the selector more conservative,
     // but it cannot bypass the global ratio or minimum-segment guards.
-    EXPECT_EQ(
-        ComputeSparseFilterResultCap(1000000, 4096, kMinRows, kRatio),
-        4096);
-    EXPECT_EQ(ComputeSparseFilterResultCap(49999, 4096, kMinRows, kRatio),
-              0);
+    EXPECT_EQ(ComputeSparseFilterResultCap(1000000, 4096, kMinRows, kRatio),
+              4096);
+    EXPECT_EQ(ComputeSparseFilterResultCap(49999, 4096, kMinRows, kRatio), 0);
 }
 
 TEST(ConjunctExprTest, OffsetInputErasesUnmaterializedReservedLikeSlot) {
@@ -745,8 +741,8 @@ TEST(ConjunctExprTest, SparseApplyPreservesUniverseAcrossNestedAnd) {
     const auto result =
         outer.TryApplySparseFilter(eval_context, std::nullopt, 1000);
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(result->universe, 32);
-    EXPECT_EQ(*result->accepted_ids, (std::vector<int32_t>{10, 25}));
+    EXPECT_EQ(result->size(), 32);
+    EXPECT_EQ(*result->SnapshotUnsetIds(), (std::vector<int32_t>{10, 25}));
     EXPECT_EQ(inner_consumer->seen_offsets_, 4);
     EXPECT_EQ(outer_consumer->seen_offsets_, 3);
 }
@@ -824,9 +820,9 @@ TEST(ConjunctExprTest, AdaptiveDenseIntermediateMergesNextPredicateOnce) {
         conjunct.TryApplySparseFilter(eval_context, std::nullopt, 1000);
 
     ASSERT_TRUE(result.has_value());
-    ASSERT_TRUE(result->IsSparse());
-    EXPECT_EQ(result->universe, 6);
-    EXPECT_EQ(*result->accepted_ids, (std::vector<int32_t>{1, 2}));
+    ASSERT_EQ(result->capability(), FilterCapability::EnumerateOnly);
+    EXPECT_EQ(result->size(), 6);
+    EXPECT_EQ(*result->SnapshotUnsetIds(), (std::vector<int32_t>{1, 2}));
     EXPECT_EQ(first->apply_count_, 1);
     EXPECT_EQ(first->eval_count_, 0);
     EXPECT_EQ(second->apply_count_, 1);
@@ -857,10 +853,12 @@ TEST(ConjunctExprTest, AdaptiveAndIsCorrectInEitherPredicateOrder) {
     for (const bool first_is_dense : {false, true}) {
         const auto ab = evaluate(false, first_is_dense);
         const auto ba = evaluate(true, first_is_dense);
-        ASSERT_TRUE(ab.has_value() && ab->IsSparse());
-        ASSERT_TRUE(ba.has_value() && ba->IsSparse());
-        EXPECT_EQ(*ab->accepted_ids, (std::vector<int32_t>{1, 2}));
-        EXPECT_EQ(*ab->accepted_ids, *ba->accepted_ids);
+        ASSERT_TRUE(ab.has_value());
+        ASSERT_TRUE(ba.has_value());
+        ASSERT_EQ(ab->capability(), FilterCapability::EnumerateOnly);
+        ASSERT_EQ(ba->capability(), FilterCapability::EnumerateOnly);
+        EXPECT_EQ(*ab->SnapshotUnsetIds(), (std::vector<int32_t>{1, 2}));
+        EXPECT_EQ(*ab->SnapshotUnsetIds(), *ba->SnapshotUnsetIds());
     }
 }
 
@@ -883,8 +881,9 @@ TEST(ConjunctExprTest, AdaptiveAndEvaluatesEachChildOnceAtEveryTestedDepth) {
 
         const auto result =
             conjunct.TryApplySparseFilter(eval_context, std::nullopt, 1000);
-        ASSERT_TRUE(result.has_value() && result->IsSparse());
-        EXPECT_EQ(*result->accepted_ids, (std::vector<int32_t>{1, 2, 3}));
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result->capability(), FilterCapability::EnumerateOnly);
+        EXPECT_EQ(*result->SnapshotUnsetIds(), (std::vector<int32_t>{1, 2, 3}));
         for (const auto& predicate : predicates) {
             EXPECT_EQ(predicate->apply_count_, 1) << "depth=" << depth;
             EXPECT_EQ(predicate->eval_count_, 0) << "depth=" << depth;
@@ -906,11 +905,12 @@ TEST(ConjunctExprTest, AdaptiveExecutionKeepsPreflightCapAcrossEntireChain) {
     constexpr int64_t kRequestCap = 37;
     ASSERT_TRUE(conjunct.CanApplySparseFilter(
         eval_context, /*has_sparse_input=*/false, kRequestCap));
-    const auto result = conjunct.TryApplySparseFilter(
-        eval_context, std::nullopt, kRequestCap);
+    const auto result =
+        conjunct.TryApplySparseFilter(eval_context, std::nullopt, kRequestCap);
 
-    ASSERT_TRUE(result.has_value() && result->IsSparse());
-    EXPECT_EQ(*result->accepted_ids, (std::vector<int32_t>{2, 3}));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->capability(), FilterCapability::EnumerateOnly);
+    EXPECT_EQ(*result->SnapshotUnsetIds(), (std::vector<int32_t>{2, 3}));
     EXPECT_EQ(first->last_cap_, kRequestCap);
     EXPECT_EQ(second->last_cap_, kRequestCap);
 }

@@ -1026,16 +1026,15 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetNativeValidIds() override;
 
-    std::shared_ptr<const std::vector<int32_t>>
-    TryGetNativeValidIds(EvalCtx& context,
-                         int64_t max_cardinality) override;
+    std::shared_ptr<std::vector<int32_t>>
+    TryGetNativeValidIds(EvalCtx& context, int64_t max_cardinality) override;
 
-    std::optional<SparseFilterResult>
+    std::optional<FilterMap>
     TryApplySparseFilter(EvalCtx& context,
-                         std::optional<SparseFilterResult> input,
+                         std::optional<FilterMap> input,
                          int64_t max_cardinality) override;
 
     bool
@@ -1048,10 +1047,9 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
                           bool has_sparse_input,
                           int64_t max_cardinality) override;
 
-    std::shared_ptr<const std::vector<int32_t>>
-    TryFilterNativeValidIds(
-        EvalCtx& context,
-        const std::shared_ptr<const std::vector<int32_t>>& input) override;
+    std::shared_ptr<std::vector<int32_t>>
+    TryFilterNativeValidIds(EvalCtx& context,
+                            std::span<const int32_t> input) override;
 
     void
     DetermineExecPath() override;
@@ -1135,7 +1133,7 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
                        int64_t batch_size);
 
  private:
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetNativeValidIdsWithCap(size_t max_cardinality);
 
     template <typename T>

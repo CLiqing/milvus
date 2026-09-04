@@ -51,29 +51,26 @@ namespace milvus {
 
 namespace exec {
 
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 PhyBinaryRangeFilterExpr::TryGetNativeValidIds() {
     const auto configured_cap = SPARSE_FILTER_RESULT_MAX_CARDINALITY.load();
     if (configured_cap < 0) {
         return nullptr;
     }
-    return TryGetNativeValidIdsWithCap(
-        static_cast<size_t>(configured_cap));
+    return TryGetNativeValidIdsWithCap(static_cast<size_t>(configured_cap));
 }
 
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 PhyBinaryRangeFilterExpr::TryGetNativeValidIds(EvalCtx&,
                                                int64_t max_cardinality) {
     if (max_cardinality < 0) {
         return nullptr;
     }
-    return TryGetNativeValidIdsWithCap(
-        static_cast<size_t>(max_cardinality));
+    return TryGetNativeValidIdsWithCap(static_cast<size_t>(max_cardinality));
 }
 
-std::shared_ptr<const std::vector<int32_t>>
-PhyBinaryRangeFilterExpr::TryGetNativeValidIdsWithCap(
-    size_t max_cardinality) {
+std::shared_ptr<std::vector<int32_t>>
+PhyBinaryRangeFilterExpr::TryGetNativeValidIdsWithCap(size_t max_cardinality) {
     if (expr_->column_.element_level_ ||
         expr_->column_.data_type_ != DataType::INT64) {
         return nullptr;
@@ -134,8 +131,7 @@ SparseFilterPreflight
 PhyBinaryRangeFilterExpr::PreflightSparseFilter(EvalCtx& context,
                                                 bool has_sparse_input,
                                                 int64_t max_cardinality) {
-    if (CanApplySparseFilter(
-            context, has_sparse_input, max_cardinality)) {
+    if (CanApplySparseFilter(context, has_sparse_input, max_cardinality)) {
         return SparseFilterPreflight::Sparse;
     }
     if (has_sparse_input || max_cardinality < 0 ||
@@ -165,9 +161,9 @@ PhyBinaryRangeFilterExpr::PreflightSparseFilter(EvalCtx& context,
                : SparseFilterPreflight::Unsupported;
 }
 
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 PhyBinaryRangeFilterExpr::TryFilterNativeValidIds(
-    EvalCtx&, const std::shared_ptr<const std::vector<int32_t>>& input) {
+    EvalCtx&, std::span<const int32_t> input) {
     if (expr_->column_.element_level_ ||
         expr_->column_.data_type_ != DataType::INT64) {
         return nullptr;

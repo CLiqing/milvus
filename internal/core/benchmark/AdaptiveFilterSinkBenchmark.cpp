@@ -71,7 +71,7 @@ struct ProducerCounters {
 };
 
 struct AdaptiveOutput {
-    SparseFilterResult result;
+    FilterMap result;
     AdaptiveFilterSinkStats stats;
 };
 
@@ -301,19 +301,17 @@ VerifyDense(const ProducerWorkload& workload, const TargetBitmap& filtered) {
 }
 
 std::string
-VerifyAdaptive(const ProducerWorkload& workload,
-               const SparseFilterResult& result) {
-    if (result.universe != workload.universe ||
-        result.IsSparse() == result.IsDense()) {
+VerifyAdaptive(const ProducerWorkload& workload, const FilterMap& result) {
+    if (result.size() != static_cast<size_t>(workload.universe)) {
         return "Adaptive output has an invalid representation contract";
     }
 
     if (result.IsDense()) {
-        return VerifyDense(workload, *result.filtered);
+        return VerifyDense(workload, *result.DenseData());
     }
 
     TargetBitmap observed(static_cast<size_t>(workload.universe), false);
-    for (const auto id : *result.accepted_ids) {
+    for (const auto id : *result.SnapshotUnsetIds()) {
         if (id < 0 || id >= workload.universe) {
             return "Adaptive Sparse output contains an out-of-range ID";
         }
@@ -495,12 +493,12 @@ AdaptiveProducerBenchmark(benchmark::State& state) {
 
         auto output = RunAdaptiveProducer<false>(
             masks, workload.universe, workload.sparse_cap);
-        if (output.result.IsSparse()) {
-            benchmark::DoNotOptimize(output.result.accepted_ids->data());
-            benchmark::DoNotOptimize(output.result.accepted_ids->size());
+        if (!output.result.IsDense()) {
+            benchmark::DoNotOptimize(output.result.StorageBytes());
+            benchmark::DoNotOptimize(output.result.count());
         } else {
-            benchmark::DoNotOptimize(output.result.filtered->data());
-            benchmark::DoNotOptimize(output.result.filtered->size());
+            benchmark::DoNotOptimize(output.result.DenseData()->data());
+            benchmark::DoNotOptimize(output.result.DenseData()->size());
         }
         benchmark::ClobberMemory();
     }

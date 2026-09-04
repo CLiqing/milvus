@@ -424,7 +424,7 @@ BitmapIndex<T>::CopyRoaringPosting(const roaring::Roaring& values) const {
 }
 
 template <typename T>
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 BitmapIndex<T>::MaterializeValidIds(const roaring_bitmap_t* values,
                                     size_t max_cardinality) const {
     constexpr size_t kMaxCardinalRows =
@@ -476,7 +476,7 @@ BitmapIndex<T>::NativeRoaringSidecarByteSize() const {
 }
 
 template <typename T>
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 BitmapIndex<T>::TryGetValidIdEqual(const T& value) const {
     const auto configured_cap = SPARSE_FILTER_RESULT_MAX_CARDINALITY.load();
     if (configured_cap < 0) {
@@ -486,7 +486,7 @@ BitmapIndex<T>::TryGetValidIdEqual(const T& value) const {
 }
 
 template <typename T>
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 BitmapIndex<T>::TryGetValidIdEqual(const T& value,
                                    size_t max_cardinality) const {
     constexpr size_t kMaxCardinalRows =
@@ -536,20 +536,19 @@ BitmapIndex<T>::PreflightValidIdEqual(const T& value,
         return NativeValidIdPreflight::Unsupported;
     }
 
-    const auto posting_status =
-        [this, max_cardinality](const roaring_bitmap_t* posting) {
-            if (posting == nullptr) {
-                return NativeValidIdPreflight::Unsupported;
-            }
-            const auto cardinality = roaring_bitmap_get_cardinality(posting);
-            if (cardinality != 0 &&
-                roaring_bitmap_maximum(posting) >= total_num_rows_) {
-                return NativeValidIdPreflight::Unsupported;
-            }
-            return cardinality <= max_cardinality
-                       ? NativeValidIdPreflight::Fits
-                       : NativeValidIdPreflight::Exceeds;
-        };
+    const auto posting_status = [this, max_cardinality](
+                                    const roaring_bitmap_t* posting) {
+        if (posting == nullptr) {
+            return NativeValidIdPreflight::Unsupported;
+        }
+        const auto cardinality = roaring_bitmap_get_cardinality(posting);
+        if (cardinality != 0 &&
+            roaring_bitmap_maximum(posting) >= total_num_rows_) {
+            return NativeValidIdPreflight::Unsupported;
+        }
+        return cardinality <= max_cardinality ? NativeValidIdPreflight::Fits
+                                              : NativeValidIdPreflight::Exceeds;
+    };
 
     if (build_mode_ == BitmapIndexBuildMode::BITSET) {
         const auto posting = native_roaring_postings_.find(value);
@@ -566,9 +565,8 @@ BitmapIndex<T>::PreflightValidIdEqual(const T& value,
 
     const auto& postings = is_mmap_ ? bitmap_info_map_ : data_;
     const auto posting = postings.find(value);
-    return posting == postings.end()
-               ? NativeValidIdPreflight::Fits
-               : posting_status(&posting->second.roaring);
+    return posting == postings.end() ? NativeValidIdPreflight::Fits
+                                     : posting_status(&posting->second.roaring);
 }
 
 template <typename T>

@@ -26,6 +26,7 @@
 #include <folly/CancellationToken.h>
 
 #include "common/Common.h"
+#include "common/FilterBitmap.h"
 #include "common/Types.h"
 #include "common/Exception.h"
 #include "common/ArrayOffsets.h"
@@ -176,18 +177,6 @@ class Context {
 
 class QueryContext : public Context {
  public:
-    // Sparse filter-result contract.  This first landing carries the accepted
-    // (valid) side of a scalar predicate as immutable, unique sealed-segment
-    // row IDs.  Producer order is intentionally preserved: ordering is not a
-    // property of the canonical payload. `universe` defines the row-ID domain
-    // shared by every downstream consumer. A future excluded-ID
-    // representation must extend this contract explicitly; it must not
-    // overload these IDs.
-    struct SparseIdPayload {
-        std::shared_ptr<const std::vector<int32_t>> ids;
-        int64_t universe;
-    };
-
     QueryContext(const std::string& query_id,
                  const milvus::segcore::SegmentInternalInterface* segment,
                  int64_t active_count,
@@ -401,35 +390,25 @@ class QueryContext : public Context {
     }
 
     void
-    set_sparse_id_payload(std::shared_ptr<const std::vector<int32_t>> ids,
-                          int64_t universe) {
-        AssertInfo(ids != nullptr,
-                   "sparse-ID payload must have an owning ID list");
-        AssertInfo(universe >= 0,
-                   "sparse-ID payload universe {} must not be negative",
-                   universe);
-        // Native producers establish uniqueness structurally (one row offset
-        // per accepted row), and subset consumers preserve it. Keep the hot
-        // cross-operator handoff O(V) with sequential range validation only;
-        // do not rebuild a hash set merely to re-prove that invariant.
-        for (const auto id : *ids) {
-            AssertInfo(id >= 0 && id < universe,
-                       "sparse-ID payload contains ID {} outside universe {}",
-                       id,
-                       universe);
-        }
-        sparse_id_payload_ = std::make_shared<const SparseIdPayload>(
-            SparseIdPayload{std::move(ids), universe});
+    set_filter_map(std::shared_ptr<FilterMap> filter_map) {
+        AssertInfo(filter_map != nullptr, "query FilterMap must have an owner");
+        AssertInfo(filter_map->IsInitialized(),
+                   "query FilterMap must be initialized");
+        AssertInfo(filter_map->size() == static_cast<size_t>(active_count_),
+                   "query FilterMap universe {} does not match active count {}",
+                   filter_map->size(),
+                   active_count_);
+        filter_map_ = std::move(filter_map);
     }
 
-    std::shared_ptr<const SparseIdPayload>
-    get_sparse_id_payload() const {
-        return sparse_id_payload_;
+    std::shared_ptr<FilterMap>
+    get_filter_map() const {
+        return filter_map_;
     }
 
     void
-    clear_sparse_id_payload() {
-        sparse_id_payload_.reset();
+    clear_filter_map() {
+        filter_map_.reset();
     }
 
     void
@@ -496,11 +475,10 @@ class QueryContext : public Context {
     // MVCC fast path: set true when sealed + no-filter + no-delete + no-TTL
     bool all_rows_visible_{false};
 
-    // Accepted row IDs for the opt-in Cardinal BF experiment. This remains a
-    // single List representation even if BitmapIndex uses Roaring internally.
-    // MVCC may replace it with a query-owned compacted list while preserving
-    // the row-ID universe.
-    std::shared_ptr<const SparseIdPayload> sparse_id_payload_{nullptr};
+    // Canonical query-owned filter. Its physical list/Roaring/Dense backend is
+    // private to FilterMap; downstream nodes consume only logical bitmap
+    // operations and capability.
+    std::shared_ptr<FilterMap> filter_map_{nullptr};
 
     // Expression filter cache for two-stage search
     bool enable_expr_cache_ = false;

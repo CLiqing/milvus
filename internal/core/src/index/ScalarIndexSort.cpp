@@ -649,7 +649,7 @@ ScalarIndexSort<T>::FindRangeBounds(const T& lower_bound_value,
 }
 
 template <typename T>
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 ScalarIndexSort<T>::BuildValidIdsFromBounds(const IndexStructure<T>* lb,
                                             const IndexStructure<T>* ub,
                                             size_t max_cardinality) const {
@@ -681,7 +681,7 @@ ScalarIndexSort<T>::BuildValidIdsFromBounds(const IndexStructure<T>* lb,
 }
 
 template <typename T>
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 ScalarIndexSort<T>::TryGetValidIdRange(const T& value, const OpType op) const {
     const auto configured_cap = SPARSE_FILTER_RESULT_MAX_CARDINALITY.load();
     if (configured_cap < 0) {
@@ -691,7 +691,7 @@ ScalarIndexSort<T>::TryGetValidIdRange(const T& value, const OpType op) const {
 }
 
 template <typename T>
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 ScalarIndexSort<T>::TryGetValidIdRange(const T& value,
                                        const OpType op,
                                        size_t max_cardinality) const {
@@ -701,7 +701,7 @@ ScalarIndexSort<T>::TryGetValidIdRange(const T& value,
 }
 
 template <typename T>
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 ScalarIndexSort<T>::TryGetValidIdRange(const T& lower_bound_value,
                                        bool lb_inclusive,
                                        const T& upper_bound_value,
@@ -718,7 +718,7 @@ ScalarIndexSort<T>::TryGetValidIdRange(const T& lower_bound_value,
 }
 
 template <typename T>
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 ScalarIndexSort<T>::TryGetValidIdRange(const T& lower_bound_value,
                                        bool lb_inclusive,
                                        const T& upper_bound_value,

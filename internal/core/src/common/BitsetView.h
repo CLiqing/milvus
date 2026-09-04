@@ -58,6 +58,28 @@ class BitsetView : public knowhere::BitsetView {
             std::move(ids), num_bits, num_filtered_out_bits));
     }
 
+    static BitsetView
+    FromFilterMap(std::shared_ptr<const void> owner,
+                  const void* context,
+                  size_t num_bits,
+                  size_t num_filtered_out_bits,
+                  knowhere::FilterMapCapability capability,
+                  knowhere::FilterMapTestFn test,
+                  knowhere::FilterMapReadUnsetFn read_unset,
+                  knowhere::FilterMapGetUnsetSpanFn get_unset_span = nullptr,
+                  knowhere::FilterMapEnsureDenseFn ensure_dense = nullptr) {
+        return BitsetView(
+            knowhere::BitsetView::FromFilterMap(std::move(owner),
+                                                context,
+                                                num_bits,
+                                                num_filtered_out_bits,
+                                                capability,
+                                                test,
+                                                read_unset,
+                                                get_unset_span,
+                                                ensure_dense));
+    }
+
  private:
     explicit BitsetView(knowhere::BitsetView bitset)
         : knowhere::BitsetView(std::move(bitset)) {
@@ -80,6 +102,9 @@ class BitsetView : public knowhere::BitsetView {
         if (empty()) {
             return true;
         }
+        if (is_filter_map() && has_count()) {
+            return count() == size();
+        }
         if (has_out_ids()) {
             for (size_t i = 0; i < size(); ++i) {
                 if (!test(i)) {
@@ -97,6 +122,9 @@ class BitsetView : public knowhere::BitsetView {
     none() const {
         if (empty()) {
             return true;
+        }
+        if (is_filter_map() && has_count()) {
+            return count() == 0;
         }
         if (has_out_ids()) {
             for (size_t i = 0; i < size(); ++i) {

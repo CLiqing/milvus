@@ -127,21 +127,22 @@ PhyVectorSearchNode::GetOutput() {
     milvus::BitsetView search_view;
     int64_t data_cnt = active_count_;
 
-    // The filter result is selected independently from search dispatch.  A
-    // Sparse list is a valid generic filter input: Cardinal may enumerate it
-    // for BF or materialize its Graph/IVF membership adapter.  Do not rewrite
-    // bf_filter_scan_mode merely because the representation is Sparse.
-    auto sparse_id_payload = query_context_->get_sparse_id_payload();
+    // FilterMap hides its physical representation. Cardinal only receives a
+    // capability: EnumerateOnly maps force BF, while RandomMembership Dense
+    // maps preserve the normal auto route.
+    auto filter_map = query_context_->get_filter_map();
     const bool hard_valid_ids =
         search_info_.search_params_.value("bf_filter_scan_mode",
                                           std::string{"auto"}) ==
         "valid_ids_per_query";
-    if (hard_valid_ids && sparse_id_payload == nullptr) {
+    if (hard_valid_ids &&
+        (filter_map == nullptr ||
+         filter_map->capability() != FilterCapability::EnumerateOnly)) {
         ThrowInfo(ConfigInvalid,
                   "native valid-ID BF mode requires a matching native "
                   "scalar-index payload");
     }
-    const bool valid_ids_per_query = sparse_id_payload != nullptr;
+    const bool has_filter_map = filter_map != nullptr;
 
     if (!ph.element_level_ && query_context_->bitset_is_element_level()) {
         ThrowInfo(ExprInvalid,
@@ -150,45 +151,71 @@ PhyVectorSearchNode::GetOutput() {
                   "array filtering");
     }
 
-    if (valid_ids_per_query) {
+    if (has_filter_map) {
         if (ph.element_level_) {
             ThrowInfo(ConfigInvalid,
-                      "valid_ids_per_query does not support "
+                      "FilterMap does not support "
                       "element-level filtering");
         }
-        // QueryNode may group independent NQ=1 RPCs into one task.  A scalar
-        // predicate is part of the merged plan identity, so this immutable
-        // payload has the same semantics as the ordinary Dense filter and can
-        // be applied to every query in the grouped placeholder batch.  The
-        // benchmark still disables grouping when it wants to exclude this
-        // payload reuse from a representation-only measurement.
-        AssertInfo(sparse_id_payload->universe == active_count_,
-                   "valid-ID payload universe {} does not match active row count {}",
-                   sparse_id_payload->universe,
+        AssertInfo(filter_map->size() == static_cast<size_t>(active_count_),
+                   "FilterMap universe {} does not match active row count {}",
+                   filter_map->size(),
                    active_count_);
-        auto native_ids = std::move(sparse_id_payload->ids);
-        const auto valid_count = native_ids->size();
-        AssertInfo(valid_count <= static_cast<uint64_t>(active_count_),
-                   "native valid-ID payload cardinality {} exceeds active "
-                   "row count {}",
-                   valid_count,
-                   active_count_);
-        search_view = milvus::BitsetView::FromOwnedValidIdList(
-            std::move(native_ids),
-            static_cast<size_t>(active_count_),
-            static_cast<size_t>(active_count_ - valid_count));
-        // Keep the native valid-ID fast path semantically and operationally
-        // equivalent to the dense path below: a dense bitmap with every bit
-        // filtered (`view.all()`) returns before touching the vector index.
-        // Without the same guard, an empty native posting reaches Cardinal
-        // and creates useless BF work for segments that contain no matching
-        // scalar value.
+        const auto filtered_count = filter_map->count();
+        const auto valid_count = filter_map->size() - filtered_count;
         if (valid_count == 0) {
             auto search_result = empty_search_result(num_queries);
             search_result.total_data_cnt_ = data_cnt;
             search_result.element_level_ = ph.element_level_;
             query_context_->set_search_result(std::move(search_result));
             return input_;
+        }
+        if (filter_map->capability() == FilterCapability::EnumerateOnly) {
+            const auto* context = filter_map.get();
+            search_view = milvus::BitsetView::FromFilterMap(
+                std::shared_ptr<const void>(filter_map),
+                context,
+                static_cast<size_t>(active_count_),
+                filtered_count,
+                knowhere::FilterMapCapability::EnumerateOnly,
+                /*test=*/nullptr,
+                [](const void* opaque,
+                   size_t* position,
+                   int32_t* output,
+                   size_t capacity) -> size_t {
+                    auto* map = static_cast<const FilterMap*>(opaque);
+                    FilterMapCursor cursor{*position};
+                    const auto written = map->ReadUnsetBatch(
+                        cursor, std::span<int32_t>(output, capacity));
+                    *position = cursor.position;
+                    return written;
+                },
+                [](const void* opaque,
+                   const int32_t** data,
+                   size_t* size) -> bool {
+                    const auto* map = static_cast<const FilterMap*>(opaque);
+                    const auto view = map->TryGetUnsetIdsView();
+                    if (!view.has_value()) {
+                        return false;
+                    }
+                    *data = view->data();
+                    *size = view->size();
+                    return true;
+                },
+                [](const void* opaque) -> const uint8_t* {
+                    auto* map = const_cast<FilterMap*>(
+                        static_cast<const FilterMap*>(opaque));
+                    const auto& dense = map->EnsureDense();
+                    return reinterpret_cast<const uint8_t*>(dense.data());
+                });
+        } else {
+            const auto* dense = filter_map->DenseData();
+            AssertInfo(dense != nullptr,
+                       "RandomMembership FilterMap has no Dense storage");
+            search_view = milvus::BitsetView(
+                reinterpret_cast<const uint8_t*>(dense->data()),
+                dense->size(),
+                filtered_count);
         }
         data_cnt = search_view.size();
     } else if (query_context_->get_all_rows_visible() && !ph.element_level_) {

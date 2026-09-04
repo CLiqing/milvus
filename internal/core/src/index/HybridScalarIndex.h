@@ -149,29 +149,29 @@ class HybridScalarIndex : public ScalarIndex<T> {
             lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
     }
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdEqual(const T& value) const override {
         return internal_index_->TryGetValidIdEqual(value);
     }
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdEqual(const T& value, size_t max_cardinality) const override {
         return internal_index_->TryGetValidIdEqual(value, max_cardinality);
     }
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdRange(const T& value, OpType op) const override {
         return internal_index_->TryGetValidIdRange(value, op);
     }
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdRange(const T& value,
                        OpType op,
                        size_t max_cardinality) const override {
         return internal_index_->TryGetValidIdRange(value, op, max_cardinality);
     }
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdRange(const T& lower_bound_value,
                        bool lb_inclusive,
                        const T& upper_bound_value,
@@ -180,7 +180,7 @@ class HybridScalarIndex : public ScalarIndex<T> {
             lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
     }
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdRange(const T& lower_bound_value,
                        bool lb_inclusive,
                        const T& upper_bound_value,
@@ -239,10 +239,10 @@ class HybridScalarIndex : public ScalarIndex<T> {
                           bool ub_inclusive,
                           size_t max_cardinality) const override {
         return internal_index_->PreflightValidIdRange(lower_bound_value,
-                                                       lb_inclusive,
-                                                       upper_bound_value,
-                                                       ub_inclusive,
-                                                       max_cardinality);
+                                                      lb_inclusive,
+                                                      upper_bound_value,
+                                                      ub_inclusive,
+                                                      max_cardinality);
     }
 
     std::optional<T>

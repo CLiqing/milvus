@@ -448,7 +448,7 @@ ExprResCacheManager::GetSparse(const Key& key, SparseValue& out_value) {
     const auto it = sparse_entries_.find(key);
     if (it == sparse_entries_.end() ||
         it->second.active_count != out_value.active_count ||
-        it->second.accepted_ids == nullptr) {
+        it->second.filter_map == nullptr) {
         return false;
     }
     out_value = it->second;
@@ -457,23 +457,23 @@ ExprResCacheManager::GetSparse(const Key& key, SparseValue& out_value) {
 
 void
 ExprResCacheManager::PutSparse(const Key& key, const SparseValue& value) {
-    if (!IsEnabled() || value.accepted_ids == nullptr) {
+    if (!IsEnabled() || value.filter_map == nullptr) {
         return;
     }
     std::shared_lock state_lock(state_mutex_);
     if (!IsEnabled()) {
         return;
     }
-    const size_t entry_bytes = key.signature.size() +
-                               value.accepted_ids->size() * sizeof(int32_t);
+    const size_t entry_bytes =
+        key.signature.size() + value.filter_map->StorageBytes();
     if (entry_bytes > kSparseSidecarMaxBytes) {
         return;
     }
     std::unique_lock lock(sparse_entries_mutex_);
-    if (const auto it = sparse_entries_.find(key); it != sparse_entries_.end()) {
+    if (const auto it = sparse_entries_.find(key);
+        it != sparse_entries_.end()) {
         sparse_entries_bytes_ -=
-            it->first.signature.size() +
-            it->second.accepted_ids->size() * sizeof(int32_t);
+            it->first.signature.size() + it->second.filter_map->StorageBytes();
         sparse_entries_.erase(it);
     }
     if (sparse_entries_bytes_ + entry_bytes > kSparseSidecarMaxBytes) {
@@ -528,9 +528,8 @@ ExprResCacheManager::EraseSegment(int64_t segment_id) {
                 ++it;
                 continue;
             }
-            sparse_entries_bytes_ -=
-                it->first.signature.size() +
-                it->second.accepted_ids->size() * sizeof(int32_t);
+            sparse_entries_bytes_ -= it->first.signature.size() +
+                                     it->second.filter_map->StorageBytes();
             it = sparse_entries_.erase(it);
             ++sparse_erased;
         }

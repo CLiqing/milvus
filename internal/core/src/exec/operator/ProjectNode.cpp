@@ -17,6 +17,7 @@
 #include "ProjectNode.h"
 
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <utility>
 
@@ -138,16 +139,16 @@ PhyProjectNode::GetOutput() {
     if (is_finished_ || input_ == nullptr) {
         return nullptr;
     }
-    auto sparse_payload = query_context_->get_sparse_id_payload();
-    if (sparse_payload != nullptr && fields_to_project_.empty()) {
-        AssertInfo(sparse_payload->universe ==
-                       query_context_->get_active_count(),
-                   "Sparse Query payload universe {} does not match active "
+    auto filter_map = query_context_->get_filter_map();
+    if (filter_map != nullptr && fields_to_project_.empty()) {
+        AssertInfo(filter_map->size() ==
+                       static_cast<size_t>(query_context_->get_active_count()),
+                   "Query FilterMap universe {} does not match active "
                    "row count {}",
-                   sparse_payload->universe,
+                   filter_map->size(),
                    query_context_->get_active_count());
         const auto valid_count =
-            static_cast<int64_t>(sparse_payload->ids->size());
+            static_cast<int64_t>(filter_map->size() - filter_map->count());
         is_finished_ = true;
         if (valid_count == 0) {
             return nullptr;
@@ -156,12 +157,12 @@ PhyProjectNode::GetOutput() {
         row_vector->resize(valid_count);
         return row_vector;
     }
-    AssertInfo(sparse_payload == nullptr,
-               "Sparse Query projection/limit requires an ordering-preserving "
-               "offset consumer; phase-one isolation supports count(*) only");
-    auto col_input = GetColumnVector(input_);
-    // raw data view
-    TargetBitmapView raw_data_view(col_input->GetRawData(), col_input->size());
+    ColumnVectorPtr col_input;
+    std::optional<TargetBitmapView> raw_data_view;
+    if (filter_map == nullptr) {
+        col_input = GetColumnVector(input_);
+        raw_data_view.emplace(col_input->GetRawData(), col_input->size());
+    }
 
     // When no fields need to be projected (e.g., count(*) only), count valid
     // logical rows directly from the bitmap.  For element-level bitmaps this is
@@ -169,8 +170,10 @@ PhyProjectNode::GetOutput() {
     // segments (OffsetOrderedMap), which would undercount rows with duplicate
     // PKs.
     if (fields_to_project_.empty()) {
+        AssertInfo(raw_data_view.has_value(),
+                   "FilterMap count path must be handled before bitmap count");
         auto valid_count =
-            static_cast<int64_t>(col_input->size()) - raw_data_view.count();
+            static_cast<int64_t>(col_input->size()) - raw_data_view->count();
         is_finished_ = true;
         if (valid_count == 0) {
             return nullptr;
@@ -180,7 +183,26 @@ PhyProjectNode::GetOutput() {
         return row_vector;
     }
 
-    auto selected = SelectOffsets(raw_data_view, query_context_, segment_);
+    SelectedOffsets selected;
+    if (filter_map != nullptr) {
+        AssertInfo(!query_context_->bitset_is_element_level(),
+                   "row-level FilterMap cannot project element-level output");
+        const auto expected = filter_map->size() - filter_map->count();
+        selected.row_offsets.reserve(expected);
+        FilterMapCursor cursor;
+        std::array<int32_t, 256> batch{};
+        while (const auto n = filter_map->ReadUnsetBatch(cursor, batch)) {
+            for (size_t i = 0; i < n; ++i) {
+                selected.row_offsets.push_back(batch[i]);
+            }
+        }
+        AssertInfo(selected.row_offsets.size() == expected,
+                   "FilterMap cursor produced {} offsets, expected {}",
+                   selected.row_offsets.size(),
+                   expected);
+    } else {
+        selected = SelectOffsets(*raw_data_view, query_context_, segment_);
+    }
     auto& selected_offsets = selected.row_offsets;
     auto& selected_element_indices = selected.element_indices;
     auto selected_count = selected_offsets.size();

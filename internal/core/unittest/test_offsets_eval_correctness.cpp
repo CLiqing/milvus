@@ -46,8 +46,7 @@ using namespace milvus::segcore;
 
 namespace {
 
-class PrefetchCountingSealedSegment final
-    : public ChunkedSegmentSealedImpl {
+class PrefetchCountingSealedSegment final : public ChunkedSegmentSealedImpl {
  public:
     using ChunkedSegmentSealedImpl::ChunkedSegmentSealedImpl;
 
@@ -57,8 +56,7 @@ class PrefetchCountingSealedSegment final
                     const std::vector<int64_t>& chunk_ids) const override {
         ++prefetch_calls_;
         last_prefetched_chunks_ = chunk_ids;
-        ChunkedSegmentSealedImpl::prefetch_chunks(
-            op_ctx, field_id, chunk_ids);
+        ChunkedSegmentSealedImpl::prefetch_chunks(op_ctx, field_id, chunk_ids);
     }
 
     int64_t
@@ -188,12 +186,12 @@ VerifySkipCursorContract(SegmentExpr& segment_expr,
     int64_t processed_cursor = 0;
     int64_t null_rows = 0;
     auto evaluate_batch = [&]<FilterType filter_type = FilterType::sequential>(
-        const T* data,
-        const bool* valid_data,
-        const int32_t* offsets,
-        const int size,
-        TargetBitmapView res,
-        TargetBitmapView valid_res) {
+                              const T* data,
+                              const bool* valid_data,
+                              const int32_t* offsets,
+                              const int size,
+                              TargetBitmapView res,
+                              TargetBitmapView valid_res) {
         if (data == nullptr) {
             null_rows += size;
             processed_cursor += size;
@@ -244,12 +242,12 @@ VerifyElementFullScanSkipCursor(SegmentExpr& segment_expr,
     int64_t processed_cursor = 0;
     int64_t null_elements = 0;
     auto evaluate_batch = [&]<FilterType filter_type = FilterType::sequential>(
-        const int64_t* data,
-        const bool* valid_data,
-        const int32_t* offsets,
-        const int size,
-        TargetBitmapView res,
-        TargetBitmapView valid_res) {
+                              const int64_t* data,
+                              const bool* valid_data,
+                              const int32_t* offsets,
+                              const int size,
+                              TargetBitmapView res,
+                              TargetBitmapView valid_res) {
         if (data == nullptr) {
             null_elements += size;
             processed_cursor += size;
@@ -340,12 +338,12 @@ VerifyNullableElementFullScanLogicalCount(
     int64_t null_elements = 0;
     int64_t live_elements = 0;
     auto evaluate_batch = [&]<FilterType filter_type = FilterType::sequential>(
-        const int64_t* data,
-        const bool* valid_data,
-        const int32_t* offsets,
-        const int size,
-        TargetBitmapView res,
-        TargetBitmapView valid_res) {
+                              const int64_t* data,
+                              const bool* valid_data,
+                              const int32_t* offsets,
+                              const int size,
+                              TargetBitmapView res,
+                              TargetBitmapView valid_res) {
         processed_cursor += size;
         if (data == nullptr) {
             null_elements += size;
@@ -479,12 +477,12 @@ TEST_F(OffsetsEvalCorrectnessTest, SkipBranchDrivesCallbackPerCandidate) {
     int64_t null_rows = 0;
     int64_t data_rows = 0;
     auto probe = [&]<FilterType filter_type = FilterType::sequential>(
-        const int64_t* data,
-        const bool* valid_data,
-        const int32_t* offsets,
-        const int size,
-        TargetBitmapView res,
-        TargetBitmapView valid_res) {
+                     const int64_t* data,
+                     const bool* valid_data,
+                     const int32_t* offsets,
+                     const int size,
+                     TargetBitmapView res,
+                     TargetBitmapView valid_res) {
         rows_seen += size;
         if (data == nullptr) {
             null_rows += size;
@@ -519,24 +517,21 @@ TEST_F(OffsetsEvalCorrectnessTest,
     const auto match_all = [](int64_t) { return true; };
     const auto skip_none = [](int64_t) { return false; };
 
-    auto single_chunk = std::make_shared<const std::vector<int32_t>>(
-        std::vector<int32_t>{9, 1, 3});
+    const std::vector<int32_t> single_chunk{9, 1, 3};
     auto single_result = seg_expr->FilterNativeIdsByRawData<int64_t>(
         single_chunk, match_all, skip_none);
     ASSERT_NE(single_result, nullptr);
-    EXPECT_EQ(*single_result, *single_chunk)
+    EXPECT_EQ(*single_result, single_chunk)
         << "the single-chunk fast path must not impose row-ID order";
 
-    auto multi_chunk = std::make_shared<const std::vector<int32_t>>(
-        std::vector<int32_t>{17, 1, 25, 9, 3});
+    const std::vector<int32_t> multi_chunk{17, 1, 25, 9, 3};
     auto multi_result = seg_expr->FilterNativeIdsByRawData<int64_t>(
         multi_chunk, match_all, skip_none);
     ASSERT_NE(multi_result, nullptr);
-    EXPECT_EQ(*multi_result, *multi_chunk)
+    EXPECT_EQ(*multi_result, multi_chunk)
         << "chunk grouping must preserve canonical producer order";
 
-    auto out_of_range = std::make_shared<const std::vector<int32_t>>(
-        std::vector<int32_t>{17, static_cast<int32_t>(N)});
+    const std::vector<int32_t> out_of_range{17, static_cast<int32_t>(N)};
     EXPECT_EQ(seg_expr->FilterNativeIdsByRawData<int64_t>(
                   out_of_range, match_all, skip_none),
               nullptr);
@@ -591,12 +586,12 @@ TEST_F(OffsetsEvalCorrectnessTest,
     constexpr int64_t kCap = 16;
     ASSERT_TRUE(physical->CanApplySparseFilter(
         eval_context, /*has_sparse_input=*/false, kCap));
-    auto adaptive = physical->TryApplySparseFilter(
-        eval_context, std::nullopt, kCap);
+    auto adaptive =
+        physical->TryApplySparseFilter(eval_context, std::nullopt, kCap);
 
     ASSERT_TRUE(adaptive.has_value());
-    ASSERT_TRUE(adaptive->IsSparse());
-    ASSERT_EQ(adaptive->universe, N);
+    ASSERT_EQ(adaptive->capability(), FilterCapability::EnumerateOnly);
+    ASSERT_EQ(adaptive->size(), N);
     EXPECT_EQ(prefetch_probe->prefetch_calls(), 1);
     EXPECT_EQ(prefetch_probe->last_prefetched_chunks(),
               (std::vector<int64_t>{0, 1}));
@@ -604,11 +599,11 @@ TEST_F(OffsetsEvalCorrectnessTest,
     // The same truth set at cap=T-1 must switch in chunk 0, then consume the
     // skipped chunk 1 into the final Dense bitmap without leaking the scratch
     // mask that WriteDenseBatch flipped in the triggering batch.
-    auto threshold_dense = physical->TryApplySparseFilter(
-        eval_context, std::nullopt, kCap - 1);
+    auto threshold_dense =
+        physical->TryApplySparseFilter(eval_context, std::nullopt, kCap - 1);
     ASSERT_TRUE(threshold_dense.has_value());
     ASSERT_TRUE(threshold_dense->IsDense());
-    ASSERT_EQ(threshold_dense->filtered->size(), N);
+    ASSERT_EQ(threshold_dense->DenseData()->size(), N);
     EXPECT_EQ(prefetch_probe->prefetch_calls(), 1)
         << "one expression instance must not prefetch its chunks twice";
 
@@ -619,7 +614,11 @@ TEST_F(OffsetsEvalCorrectnessTest,
     ASSERT_EQ(dense->size(), N);
 
     TargetBitmap sparse_accepted(N, false);
-    for (const auto id : *adaptive->accepted_ids) {
+    // Keep the snapshot owner alive for the complete range-for. Dereferencing
+    // a temporary shared_ptr here leaves the range referring to a destroyed
+    // vector before the loop body starts.
+    const auto adaptive_ids = adaptive->SnapshotUnsetIds();
+    for (const auto id : *adaptive_ids) {
         ASSERT_GE(id, 0);
         ASSERT_LT(id, N);
         sparse_accepted.set(static_cast<size_t>(id));
@@ -629,7 +628,7 @@ TEST_F(OffsetsEvalCorrectnessTest,
     for (size_t id = 0; id < N; ++id) {
         const auto expected = dense_data[id] && dense_valid[id];
         EXPECT_EQ(sparse_accepted[id], expected) << "Sparse row " << id;
-        EXPECT_EQ(!(*threshold_dense->filtered)[id], expected)
+        EXPECT_EQ(!(*threshold_dense->DenseData())[id], expected)
             << "row " << id;
     }
     // The independent Dense evaluation also takes its one lazy prefetch path;
@@ -668,12 +667,12 @@ TEST_F(OffsetsEvalCorrectnessTest, SkipBranchKeepsBitmapCursorAligned) {
     // processed_cursor advanced by every invocation, including null batches.
     int64_t processed_cursor = 0;
     auto probe = [&]<FilterType filter_type = FilterType::sequential>(
-        const int64_t* data,
-        const bool* valid_data,
-        const int32_t* offsets,
-        const int size,
-        TargetBitmapView res,
-        TargetBitmapView valid_res) {
+                     const int64_t* data,
+                     const bool* valid_data,
+                     const int32_t* offsets,
+                     const int size,
+                     TargetBitmapView res,
+                     TargetBitmapView valid_res) {
         if (data == nullptr) {
             processed_cursor += size;
             return;
@@ -730,12 +729,12 @@ TEST_F(OffsetsEvalCorrectnessTest,
     int64_t processed_cursor = 0;
     int64_t null_batches = 0;
     auto evaluate_batch = [&]<FilterType filter_type = FilterType::sequential>(
-        const int64_t* data,
-        const bool* valid_data,
-        const int32_t* offsets,
-        const int size,
-        TargetBitmapView res,
-        TargetBitmapView valid_res) {
+                              const int64_t* data,
+                              const bool* valid_data,
+                              const int32_t* offsets,
+                              const int size,
+                              TargetBitmapView res,
+                              TargetBitmapView valid_res) {
         if (data == nullptr) {
             null_batches += size;
             processed_cursor += size;
@@ -951,12 +950,12 @@ TEST_F(OffsetsEvalCorrectnessTest,
     int64_t processed_cursor = 0;
     int64_t null_rows = 0;
     auto evaluate_batch = [&]<FilterType filter_type = FilterType::sequential>(
-        const int64_t* data,
-        const bool* valid_data,
-        const int32_t* offsets,
-        const int size,
-        TargetBitmapView res,
-        TargetBitmapView valid_res) {
+                              const int64_t* data,
+                              const bool* valid_data,
+                              const int32_t* offsets,
+                              const int size,
+                              TargetBitmapView res,
+                              TargetBitmapView valid_res) {
         if (data == nullptr) {
             null_rows += size;
             processed_cursor += size;
@@ -1166,12 +1165,12 @@ TEST(OffsetsEvalIndexOnlyCorrectnessTest,
     int64_t processed_cursor = 0;
     int64_t null_rows = 0;
     auto evaluate_batch = [&]<FilterType filter_type = FilterType::sequential>(
-        const int64_t* data,
-        const bool* valid_data,
-        const int32_t* offsets,
-        const int size,
-        TargetBitmapView res,
-        TargetBitmapView valid_res) {
+                              const int64_t* data,
+                              const bool* valid_data,
+                              const int32_t* offsets,
+                              const int size,
+                              TargetBitmapView res,
+                              TargetBitmapView valid_res) {
         if (data == nullptr) {
             null_rows += size;
             processed_cursor += size;

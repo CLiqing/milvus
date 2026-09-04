@@ -224,12 +224,17 @@ SealedOffsetMapping::GetTotalCount() const {
 OffsetMapping::BitsetTransformStatus
 SealedOffsetMapping::TransformBitset(const BitsetView& bitset,
                                      TargetBitmap& result) const {
+    BitsetView random_access_bitset = bitset;
+    if (random_access_bitset.is_filter_map()) {
+        random_access_bitset.ensure_dense();
+    }
     if (!enabled_) {
         result.clear();
         return BitsetTransformStatus::NoFilter;
     }
     BitsetTransformStatus status;
-    if (ShouldSkipBitsetTransform(bitset, total_count_, result, status)) {
+    if (ShouldSkipBitsetTransform(
+            random_access_bitset, total_count_, result, status)) {
         return status;
     }
 
@@ -239,8 +244,9 @@ SealedOffsetMapping::TransformBitset(const BitsetView& bitset,
              ++physical_idx) {
             auto it = p2l_map_.find(static_cast<int32_t>(physical_idx));
             if (it != p2l_map_.end() &&
-                it->second < static_cast<int64_t>(bitset.size())) {
-                result[physical_idx] = bitset.test(it->second);
+                it->second <
+                    static_cast<int64_t>(random_access_bitset.size())) {
+                result[physical_idx] = random_access_bitset.test(it->second);
             }
         }
     } else {
@@ -248,8 +254,9 @@ SealedOffsetMapping::TransformBitset(const BitsetView& bitset,
              ++physical_idx) {
             auto logical_idx = p2l_vec_[physical_idx];
             if (logical_idx >= 0 &&
-                logical_idx < static_cast<int64_t>(bitset.size())) {
-                result[physical_idx] = bitset.test(logical_idx);
+                logical_idx <
+                    static_cast<int64_t>(random_access_bitset.size())) {
+                result[physical_idx] = random_access_bitset.test(logical_idx);
             }
         }
     }

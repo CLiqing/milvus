@@ -366,7 +366,7 @@ PhyUnaryRangeFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
     }
 }
 
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 PhyUnaryRangeFilterExpr::TryGetNativeValidIds() {
     const auto configured_cap = SPARSE_FILTER_RESULT_MAX_CARDINALITY.load();
     if (configured_cap < 0) {
@@ -375,7 +375,7 @@ PhyUnaryRangeFilterExpr::TryGetNativeValidIds() {
     return TryGetNativeValidIdsWithCap(static_cast<size_t>(configured_cap));
 }
 
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 PhyUnaryRangeFilterExpr::TryGetNativeValidIds(EvalCtx&,
                                               int64_t max_cardinality) {
     if (max_cardinality < 0) {
@@ -384,7 +384,7 @@ PhyUnaryRangeFilterExpr::TryGetNativeValidIds(EvalCtx&,
     return TryGetNativeValidIdsWithCap(static_cast<size_t>(max_cardinality));
 }
 
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 PhyUnaryRangeFilterExpr::TryGetNativeValidIdsWithCap(size_t max_cardinality) {
     if (expr_->column_.element_level_ ||
         expr_->column_.data_type_ != DataType::INT64) {
@@ -437,11 +437,10 @@ PhyUnaryRangeFilterExpr::TryGetNativeValidIdsWithCap(size_t max_cardinality) {
                      max_cardinality);
 }
 
-std::optional<SparseFilterResult>
-PhyUnaryRangeFilterExpr::TryApplySparseFilter(
-    EvalCtx& context,
-    std::optional<SparseFilterResult> input,
-    int64_t max_cardinality) {
+std::optional<FilterMap>
+PhyUnaryRangeFilterExpr::TryApplySparseFilter(EvalCtx& context,
+                                              std::optional<FilterMap> input,
+                                              int64_t max_cardinality) {
     if (max_cardinality < 0) {
         return std::nullopt;
     }
@@ -654,8 +653,7 @@ SparseFilterPreflight
 PhyUnaryRangeFilterExpr::PreflightSparseFilter(EvalCtx& context,
                                                bool has_sparse_input,
                                                int64_t max_cardinality) {
-    if (CanApplySparseFilter(
-            context, has_sparse_input, max_cardinality)) {
+    if (CanApplySparseFilter(context, has_sparse_input, max_cardinality)) {
         return SparseFilterPreflight::Sparse;
     }
     if (has_sparse_input || max_cardinality < 0 ||
@@ -698,9 +696,9 @@ PhyUnaryRangeFilterExpr::PreflightSparseFilter(EvalCtx& context,
                : SparseFilterPreflight::Unsupported;
 }
 
-std::shared_ptr<const std::vector<int32_t>>
+std::shared_ptr<std::vector<int32_t>>
 PhyUnaryRangeFilterExpr::TryFilterNativeValidIds(
-    EvalCtx&, const std::shared_ptr<const std::vector<int32_t>>& input) {
+    EvalCtx&, std::span<const int32_t> input) {
     if (expr_->column_.element_level_ ||
         expr_->column_.data_type_ != DataType::INT64) {
         return nullptr;

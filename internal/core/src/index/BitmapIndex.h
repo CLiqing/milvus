@@ -122,10 +122,10 @@ class BitmapIndex : public ScalarIndex<T> {
     // Cardinal BF runtime producer.  Roaring remains the index-owned posting
     // representation; this materializes the accepted row IDs exactly once at
     // the FilterBits boundary.
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdEqual(const T& value) const override;
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdEqual(const T& value, size_t max_cardinality) const override;
 
     bool
@@ -423,7 +423,7 @@ class BitmapIndex : public ScalarIndex<T> {
     std::shared_ptr<const roaring_bitmap_t>
     CopyRoaringPosting(const roaring::Roaring& values) const;
 
-    std::shared_ptr<const std::vector<int32_t>>
+    std::shared_ptr<std::vector<int32_t>>
     MaterializeValidIds(const roaring_bitmap_t* values,
                         size_t max_cardinality) const;
 

@@ -51,6 +51,21 @@ SearchOnIndex(const dataset::SearchDataset& search_dataset,
     const auto has_offset_mapping = offset_mapping.IsEnabled();
     const auto active_count = search_conf.active_count_;
 
+    // Enumerated FilterMaps are a direct-Search optimization owned by
+    // Cardinal Tiered. Iterator, offset-mapping, Disk/routed and all other
+    // consumers require ordinary random membership. Resolve that capability
+    // once at the actual index boundary; EnsureDense is idempotent and keeps
+    // the rest of the search stack representation-agnostic.
+    const bool uses_iterator = search_conf.has_group_by() ||
+                               search_conf.iterative_filter_execution ||
+                               search_conf.iterator_v2_info_.has_value();
+    const bool cardinal_direct =
+        indexing.GetIndexType() == knowhere::IndexEnum::INDEX_CARDINAL_TIERED &&
+        !uses_iterator && !has_offset_mapping;
+    if (search_bitset.is_filter_map() && !cardinal_direct) {
+        search_bitset.ensure_dense();
+    }
+
     // A growing interim index can advance after the plan freezes its visible
     // logical prefix.  Knowhere treats an empty bitset as IDSelectorAll, so an
     // empty/no-filter fast path must still carry an explicit prefix length or
@@ -82,9 +97,9 @@ SearchOnIndex(const dataset::SearchDataset& search_dataset,
                 search_result, num_queries, search_conf.topk_);
             return;
         }
-        if (!bitset.empty()) {
-            auto status =
-                offset_mapping.TransformBitset(bitset, transformed_bitset);
+        if (!search_bitset.empty()) {
+            auto status = offset_mapping.TransformBitset(search_bitset,
+                                                         transformed_bitset);
             if (status == OffsetMapping::BitsetTransformStatus::AllFiltered) {
                 FillEmptySearchResult(
                     search_result, num_queries, search_conf.topk_);
@@ -121,8 +136,11 @@ SearchOnIndex(const dataset::SearchDataset& search_dataset,
         // prevent, and the subview aliases the caller's buffer, so this costs
         // nothing. A shorter bitset already bounds the scan more tightly than
         // active_count and is left alone.
-        if (static_cast<int64_t>(bitset.size()) > active_count) {
-            search_bitset = bitset.subview(0, active_count);
+        if (static_cast<int64_t>(search_bitset.size()) > active_count) {
+            if (search_bitset.is_filter_map()) {
+                search_bitset.ensure_dense();
+            }
+            search_bitset = search_bitset.subview(0, active_count);
         }
     }
 

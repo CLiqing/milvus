@@ -36,6 +36,35 @@ ToBoolBytes(const std::vector<bool>& valid) {
     }
     return bytes;
 }
+
+BitsetView
+MakeEnumerateOnlyView(const std::shared_ptr<FilterMap>& map) {
+    return BitsetView::FromFilterMap(
+        std::shared_ptr<const void>(map),
+        map.get(),
+        map->size(),
+        map->count(),
+        knowhere::FilterMapCapability::EnumerateOnly,
+        nullptr,
+        [](const void* opaque,
+           size_t* position,
+           int32_t* output,
+           size_t capacity) -> size_t {
+            const auto* filter = static_cast<const FilterMap*>(opaque);
+            FilterMapCursor cursor{*position};
+            const auto written = filter->ReadUnsetBatch(
+                cursor, std::span<int32_t>(output, capacity));
+            *position = cursor.position;
+            return written;
+        },
+        nullptr,
+        [](const void* opaque) -> const uint8_t* {
+            auto* filter =
+                const_cast<FilterMap*>(static_cast<const FilterMap*>(opaque));
+            return reinterpret_cast<const uint8_t*>(
+                filter->EnsureDense().data());
+        });
+}
 }  // namespace
 
 // ---------- Build ----------
@@ -208,6 +237,36 @@ TEST(SealedOffsetMapping, ValidCountBelowIsIdentityBeforeBuild) {
     ASSERT_FALSE(mapping.IsEnabled());
     EXPECT_EQ(mapping.ValidCountBelow(42), 42);
     EXPECT_EQ(mapping.ValidCountBelow(-5), 0);
+}
+
+TEST(SealedOffsetMapping, TransformBitsetMaterializesFilterMapExactlyOnce) {
+    SealedOffsetMapping mapping;
+    auto validity = ToBoolBytes(MakeValid({1, 0, 1, 1}));
+    mapping.Build(reinterpret_cast<const bool*>(validity.data()), 4);
+
+    auto ids = std::make_shared<std::vector<int32_t>>(
+        std::initializer_list<int32_t>{0, 2});
+    auto filter = std::make_shared<FilterMap>(
+        FilterMap::AdoptUnsetIds(4, std::move(ids)));
+    auto view = MakeEnumerateOnlyView(filter);
+    TargetBitmap physical;
+
+    EXPECT_EQ(mapping.TransformBitset(view, physical),
+              OffsetMapping::BitsetTransformStatus::Transformed);
+    EXPECT_EQ(filter->dense_materialization_count(), 1);
+    ASSERT_EQ(physical.size(), 3);
+    EXPECT_FALSE(physical[0]);
+    EXPECT_FALSE(physical[1]);
+    EXPECT_TRUE(physical[2]);
+
+    TargetBitmap repeated;
+    EXPECT_EQ(mapping.TransformBitset(view, repeated),
+              OffsetMapping::BitsetTransformStatus::Transformed);
+    EXPECT_EQ(filter->dense_materialization_count(), 1);
+    ASSERT_EQ(repeated.size(), physical.size());
+    for (size_t i = 0; i < physical.size(); ++i) {
+        EXPECT_EQ(repeated[i], physical[i]);
+    }
 }
 
 }  // namespace milvus

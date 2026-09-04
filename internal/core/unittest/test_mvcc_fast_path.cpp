@@ -62,6 +62,10 @@ class MvccFastPathTest : public ::testing::Test {
     SetUp() override {
         original_sparse_filter_enabled_ =
             ENABLE_SPARSE_FILTER_RESULT.exchange(true);
+        original_sparse_min_segment_rows_ =
+            SPARSE_FILTER_RESULT_MIN_SEGMENT_ROWS.exchange(1);
+        original_sparse_max_ratio_ =
+            SPARSE_FILTER_RESULT_MAX_RATIO.exchange(1.0);
         schema_ = std::make_shared<Schema>();
         vec_fid_ = schema_->AddDebugField(
             "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
@@ -72,6 +76,9 @@ class MvccFastPathTest : public ::testing::Test {
     void
     TearDown() override {
         ENABLE_SPARSE_FILTER_RESULT.store(original_sparse_filter_enabled_);
+        SPARSE_FILTER_RESULT_MIN_SEGMENT_ROWS.store(
+            original_sparse_min_segment_rows_);
+        SPARSE_FILTER_RESULT_MAX_RATIO.store(original_sparse_max_ratio_);
     }
 
     // Helper: create sealed segment with no deletes
@@ -185,8 +192,8 @@ class MvccFastPathTest : public ::testing::Test {
                                  query_context);
         while (task->Next()) {
         }
-        auto payload = query_context->get_sparse_id_payload();
-        return payload ? payload->ids : nullptr;
+        auto filter_map = query_context->get_filter_map();
+        return filter_map ? filter_map->SnapshotUnsetIds() : nullptr;
     }
 
     SchemaPtr schema_;
@@ -194,6 +201,8 @@ class MvccFastPathTest : public ::testing::Test {
     FieldId int64_fid_;
     int64_t N_ = 1000;
     bool original_sparse_filter_enabled_ = false;
+    int64_t original_sparse_min_segment_rows_ = 0;
+    double original_sparse_max_ratio_ = 0.0;
 };
 
 // ---------------------------------------------------------------------------
@@ -370,9 +379,10 @@ TEST_F(MvccFastPathTest, SparseIdPayloadAcceptsUnorderedUniqueIds) {
     auto ids = std::make_shared<const std::vector<int32_t>>(
         std::vector<int32_t>{3, 0, 4});
 
-    EXPECT_NO_THROW(query_context.set_sparse_id_payload(ids, 5));
-    ASSERT_NE(query_context.get_sparse_id_payload(), nullptr);
-    EXPECT_EQ(*query_context.get_sparse_id_payload()->ids, *ids);
+    EXPECT_NO_THROW(query_context.set_filter_map(std::make_shared<FilterMap>(
+        FilterMap::FromUnsetIds(/*universe=*/5, ids))));
+    ASSERT_NE(query_context.get_filter_map(), nullptr);
+    EXPECT_EQ(*query_context.get_filter_map()->SnapshotUnsetIds(), *ids);
 }
 
 TEST_F(MvccFastPathTest, SparseIdPayloadRejectsOutOfRangeIds) {
@@ -380,7 +390,7 @@ TEST_F(MvccFastPathTest, SparseIdPayloadRejectsOutOfRangeIds) {
     auto out_of_range = std::make_shared<const std::vector<int32_t>>(
         std::vector<int32_t>{3, 5});
 
-    EXPECT_ANY_THROW(query_context.set_sparse_id_payload(out_of_range, 5));
+    EXPECT_ANY_THROW(FilterMap::FromUnsetIds(/*universe=*/5, out_of_range));
 }
 
 // Sparse is an output contract, not a sealed-index-only fast path.  Growing

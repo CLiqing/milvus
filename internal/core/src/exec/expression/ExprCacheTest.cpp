@@ -94,16 +94,18 @@ TEST(ExprResCacheManagerTest, SparseSidecarGetAndSegmentErase) {
 
     ExprResCacheManager::Key key{321, "expr:A|adaptive_sparse:1000"};
     ExprResCacheManager::SparseValue value;
-    value.accepted_ids =
-        std::make_shared<const std::vector<int32_t>>(std::vector<int32_t>{
-            1, 17, 99});
+    auto ids = std::make_shared<const std::vector<int32_t>>(
+        std::vector<int32_t>{1, 17, 99});
+    value.filter_map = std::make_shared<const milvus::FilterMap>(
+        milvus::FilterMap::FromUnsetIds(/*universe=*/128, ids));
     value.active_count = 128;
     mgr.PutSparse(key, value);
 
     ExprResCacheManager::SparseValue got;
     got.active_count = 128;
     ASSERT_TRUE(mgr.GetSparse(key, got));
-    ASSERT_EQ(*got.accepted_ids, *value.accepted_ids);
+    ASSERT_EQ(*got.filter_map->SnapshotUnsetIds(),
+              *value.filter_map->SnapshotUnsetIds());
 
     ExprResCacheManager::SparseValue stale;
     stale.active_count = 129;

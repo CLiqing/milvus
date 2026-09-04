@@ -170,29 +170,29 @@ class ScalarIndex : public IndexBase {
           const T& upper_bound_value,
           bool ub_inclusive) = 0;
 
-    virtual std::shared_ptr<const std::vector<int32_t>>
+    virtual std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdEqual(const T& value) const {
         return nullptr;
     }
 
-    virtual std::shared_ptr<const std::vector<int32_t>>
+    virtual std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdEqual(const T& value, size_t /* max_cardinality */) const {
         return TryGetValidIdEqual(value);
     }
 
-    virtual std::shared_ptr<const std::vector<int32_t>>
+    virtual std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdRange(const T& value, OpType op) const {
         return nullptr;
     }
 
-    virtual std::shared_ptr<const std::vector<int32_t>>
+    virtual std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdRange(const T& value,
                        OpType op,
                        size_t /* max_cardinality */) const {
         return TryGetValidIdRange(value, op);
     }
 
-    virtual std::shared_ptr<const std::vector<int32_t>>
+    virtual std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdRange(const T& lower_bound_value,
                        bool lb_inclusive,
                        const T& upper_bound_value,
@@ -200,7 +200,7 @@ class ScalarIndex : public IndexBase {
         return nullptr;
     }
 
-    virtual std::shared_ptr<const std::vector<int32_t>>
+    virtual std::shared_ptr<std::vector<int32_t>>
     TryGetValidIdRange(const T& lower_bound_value,
                        bool lb_inclusive,
                        const T& upper_bound_value,

@@ -76,26 +76,17 @@ PhyMvccNode::GetOutput() {
     tracer::AddEvent(fmt::format("input_rows: {}", active_count_));
     WaitPrefetch();
 
-    // A Sparse accepted-ID list is the scalar predicate's candidate set, not
-    // an assertion that every candidate is visible at this snapshot.  Preserve
-    // the regular MVCC semantics by compacting it against the same invalid
-    // timestamp/delete mask used by the Dense path.  This deliberately also
-    // covers growing segments: active_count_ is the query snapshot boundary,
-    // and the normal masks exclude rows that are not visible at that snapshot.
-    if (auto payload = query_context->get_sparse_id_payload();
-        payload != nullptr) {
-        AssertInfo(!is_source_node_, "sparse IDs require a FilterBits input");
-        AssertInfo(
-            payload->universe == active_count_,
-            "valid-ID payload universe {} does not match active row count {}",
-            payload->universe,
-            active_count_);
-        const auto& native_ids = payload->ids;
-        if (native_ids->empty()) {
-            is_finished_ = true;
-            return input_;
-        }
-
+    // FilterMap owns its physical representation. MVCC applies the same
+    // logical 1=invalid mask through the common bitmap contract; a sparse
+    // default-1 map compacts its zero exceptions internally, while a Dense
+    // map performs the established bulk OR.
+    if (auto filter_map = query_context->get_filter_map();
+        filter_map != nullptr) {
+        AssertInfo(!is_source_node_, "FilterMap requires a FilterBits input");
+        AssertInfo(filter_map->size() == static_cast<size_t>(active_count_),
+                   "FilterMap universe {} does not match active row count {}",
+                   filter_map->size(),
+                   active_count_);
         TargetBitmap invalid(active_count_);
         TargetBitmapView invalid_view(invalid.data(), invalid.size());
 
@@ -118,21 +109,7 @@ PhyMvccNode::GetOutput() {
             invalid_view, active_count_, query_timestamp_);
 
         if (!invalid_view.none()) {
-            auto surviving_ids = std::make_shared<std::vector<int32_t>>();
-            surviving_ids->reserve(native_ids->size());
-            for (const auto id : *native_ids) {
-                AssertInfo(id >= 0 && id < active_count_,
-                           "native valid ID {} is outside active row range {}",
-                           id,
-                           active_count_);
-                if (!invalid_view[id]) {
-                    surviving_ids->push_back(id);
-                }
-            }
-            query_context->set_sparse_id_payload(
-                std::shared_ptr<const std::vector<int32_t>>(
-                    std::move(surviving_ids)),
-                payload->universe);
+            filter_map->InplaceOr(invalid_view);
         }
         is_finished_ = true;
         return input_;

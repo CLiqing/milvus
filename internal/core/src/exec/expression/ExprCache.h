@@ -140,13 +140,11 @@ class ExprResCacheManager {
             0};  // eval duration in us, 0 = skip cost check
     };
 
-    // Adaptive Sparse results are deliberately kept in a bounded in-memory
-    // sidecar even when the Dense cache backend is disk based.  Their payload
-    // is capped (normally at 1,000 int32 row IDs), so serializing them through
-    // the N-bit DiskSlotFile format would both waste space and reintroduce the
-    // Dense-to-Sparse materialization that this representation avoids.
+    // Adaptive EnumerateOnly FilterMaps are kept in a bounded in-memory
+    // sidecar even when the Dense cache backend is disk based. The physical
+    // representation remains encapsulated by FilterMap.
     struct SparseValue {
-        std::shared_ptr<const std::vector<int32_t>> accepted_ids;
+        std::shared_ptr<const FilterMap> filter_map;
         int64_t active_count{0};
     };
 
