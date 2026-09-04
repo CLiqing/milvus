@@ -30,6 +30,7 @@
 #include "exec/expression/ExprCache.h"
 #include "expr/ITypeExpr.h"
 #include "fmt/core.h"
+#include "log/Log.h"
 #include "monitor/Monitor.h"
 #include "plan/PlanNode.h"
 #include "prometheus/histogram.h"
@@ -96,6 +97,15 @@ PhyFilterBitsNode::PhyFilterBitsNode(
         filters, exec_context, /*null_rejecting=*/true);
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
+
+    if (query_context_->get_search_info().ann_filter_fusing_request ==
+        AnnFilterFusingRequest::ExplicitFusing) {
+        // Stage 1 is intentionally observational: the request has reached the
+        // filter decision boundary, but execution stays on the baseline path
+        // until the loaded-index planner and callback transport are connected.
+        LOG_DEBUG("ANN filter fusing request reached FilterBitsNode; "
+                  "decision=baseline reason=not_connected");
+    }
 
     enable_expr_cache_ = query_context_->get_enable_expr_cache();
     if (enable_expr_cache_) {

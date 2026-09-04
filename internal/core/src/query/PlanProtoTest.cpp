@@ -25,6 +25,7 @@
 
 #include "common/EasyAssert.h"
 #include "common/BloomFilterEnvelope.h"
+#include "common/Consts.h"
 #include "common/RoaringMembership.h"
 #include "common/Schema.h"
 #include "common/Types.h"
@@ -318,6 +319,47 @@ TEST(PlanProto, RejectsGlobalRefineRatiosBelowOne) {
         BuildSearchPlanNode(0.5f, 1.5f, vector_field_id)));
     EXPECT_ANY_THROW(parser.PlanNodeFromProto(
         BuildSearchPlanNode(1.5f, 0.5f, vector_field_id)));
+}
+
+TEST(PlanProto, ParsesAnnFilterFusingRequestIndependentlyFromIterative) {
+    using milvus::AnnFilterFusingRequest;
+    using milvus::query::ProtoParser;
+
+    auto schema = BuildSchema();
+    const auto vector_field_id =
+        schema->get_field_id(milvus::FieldName("fakevec"));
+    ProtoParser parser(schema);
+
+    auto no_hint = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
+    auto parsed = parser.ParseSearchInfo(no_hint.vector_anns());
+    EXPECT_EQ(parsed.ann_filter_fusing_request,
+              AnnFilterFusingRequest::Baseline);
+    EXPECT_FALSE(parsed.iterative_filter_execution);
+
+    auto top_level = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
+    top_level.mutable_vector_anns()->mutable_query_info()->set_hints(
+        milvus::DOWNPUSH);
+    parsed = parser.ParseSearchInfo(top_level.vector_anns());
+    EXPECT_EQ(parsed.ann_filter_fusing_request,
+              AnnFilterFusingRequest::ExplicitFusing);
+    EXPECT_FALSE(parsed.iterative_filter_execution);
+
+    auto search_params = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
+    search_params.mutable_vector_anns()
+        ->mutable_query_info()
+        ->set_search_params(R"({"hints":"downpush"})");
+    parsed = parser.ParseSearchInfo(search_params.vector_anns());
+    EXPECT_EQ(parsed.ann_filter_fusing_request,
+              AnnFilterFusingRequest::ExplicitFusing);
+    EXPECT_FALSE(parsed.iterative_filter_execution);
+
+    auto iterative = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
+    iterative.mutable_vector_anns()->mutable_query_info()->set_hints(
+        milvus::ITERATIVE_FILTER);
+    parsed = parser.ParseSearchInfo(iterative.vector_anns());
+    EXPECT_EQ(parsed.ann_filter_fusing_request,
+              AnnFilterFusingRequest::Baseline);
+    EXPECT_TRUE(parsed.iterative_filter_execution);
 }
 
 TEST(PlanProto, VectorArrayFieldIdGapInStructArray) {

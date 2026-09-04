@@ -99,6 +99,20 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
         nlohmann::json::parse(query_info_proto.search_params());
     search_info.materialized_view_involved =
         query_info_proto.materialized_view_involved();
+
+    // A top-level hint takes precedence over the copy in search_params.  In
+    // Phase 1 the absence of a hint deliberately remains baseline; parsing the
+    // explicit request here only carries intent to the later decision point.
+    if (query_info_proto.hints() == DOWNPUSH) {
+        search_info.ann_filter_fusing_request =
+            AnnFilterFusingRequest::ExplicitFusing;
+    } else if (query_info_proto.hints().empty() &&
+               search_info.search_params_.contains(HINTS) &&
+               search_info.search_params_[HINTS] == DOWNPUSH) {
+        search_info.ann_filter_fusing_request =
+            AnnFilterFusingRequest::ExplicitFusing;
+    }
+
     // currently, iterative filter does not support range search
     if (!search_info.search_params_.contains(RADIUS)) {
         if (query_info_proto.hints() != "") {
@@ -106,6 +120,9 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
                 search_info.iterative_filter_execution = false;
             } else if (query_info_proto.hints() == ITERATIVE_FILTER) {
                 search_info.iterative_filter_execution = true;
+            } else if (query_info_proto.hints() == DOWNPUSH) {
+                // Parsed above.  Fusing and iterative filtering are separate
+                // request modes.
             } else {
                 // check if hints is valid
                 ThrowInfo(ConfigInvalid,
@@ -115,6 +132,8 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
         } else if (search_info.search_params_.contains(HINTS)) {
             if (search_info.search_params_[HINTS] == ITERATIVE_FILTER) {
                 search_info.iterative_filter_execution = true;
+            } else if (search_info.search_params_[HINTS] == DOWNPUSH) {
+                // Parsed above.
             } else {
                 // check if hints is valid
                 ThrowInfo(ConfigInvalid,

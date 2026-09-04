@@ -59,6 +59,9 @@ const char VEC_OPT_FIELDS[] = "opt_fields";
 const char PAGE_RETAIN_ORDER[] = "page_retain_order";
 const char TEXT_LOG_ROOT_PATH[] = "text_log";
 const char ITERATIVE_FILTER[] = "iterative_filter";
+// Temporary external hint name for ANN filter fusing.  Keep this spelling
+// until the public feature name is finalized.
+const char DOWNPUSH[] = "downpush";
 const char HINTS[] = "hints";
 // json stats related
 const char NGRAM_LOG_ROOT_PATH[] = "ngram_log";
