@@ -18,6 +18,7 @@
 
 #include <unordered_map>
 
+#include "common/PrometheusClient.h"
 #include "exec/operator/groupby/GroupMembership.h"
 #include "exec/operator/groupby/SearchGroupByOperator.h"
 #include "exec/operator/groupby/StrictGroupPhase2Planner.h"
@@ -103,6 +104,9 @@ TEST(StrictGroupPhase2PlannerTest, UsesOneBatchBelowTenPercent) {
         /*eligible_rows=*/10000, /*group_row_counts=*/{200, 300, 499});
     ASSERT_TRUE(plan.has_value());
     EXPECT_EQ(plan->batches, (std::vector<std::vector<size_t>>{{0, 1, 2}}));
+    EXPECT_EQ(plan->combined_rows, 999);
+    EXPECT_EQ(plan->small_group_count, 0);
+    EXPECT_EQ(plan->large_group_count, 3);
 }
 
 TEST(StrictGroupPhase2PlannerTest, SplitsSmallGroupsAndCombinesLargeGroups) {
@@ -113,6 +117,9 @@ TEST(StrictGroupPhase2PlannerTest, SplitsSmallGroupsAndCombinesLargeGroups) {
     auto plan = BuildStrictGroupPhase2Plan(/*eligible_rows=*/10000, counts);
     ASSERT_TRUE(plan.has_value());
     ASSERT_EQ(plan->batches.size(), 3);
+    EXPECT_EQ(plan->combined_rows, 1980);
+    EXPECT_EQ(plan->small_group_count, 12);
+    EXPECT_EQ(plan->large_group_count, 2);
     EXPECT_EQ(plan->batches[0],
               (std::vector<size_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
     EXPECT_EQ(plan->batches[1], (std::vector<size_t>{11}));
@@ -216,6 +223,11 @@ TEST(StrictGroupPhase2ExecutorTest,
                   &search_result);
 
     EXPECT_EQ(recreate_count, 1);
+    const auto metrics = milvus::monitor::getPrometheusClient().GetMetrics();
+    EXPECT_NE(metrics.find("internal_core_strict_group_phase2_count"),
+              std::string::npos);
+    EXPECT_NE(metrics.find("type=\"phase1_candidates\""), std::string::npos);
+    EXPECT_NE(metrics.find("type=\"phase2_candidates\""), std::string::npos);
     EXPECT_EQ(offsets.size(), 6);
     EXPECT_EQ(prefix_sum, (std::vector<size_t>{0, 6}));
     EXPECT_TRUE(observed_filter[candidates[0].first]);

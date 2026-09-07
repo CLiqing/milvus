@@ -14,16 +14,50 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "SearchGroupByOperator.h"
+
+#include <chrono>
+
+#include "common/Tracer.h"
 #include "common/Consts.h"
+#include "common/JsonUtils.h"
 #include "exec/operator/groupby/GroupMembership.h"
 #include "exec/operator/groupby/StrictGroupPhase2Planner.h"
+#include "fmt/format.h"
+#include "monitor/Monitor.h"
 #include "query/Utils.h"
-#include "common/JsonUtils.h"
 
 namespace milvus {
 namespace exec {
 
 namespace {
+
+enum class StrictGroupPhase2FallbackReason {
+    None,
+    MissingRecreator,
+    InvalidRowCount,
+    Phase1Exhausted,
+    Phase2NotNeeded,
+    MembershipUnavailable,
+    PlanUnavailable,
+    MembershipBitmapUnavailable,
+    RecreateUnavailable,
+};
+
+struct StrictGroupPhase2Stats {
+    bool attempted = false;
+    bool used = false;
+    size_t phase1_candidates = 0;
+    size_t phase2_candidates = 0;
+    size_t eligible_rows = 0;
+    size_t unfinished_group_rows = 0;
+    size_t small_group_count = 0;
+    size_t large_group_count = 0;
+    size_t batch_count = 0;
+    uint64_t membership_build_us = 0;
+    uint64_t bitmap_build_us = 0;
+    StrictGroupPhase2FallbackReason fallback_reason =
+        StrictGroupPhase2FallbackReason::None;
+};
 
 struct StrictGroupPhase2Context {
     milvus::OpContext* op_ctx;
@@ -33,16 +67,85 @@ struct StrictGroupPhase2Context {
     bool eligible;
 };
 
-template <typename T, typename StopPredicate>
+const char*
+FallbackReasonName(StrictGroupPhase2FallbackReason reason) {
+    switch (reason) {
+        case StrictGroupPhase2FallbackReason::None:
+            return "none";
+        case StrictGroupPhase2FallbackReason::MissingRecreator:
+            return "missing_recreator";
+        case StrictGroupPhase2FallbackReason::InvalidRowCount:
+            return "invalid_row_count";
+        case StrictGroupPhase2FallbackReason::Phase1Exhausted:
+            return "phase1_exhausted";
+        case StrictGroupPhase2FallbackReason::Phase2NotNeeded:
+            return "phase2_not_needed";
+        case StrictGroupPhase2FallbackReason::MembershipUnavailable:
+            return "membership_unavailable";
+        case StrictGroupPhase2FallbackReason::PlanUnavailable:
+            return "plan_unavailable";
+        case StrictGroupPhase2FallbackReason::MembershipBitmapUnavailable:
+            return "membership_bitmap_unavailable";
+        case StrictGroupPhase2FallbackReason::RecreateUnavailable:
+            return "recreate_unavailable";
+    }
+    return "unknown";
+}
+
 void
+RecordStrictGroupPhase2Stats(const StrictGroupPhase2Stats& stats) {
+    if (!stats.attempted) {
+        return;
+    }
+    milvus::monitor::internal_core_strict_group_phase2_phase1_candidates
+        .Observe(stats.phase1_candidates);
+    milvus::monitor::internal_core_strict_group_phase2_phase2_candidates
+        .Observe(stats.phase2_candidates);
+    milvus::monitor::internal_core_strict_group_phase2_batch_count.Observe(
+        stats.batch_count);
+    milvus::monitor::internal_core_strict_group_phase2_small_group_count
+        .Observe(stats.small_group_count);
+    milvus::monitor::internal_core_strict_group_phase2_large_group_count
+        .Observe(stats.large_group_count);
+    milvus::monitor::internal_core_strict_group_phase2_membership_build_latency
+        .Observe(stats.membership_build_us);
+    milvus::monitor::internal_core_strict_group_phase2_bitmap_build_latency
+        .Observe(stats.bitmap_build_us);
+    if (stats.eligible_rows > 0) {
+        milvus::monitor::internal_core_strict_group_phase2_selectivity.Observe(
+            static_cast<double>(stats.unfinished_group_rows) /
+            stats.eligible_rows);
+    }
+    tracer::AddEvent(fmt::format(
+        "strict_group_phase2: used={}, fallback={}, phase1_candidates={}, "
+        "phase2_candidates={}, eligible_rows={}, unfinished_group_rows={}, "
+        "small_groups={}, large_groups={}, batches={}, membership_ms={:.3f}, "
+        "bitmap_ms={:.3f}",
+        stats.used,
+        FallbackReasonName(stats.fallback_reason),
+        stats.phase1_candidates,
+        stats.phase2_candidates,
+        stats.eligible_rows,
+        stats.unfinished_group_rows,
+        stats.small_group_count,
+        stats.large_group_count,
+        stats.batch_count,
+        stats.membership_build_us / 1000.0,
+        stats.bitmap_build_us / 1000.0));
+}
+
+template <typename T, typename StopPredicate>
+size_t
 ConsumeGroupByIteratorUntil(const std::shared_ptr<VectorIterator>& iterator,
                             const std::shared_ptr<DataGetter<T>>& data_getter,
                             GroupByMap<T>& group_map,
                             GroupByResultCollector<T>& collector,
                             StopPredicate&& should_stop,
                             TargetBitmap* consumed_offsets = nullptr) {
+    size_t candidates = 0;
     while (iterator->HasNext() && !should_stop()) {
         auto offset_dis_pair = iterator->Next();
+        ++candidates;
         AssertInfo(
             offset_dis_pair.has_value(),
             "Wrong state! iterator cannot return valid result whereas it "
@@ -63,6 +166,7 @@ ConsumeGroupByIteratorUntil(const std::shared_ptr<VectorIterator>& iterator,
             collector.Add(offset, distance, std::move(group));
         }
     }
+    return candidates;
 }
 
 template <typename T>
@@ -98,14 +202,28 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
                              GroupByResultCollector<T>& collector,
                              const StrictGroupPhase2Context* context) {
     if (context == nullptr || !context->eligible ||
-        context->search_result == nullptr ||
-        !context->search_result->CanRecreateVectorIterator() ||
-        context->search_result->total_data_cnt_ < 0) {
+        context->search_result == nullptr) {
+        return false;
+    }
+
+    StrictGroupPhase2Stats stats;
+    stats.attempted = true;
+    auto finish = [&] { RecordStrictGroupPhase2Stats(stats); };
+    if (!context->search_result->CanRecreateVectorIterator()) {
+        stats.fallback_reason =
+            StrictGroupPhase2FallbackReason::MissingRecreator;
+        finish();
+        return false;
+    }
+    if (context->search_result->total_data_cnt_ < 0) {
+        stats.fallback_reason =
+            StrictGroupPhase2FallbackReason::InvalidRowCount;
+        finish();
         return false;
     }
 
     TargetBitmap phase1_offsets(context->search_result->total_data_cnt_, false);
-    ConsumeGroupByIteratorUntil(
+    stats.phase1_candidates = ConsumeGroupByIteratorUntil(
         iterator,
         data_getter,
         group_map,
@@ -113,7 +231,16 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
         [&] { return group_map.IsGroupCapacityReached(); },
         &phase1_offsets);
 
-    if (!group_map.IsGroupCapacityReached() || group_map.IsGroupResEnough()) {
+    if (!group_map.IsGroupCapacityReached()) {
+        stats.fallback_reason =
+            StrictGroupPhase2FallbackReason::Phase1Exhausted;
+        finish();
+        return true;
+    }
+    if (group_map.IsGroupResEnough()) {
+        stats.fallback_reason =
+            StrictGroupPhase2FallbackReason::Phase2NotNeeded;
+        finish();
         return true;
     }
 
@@ -126,6 +253,7 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
     AssertInfo(!unfinished_groups.empty(),
                "strict group phase2 has no unfinished group");
 
+    auto membership_start = std::chrono::steady_clock::now();
     auto membership = BuildGroupMembership<T>(
         context->op_ctx,
         context->segment,
@@ -133,37 +261,62 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
         context->search_result->total_data_cnt_,
         unfinished_groups,
         context->search_result->GetVectorIteratorBaseFilter());
+    stats.membership_build_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - membership_start)
+            .count();
     if (!membership.has_value()) {
+        stats.fallback_reason =
+            StrictGroupPhase2FallbackReason::MembershipUnavailable;
         ConsumeGroupByIteratorUntil(
             iterator, data_getter, group_map, collector, [&] {
                 return group_map.IsGroupResEnough();
             });
+        finish();
         return true;
     }
+
+    stats.eligible_rows = membership->EligibleRowCount();
 
     auto plan = BuildStrictGroupPhase2Plan(membership->EligibleRowCount(),
                                            membership->GroupRowCounts());
     if (!plan.has_value()) {
+        stats.fallback_reason =
+            StrictGroupPhase2FallbackReason::PlanUnavailable;
         ConsumeGroupByIteratorUntil(
             iterator, data_getter, group_map, collector, [&] {
                 return group_map.IsGroupResEnough();
             });
+        finish();
         return true;
     }
+    stats.unfinished_group_rows = plan->combined_rows;
+    stats.small_group_count = plan->small_group_count;
+    stats.large_group_count = plan->large_group_count;
+    stats.batch_count = plan->batches.size();
 
     bool phase2_started = false;
     for (const auto& batch_ordinals : plan->batches) {
         auto batch_groups =
             SelectBatchGroups(unfinished_groups, batch_ordinals);
+        auto bitmap_start = std::chrono::steady_clock::now();
         auto batch_membership = membership->BuildMembership(batch_groups);
         if (!batch_membership.has_value()) {
+            stats.bitmap_build_us +=
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - bitmap_start)
+                    .count();
+            stats.fallback_reason =
+                StrictGroupPhase2FallbackReason::MembershipBitmapUnavailable;
             if (!phase2_started) {
                 ConsumeGroupByIteratorUntil(
                     iterator, data_getter, group_map, collector, [&] {
                         return group_map.IsGroupResEnough();
                     });
+                finish();
                 return true;
             }
+            finish();
             ThrowInfo(UnexpectedError,
                       "failed to build strict group phase2 membership after "
                       "phase2 started");
@@ -171,17 +324,25 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
 
         batch_membership->flip();
         *batch_membership |= phase1_offsets;
+        stats.bitmap_build_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - bitmap_start)
+                .count();
 
         auto recreated =
             context->search_result->RecreateVectorIterators(*batch_membership);
         if (!recreated.has_value()) {
+            stats.fallback_reason =
+                StrictGroupPhase2FallbackReason::RecreateUnavailable;
             if (!phase2_started) {
                 ConsumeGroupByIteratorUntil(
                     iterator, data_getter, group_map, collector, [&] {
                         return group_map.IsGroupResEnough();
                     });
+                finish();
                 return true;
             }
+            finish();
             ThrowInfo(UnexpectedError,
                       "failed to recreate strict group iterator after phase2 "
                       "started");
@@ -195,12 +356,13 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
                    "strict group phase2 expected at most one iterator, got {}",
                    batch_result.vector_iterators_->size());
         phase2_started = true;
+        stats.used = true;
         if (batch_result.vector_iterators_->empty()) {
             context->search_result->search_storage_cost_ +=
                 batch_result.search_storage_cost_;
             continue;
         }
-        ConsumeGroupByIteratorUntil(
+        stats.phase2_candidates += ConsumeGroupByIteratorUntil(
             batch_result.vector_iterators_->front(),
             data_getter,
             group_map,
@@ -212,6 +374,7 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
             break;
         }
     }
+    finish();
     return true;
 }
 

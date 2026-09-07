@@ -30,6 +30,9 @@ constexpr size_t kStrictGroupSmallGroupSelectivityPercent = 1;
 // Batches are disjoint and retain the phase-1 lock order.
 struct StrictGroupPhase2Plan {
     std::vector<std::vector<size_t>> batches;
+    size_t combined_rows = 0;
+    size_t small_group_count = 0;
+    size_t large_group_count = 0;
 };
 
 inline bool
@@ -45,13 +48,19 @@ BuildStrictGroupPhase2Plan(size_t eligible_rows,
         return std::nullopt;
     }
 
-    size_t combined_rows = 0;
+    StrictGroupPhase2Plan plan;
     for (auto count : group_row_counts) {
-        combined_rows += count;
+        plan.combined_rows += count;
+        if (IsBelowSelectivity(count,
+                               eligible_rows,
+                               kStrictGroupSmallGroupSelectivityPercent)) {
+            ++plan.small_group_count;
+        } else {
+            ++plan.large_group_count;
+        }
     }
 
-    StrictGroupPhase2Plan plan;
-    if (IsBelowSelectivity(combined_rows,
+    if (IsBelowSelectivity(plan.combined_rows,
                            eligible_rows,
                            kStrictGroupPhase2MaxSelectivityPercent)) {
         std::vector<size_t> batch;
