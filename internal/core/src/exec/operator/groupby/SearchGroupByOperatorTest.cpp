@@ -55,7 +55,8 @@ class SequenceIterator final : public knowhere::IndexNode::iterator {
 std::shared_ptr<VectorIterator>
 MakeSequenceVectorIterator(
     const std::vector<std::pair<int64_t, float>>& candidates,
-    const BitsetView& invalid = {}) {
+    const BitsetView& invalid = {},
+    bool empty_leading_chunk = false) {
     std::vector<std::pair<int64_t, float>> eligible;
     eligible.reserve(candidates.size());
     for (const auto& candidate : candidates) {
@@ -64,13 +65,32 @@ MakeSequenceVectorIterator(
         }
     }
     auto iterator = std::make_shared<VectorIterator>(
-        /*chunk_count=*/1, /*offset_mapping=*/nullptr);
+        /*chunk_count=*/empty_leading_chunk ? 2 : 1,
+        /*offset_mapping=*/nullptr);
+    if (empty_leading_chunk) {
+        iterator->AddIterator(std::make_shared<SequenceIterator>(
+            std::vector<std::pair<int64_t, float>>{}));
+    }
     iterator->AddIterator(std::make_shared<SequenceIterator>(eligible));
     iterator->seal();
     return iterator;
 }
 
 }  // namespace
+
+TEST(VectorIteratorFilteredChunksTest, EmptyLeadingChunkKeepsSuccessors) {
+    VectorIterator iterator(2, nullptr);
+    iterator.AddIterator(std::make_shared<SequenceIterator>(
+        std::vector<std::pair<int64_t, float>>{}));
+    iterator.AddIterator(std::make_shared<SequenceIterator>(
+        std::vector<std::pair<int64_t, float>>{{3, 1.0F}, {4, 2.0F}}));
+    iterator.seal();
+    ASSERT_TRUE(iterator.HasNext());
+    EXPECT_EQ(iterator.Next()->first, 3);
+    ASSERT_TRUE(iterator.HasNext());
+    EXPECT_EQ(iterator.Next()->first, 4);
+    EXPECT_FALSE(iterator.HasNext());
+}
 
 TEST(StrictGroupFilteredIteratorEligibilityTest,
      RequiresStrictMultiResultSingleQueryRowLevelSearch) {
@@ -174,9 +194,19 @@ TEST(StrictGroupPhase2ExecutorTest,
     candidates.emplace_back(rows_by_group[locked_groups[0]][0], 0.0F);
     candidates.emplace_back(rows_by_group[locked_groups[1]][0], 1.0F);
     for (int64_t offset = 0; offset < kRowCount; ++offset) {
-        if (offset != candidates[0].first && offset != candidates[1].first) {
+        if (group_values[offset] != locked_groups[0] &&
+            group_values[offset] != locked_groups[1]) {
             candidates.emplace_back(offset,
                                     static_cast<float>(candidates.size()));
+        }
+    }
+    for (auto group : locked_groups) {
+        for (auto offset : rows_by_group[group]) {
+            if (offset != candidates[0].first &&
+                offset != candidates[1].first) {
+                candidates.emplace_back(offset,
+                                        static_cast<float>(candidates.size()));
+            }
         }
     }
 
@@ -199,7 +229,7 @@ TEST(StrictGroupPhase2ExecutorTest,
             }
             recreated_result.vector_iterators_ =
                 std::vector<std::shared_ptr<VectorIterator>>{
-                    MakeSequenceVectorIterator(candidates, invalid)};
+                    MakeSequenceVectorIterator(candidates, invalid, true)};
         });
 
     SearchInfo search_info;
@@ -245,6 +275,82 @@ TEST(StrictGroupPhase2ExecutorTest,
         if (!belongs_to_locked_group) {
             EXPECT_TRUE(observed_filter[offset]);
         }
+    }
+}
+
+TEST(StrictGroupPhase2ExecutorTest, EasyQuotaDoesNotRecreate) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto field = schema->AddDebugField("group", DataType::INT64);
+    schema->set_primary_field_id(pk);
+    auto data = segcore::DataGen(schema, 1000, 42, 0, 1000);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, data);
+    auto values = data.get_col<int64_t>(field);
+    std::vector<std::pair<int64_t, float>> candidates;
+    for (int64_t i = 0; i < 1000; ++i) {
+        if (values[i] == values[0]) {
+            candidates.emplace_back(i, static_cast<float>(i));
+        }
+    }
+    ASSERT_GE(candidates.size(), 2);
+    SearchResult result;
+    result.total_nq_ = 1;
+    result.total_data_cnt_ = 1000;
+    result.vector_iterators_ = std::vector<std::shared_ptr<VectorIterator>>{
+        MakeSequenceVectorIterator(candidates)};
+    result.SetVectorIteratorRecreator(BitsetView{}, [](auto&, auto&) {
+        ADD_FAILURE() << "easy quota must use the original iterator";
+    });
+    SearchInfo info;
+    info.topk_ = 1;
+    info.group_size_ = 2;
+    info.strict_group_size_ = true;
+    info.group_by_field_id_ = field;
+    info.metric_type_ = knowhere::metric::L2;
+    std::vector<GroupByValueType> groups;
+    std::vector<int64_t> offsets;
+    std::vector<float> distances;
+    std::vector<size_t> prefix;
+    SearchGroupBy(nullptr,
+                  *result.vector_iterators_,
+                  info,
+                  groups,
+                  *segment,
+                  offsets,
+                  distances,
+                  prefix,
+                  &result);
+    EXPECT_EQ(offsets.size(), 2);
+}
+
+TEST(GroupMembershipTest, GrowingMmapStringUsesElementView) {
+    auto& config = storage::MmapManager::GetInstance().GetMmapConfig();
+    const bool previous = config.GetEnableGrowingMmap();
+    config.SetEnableGrowingMmap(true);
+    auto restore = std::shared_ptr<void>(
+        nullptr, [&](void*) { config.SetEnableGrowingMmap(previous); });
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto field = schema->AddDebugField("group", DataType::VARCHAR);
+    schema->set_primary_field_id(pk);
+    auto data = segcore::DataGen(schema, 100, 42, 0, 4);
+    auto segment = segcore::CreateGrowingSegment(schema, empty_index_meta);
+    auto offset = segment->PreInsert(100);
+    segment->Insert(
+        offset, 100, data.row_ids_.data(), data.timestamps_.data(), data.raw_);
+    auto values = data.get_col<std::string>(field);
+    auto* growing = dynamic_cast<segcore::SegmentGrowingImpl*>(segment.get());
+    ASSERT_NE(growing, nullptr);
+    ASSERT_TRUE(
+        growing->get_insert_record().get_data<std::string>(field)->is_mmap());
+    std::vector<std::optional<std::string>> groups{values[0]};
+    auto membership = BuildGroupMembership<std::string>(
+        nullptr, *growing, field, 100, groups, nullptr);
+    ASSERT_TRUE(membership.has_value());
+    auto bitmap = membership->BuildMembership(groups);
+    ASSERT_TRUE(bitmap.has_value());
+    for (size_t i = 0; i < values.size(); ++i) {
+        EXPECT_EQ((*bitmap)[i], values[i] == values[0]);
     }
 }
 
@@ -395,6 +501,8 @@ TEST(GroupMembershipTest, ScalarIndexAndRawFieldProduceIdenticalMembership) {
     EXPECT_EQ(raw->EligibleRowCount(), indexed->EligibleRowCount());
     EXPECT_EQ(raw->GroupRowCounts(), indexed->GroupRowCounts());
 
+    // Batch materialization must use cached offsets, not rescan the column.
+    raw_segment->DropFieldData(group_field);
     std::vector<std::optional<int64_t>> batch{
         std::nullopt, values[4], values[20]};
     auto raw_bitmap = raw->BuildMembership(batch);

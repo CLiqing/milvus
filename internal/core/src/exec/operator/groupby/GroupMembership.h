@@ -34,6 +34,7 @@ enum class GroupMembershipSource {
 // Holds the cardinality of each requested group after the original search
 // filter, plus a provider that can materialize one union bitmap at a time.
 // Delayed materialization avoids retaining topK full-segment bitmaps.
+// The segment and original base filter must outlive this provider.
 template <typename T>
 class GroupMembership {
  public:

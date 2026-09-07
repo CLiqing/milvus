@@ -244,6 +244,26 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
         return true;
     }
 
+    // Bound the extra ANN work before paying for a full membership scan.
+    constexpr size_t kStrictGroupFillCandidateBudget = 64;
+    size_t fill_candidates = 0;
+    stats.phase1_candidates += ConsumeGroupByIteratorUntil(
+        iterator,
+        data_getter,
+        group_map,
+        collector,
+        [&] {
+            return group_map.IsGroupResEnough() ||
+                   fill_candidates++ >= kStrictGroupFillCandidateBudget;
+        },
+        &phase1_offsets);
+    if (group_map.IsGroupResEnough() || !iterator->HasNext()) {
+        stats.fallback_reason =
+            StrictGroupPhase2FallbackReason::Phase2NotNeeded;
+        finish();
+        return true;
+    }
+
     std::vector<std::optional<T>> unfinished_groups;
     for (const auto& group : group_map.GetGroupOrder()) {
         if (!group_map.IsGroupFull(group)) {
@@ -329,8 +349,8 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
                 std::chrono::steady_clock::now() - bitmap_start)
                 .count();
 
-        auto recreated =
-            context->search_result->RecreateVectorIterators(*batch_membership);
+        auto recreated = context->search_result->RecreateVectorIterators(
+            std::move(*batch_membership));
         if (!recreated.has_value()) {
             stats.fallback_reason =
                 StrictGroupPhase2FallbackReason::RecreateUnavailable;

@@ -122,7 +122,7 @@ AssertRecreatedIteratorUsesCombinedLogicalFilter(
     auto original_chunk_buffers = search_result.chunk_buffers_.size();
     {
         auto recreated =
-            search_result.RecreateVectorIterators(additional_filter);
+            search_result.RecreateVectorIterators(additional_filter.clone());
         ASSERT_TRUE(recreated.has_value());
         auto& batch_result = **recreated;
         EXPECT_FALSE(batch_result.CanRecreateVectorIterator());

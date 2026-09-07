@@ -194,9 +194,10 @@ struct VectorIterator {
             if (iter->HasNext()) {
                 auto origin_pair = iter->Next();
                 auto off_dis_pair =
-                    std::make_shared<OffsetDisPair>(origin_pair, idx++);
+                    std::make_shared<OffsetDisPair>(origin_pair, idx);
                 heap_.push(off_dis_pair);
             }
+            ++idx;
         }
     }
 
@@ -327,7 +328,7 @@ struct SearchResult {
     // its iterators. Keep it alive while consuming the batch, then release it
     // before recreating the next batch.
     std::optional<std::unique_ptr<SearchResult>>
-    RecreateVectorIterators(const TargetBitmap& additional_filter) {
+    RecreateVectorIterators(TargetBitmap additional_filter) {
         if (!CanRecreateVectorIterator()) {
             return std::nullopt;
         }
@@ -336,7 +337,7 @@ struct SearchResult {
             return std::nullopt;
         }
 
-        auto combined_filter = additional_filter.clone();
+        auto combined_filter = std::move(additional_filter);
         if (vector_iterator_base_filter_ != nullptr) {
             combined_filter |= *vector_iterator_base_filter_;
         }
