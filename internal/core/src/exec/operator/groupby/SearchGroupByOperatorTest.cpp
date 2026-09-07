@@ -71,6 +71,33 @@ MakeSequenceVectorIterator(
 
 }  // namespace
 
+TEST(StrictGroupFilteredIteratorEligibilityTest,
+     RequiresStrictMultiResultSingleQueryRowLevelSearch) {
+    SearchInfo eligible;
+    eligible.topk_ = 10;
+    eligible.group_size_ = 3;
+    eligible.strict_group_size_ = true;
+    EXPECT_TRUE(query::CanUseStrictGroupFilteredIterator(eligible, 1));
+
+    auto non_strict = eligible;
+    non_strict.strict_group_size_ = false;
+    EXPECT_FALSE(query::CanUseStrictGroupFilteredIterator(non_strict, 1));
+
+    auto single_result_group = eligible;
+    single_result_group.group_size_ = 1;
+    EXPECT_FALSE(
+        query::CanUseStrictGroupFilteredIterator(single_result_group, 1));
+
+    auto empty_topk = eligible;
+    empty_topk.topk_ = 0;
+    EXPECT_FALSE(query::CanUseStrictGroupFilteredIterator(empty_topk, 1));
+    EXPECT_FALSE(query::CanUseStrictGroupFilteredIterator(eligible, 2));
+
+    auto element_level = eligible;
+    element_level.array_offsets_ = std::make_shared<ArrayOffsetsSealed>();
+    EXPECT_FALSE(query::CanUseStrictGroupFilteredIterator(element_level, 1));
+}
+
 TEST(StrictGroupPhase2PlannerTest, UsesOneBatchBelowTenPercent) {
     auto plan = BuildStrictGroupPhase2Plan(
         /*eligible_rows=*/10000, /*group_row_counts=*/{200, 300, 499});

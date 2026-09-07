@@ -30,6 +30,7 @@ struct StrictGroupPhase2Context {
     const segcore::SegmentInternalInterface& segment;
     FieldId group_by_field_id;
     SearchResult* search_result;
+    bool eligible;
 };
 
 template <typename T, typename StopPredicate>
@@ -92,15 +93,13 @@ SelectBatchGroups(const std::vector<std::optional<T>>& groups,
 template <typename T>
 bool
 TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
-                             int64_t topK,
-                             int64_t group_size,
                              const std::shared_ptr<DataGetter<T>>& data_getter,
                              GroupByMap<T>& group_map,
                              GroupByResultCollector<T>& collector,
                              const StrictGroupPhase2Context* context) {
-    if (context == nullptr || context->search_result == nullptr ||
-        !context->search_result->CanRecreateVectorIterator() || topK <= 0 ||
-        group_size <= 1 || context->search_result->total_nq_ != 1 ||
+    if (context == nullptr || !context->eligible ||
+        context->search_result == nullptr ||
+        !context->search_result->CanRecreateVectorIterator() ||
         context->search_result->total_data_cnt_ < 0) {
         return false;
     }
@@ -253,7 +252,12 @@ SearchGroupBy(milvus::OpContext* op_ctx,
     group_by_values.reserve(max_total_size);
     topk_per_nq_prefix_sum.reserve(iterators.size() + 1);
     StrictGroupPhase2Context phase2_context{
-        op_ctx, segment, group_by_field_id, search_result};
+        op_ctx,
+        segment,
+        group_by_field_id,
+        search_result,
+        query::CanUseStrictGroupFilteredIterator(search_info,
+                                                 iterators.size())};
     switch (data_type) {
         case DataType::INT8: {
             auto dataGetter =
@@ -597,13 +601,9 @@ GroupIteratorResult(const std::shared_ptr<VectorIterator>& iterator,
     GroupByResultCollector<T> collector;
 
     auto handled_by_filtered_phase2 =
-        strict_group_size && TryStrictGroupFilteredPhase2(iterator,
-                                                          topK,
-                                                          group_size,
-                                                          data_getter,
-                                                          group_map,
-                                                          collector,
-                                                          context);
+        strict_group_size &&
+        TryStrictGroupFilteredPhase2(
+            iterator, data_getter, group_map, collector, context);
     if (!handled_by_filtered_phase2) {
         // Do iteration until fill the whole map or run out of all data. It may
         // enumerate every row in a segment and block following work.
