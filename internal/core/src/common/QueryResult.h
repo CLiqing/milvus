@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstring>
 #include <memory>
 #include <map>
 #include <limits>
@@ -297,8 +298,14 @@ struct SearchResult {
         } else {
             auto copied_filter =
                 std::make_unique<TargetBitmap>(base_filter.size(), false);
-            for (size_t i = 0; i < base_filter.size(); ++i) {
-                (*copied_filter)[i] = base_filter.test(i);
+            if (!base_filter.has_out_ids()) {
+                std::memcpy(copied_filter->data(),
+                            base_filter.data(),
+                            base_filter.byte_size());
+            } else {
+                for (size_t i = 0; i < base_filter.size(); ++i) {
+                    (*copied_filter)[i] = base_filter.test(i);
+                }
             }
             vector_iterator_base_filter_ = std::move(copied_filter);
         }
@@ -307,12 +314,21 @@ struct SearchResult {
 
     bool
     CanRecreateVectorIterator() const {
-        return static_cast<bool>(vector_iterator_recreate_fn_);
+        return allow_vector_iterator_recreation_ &&
+               static_cast<bool>(vector_iterator_recreate_fn_);
     }
 
-    std::optional<std::vector<std::shared_ptr<VectorIterator>>>
+    const TargetBitmap*
+    GetVectorIteratorBaseFilter() const {
+        return vector_iterator_base_filter_.get();
+    }
+
+    // The returned SearchResult owns every bitmap and raw chunk buffer used by
+    // its iterators. Keep it alive while consuming the batch, then release it
+    // before recreating the next batch.
+    std::optional<std::unique_ptr<SearchResult>>
     RecreateVectorIterators(const TargetBitmap& additional_filter) {
-        if (!vector_iterator_recreate_fn_) {
+        if (!CanRecreateVectorIterator()) {
             return std::nullopt;
         }
         if (vector_iterator_base_filter_ != nullptr &&
@@ -325,25 +341,18 @@ struct SearchResult {
             combined_filter |= *vector_iterator_base_filter_;
         }
 
-        SearchResult recreated_result;
+        auto recreated_result = std::make_unique<SearchResult>();
+        recreated_result->allow_vector_iterator_recreation_ = false;
         auto combined_view =
-            recreated_result.PinBitset(std::move(combined_filter));
-        vector_iterator_recreate_fn_(combined_view, recreated_result);
-        if (!recreated_result.vector_iterators_.has_value()) {
+            recreated_result->PinBitset(std::move(combined_filter));
+        vector_iterator_recreate_fn_(combined_view, *recreated_result);
+        if (!recreated_result->vector_iterators_.has_value()) {
             // The combined filter may exclude every row. The provider ran
             // successfully, but there is no iterator to assemble.
-            return std::vector<std::shared_ptr<VectorIterator>>{};
+            recreated_result->vector_iterators_ =
+                std::vector<std::shared_ptr<VectorIterator>>{};
         }
-
-        auto recreated_iterators =
-            std::move(recreated_result.vector_iterators_.value());
-        for (auto& pinned_bitset : recreated_result.pinned_bitsets_) {
-            pinned_bitsets_.emplace_back(std::move(pinned_bitset));
-        }
-        for (auto& chunk_buffer : recreated_result.chunk_buffers_) {
-            chunk_buffers_.emplace_back(std::move(chunk_buffer));
-        }
-        return recreated_iterators;
+        return recreated_result;
     }
 
  public:
@@ -385,6 +394,7 @@ struct SearchResult {
     // provider so offset mapping and backend selection stay centralized there.
     VectorIteratorRecreateFn vector_iterator_recreate_fn_{};
     TargetBitmapPtr vector_iterator_base_filter_{};
+    bool allow_vector_iterator_recreation_{true};
 
     bool element_level_{false};
     std::vector<int32_t> element_indices_;

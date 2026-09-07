@@ -44,7 +44,8 @@ SearchOnSealedIndex(const Schema& schema,
     auto recreate_search_info = search_info;
     Defer register_vector_iterator_recreator(
         [&, schema_ptr, record_ptr, recreate_search_info] {
-            if (num_queries != 1 || !search_info.strict_group_size_ ||
+            if (!search_result.allow_vector_iterator_recreation_ ||
+                num_queries != 1 || !search_info.strict_group_size_ ||
                 search_info.group_size_ <= 1 ||
                 search_info.array_offsets_ != nullptr ||
                 !search_result.vector_iterators_.has_value()) {
@@ -191,7 +192,8 @@ SearchOnSealedColumn(const Schema& schema,
     auto recreate_index_info = index_info;
     Defer register_vector_iterator_recreator(
         [&, schema_ptr, recreate_search_info, recreate_index_info] {
-            if (num_queries != 1 || !search_info.strict_group_size_ ||
+            if (!result.allow_vector_iterator_recreation_ || num_queries != 1 ||
+                !search_info.strict_group_size_ ||
                 search_info.group_size_ <= 1 ||
                 search_info.array_offsets_ != nullptr ||
                 !result.vector_iterators_.has_value()) {

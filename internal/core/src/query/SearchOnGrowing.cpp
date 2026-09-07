@@ -85,7 +85,8 @@ SearchOnGrowing(const segcore::SegmentGrowingImpl& segment,
     auto recreate_search_info = info;
     Defer register_vector_iterator_recreator(
         [&, segment_ptr, recreate_search_info] {
-            if (num_queries != 1 || !info.strict_group_size_ ||
+            if (!search_result.allow_vector_iterator_recreation_ ||
+                num_queries != 1 || !info.strict_group_size_ ||
                 info.group_size_ <= 1 || info.array_offsets_ != nullptr ||
                 !search_result.vector_iterators_.has_value()) {
                 return;

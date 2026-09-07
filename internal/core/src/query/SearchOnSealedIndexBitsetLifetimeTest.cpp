@@ -118,27 +118,38 @@ AssertRecreatedIteratorUsesCombinedLogicalFilter(
     IsValid&& is_valid,
     IteratorResults& observed_results) {
     ASSERT_TRUE(search_result.CanRecreateVectorIterator());
-    auto recreated = search_result.RecreateVectorIterators(additional_filter);
-    ASSERT_TRUE(recreated.has_value());
-    ASSERT_EQ(recreated->size(), 1);
+    auto original_pinned_bitsets = search_result.pinned_bitsets_.size();
+    auto original_chunk_buffers = search_result.chunk_buffers_.size();
+    {
+        auto recreated =
+            search_result.RecreateVectorIterators(additional_filter);
+        ASSERT_TRUE(recreated.has_value());
+        auto& batch_result = **recreated;
+        EXPECT_FALSE(batch_result.CanRecreateVectorIterator());
+        EXPECT_FALSE(batch_result.pinned_bitsets_.empty());
+        ASSERT_TRUE(batch_result.vector_iterators_.has_value());
+        ASSERT_EQ(batch_result.vector_iterators_->size(), 1);
 
-    auto iterator = recreated->at(0);
-    ASSERT_NE(iterator, nullptr);
-    int64_t result_count = 0;
-    while (iterator->HasNext() && result_count < kTopK) {
-        auto result = iterator->Next();
-        ASSERT_TRUE(result.has_value());
-        auto logical_offset = result->first;
-        ASSERT_GE(logical_offset, 0);
-        ASSERT_LT(logical_offset,
-                  static_cast<int64_t>(additional_filter.size()));
-        EXPECT_FALSE(IsFiltered(base_filter, logical_offset));
-        EXPECT_FALSE(additional_filter[logical_offset]);
-        EXPECT_TRUE(is_valid(logical_offset));
-        observed_results.emplace_back(result.value());
-        ++result_count;
+        auto iterator = batch_result.vector_iterators_->at(0);
+        ASSERT_NE(iterator, nullptr);
+        int64_t result_count = 0;
+        while (iterator->HasNext() && result_count < kTopK) {
+            auto result = iterator->Next();
+            ASSERT_TRUE(result.has_value());
+            auto logical_offset = result->first;
+            ASSERT_GE(logical_offset, 0);
+            ASSERT_LT(logical_offset,
+                      static_cast<int64_t>(additional_filter.size()));
+            EXPECT_FALSE(IsFiltered(base_filter, logical_offset));
+            EXPECT_FALSE(additional_filter[logical_offset]);
+            EXPECT_TRUE(is_valid(logical_offset));
+            observed_results.emplace_back(result.value());
+            ++result_count;
+        }
+        ASSERT_GT(result_count, 0);
     }
-    ASSERT_GT(result_count, 0);
+    EXPECT_EQ(search_result.pinned_bitsets_.size(), original_pinned_bitsets);
+    EXPECT_EQ(search_result.chunk_buffers_.size(), original_chunk_buffers);
 }
 
 std::unique_ptr<bool[]>

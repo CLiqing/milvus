@@ -30,22 +30,16 @@ template <typename T>
 using GroupKey = std::optional<T>;
 
 bool
-IsEligible(const TargetBitmap* base_filter, size_t offset) {
-    return base_filter == nullptr || !(*base_filter)[offset];
+IsEligible(const TargetBitmap* eligible_rows, size_t offset) {
+    return eligible_rows == nullptr || (*eligible_rows)[offset];
 }
 
 void
-ApplyBaseFilter(TargetBitmap& membership,
-                const TargetBitmap* base_filter,
-                size_t row_count) {
-    if (base_filter == nullptr) {
+ApplyBaseFilter(TargetBitmap& membership, const TargetBitmap* eligible_rows) {
+    if (eligible_rows == nullptr) {
         return;
     }
-    for (size_t offset = 0; offset < row_count; ++offset) {
-        if ((*base_filter)[offset]) {
-            membership[offset] = false;
-        }
-    }
+    membership &= *eligible_rows;
 }
 
 template <typename T>
@@ -55,7 +49,7 @@ BuildIndexMembership(milvus::OpContext* op_ctx,
                      FieldId field_id,
                      size_t row_count,
                      const std::vector<GroupKey<T>>& groups,
-                     const TargetBitmap* base_filter) {
+                     const TargetBitmap* eligible_rows) {
     auto pinned_indexes = segment.PinIndex(op_ctx, field_id);
     if (pinned_indexes.empty()) {
         return std::nullopt;
@@ -92,7 +86,7 @@ BuildIndexMembership(milvus::OpContext* op_ctx,
     if (membership.size() != row_count) {
         return std::nullopt;
     }
-    ApplyBaseFilter(membership, base_filter, row_count);
+    ApplyBaseFilter(membership, eligible_rows);
     return membership;
 }
 
@@ -108,6 +102,20 @@ ScanRawField(milvus::OpContext* op_ctx,
     }
     if (row_count == 0) {
         return true;
+    }
+    auto raw_chunk_count = segment.num_chunk_data(field_id);
+    if (raw_chunk_count == 0 ||
+        segment.num_rows_until_chunk(field_id, 0) != 0) {
+        return false;
+    }
+    size_t raw_row_count = 0;
+    for (int64_t chunk = 0; chunk < raw_chunk_count; ++chunk) {
+        raw_row_count += segment.chunk_size(field_id, chunk);
+    }
+    if (raw_row_count < row_count) {
+        // A partially indexed field may only retain raw data for a suffix of
+        // the segment. Do not reinterpret that suffix as logical offset zero.
+        return false;
     }
 
     int64_t chunk_id = 0;
@@ -137,7 +145,7 @@ BuildRawMembership(milvus::OpContext* op_ctx,
                    FieldId field_id,
                    size_t row_count,
                    const std::vector<GroupKey<T>>& groups,
-                   const TargetBitmap* base_filter) {
+                   const TargetBitmap* eligible_rows) {
     std::unordered_map<GroupKey<T>, bool> requested_groups;
     requested_groups.reserve(groups.size());
     for (const auto& group : groups) {
@@ -147,7 +155,7 @@ BuildRawMembership(milvus::OpContext* op_ctx,
     TargetBitmap membership(row_count, false);
     auto scanned = ScanRawField<T>(
         op_ctx, segment, field_id, row_count, [&](size_t offset, auto group) {
-            if (IsEligible(base_filter, offset) &&
+            if (IsEligible(eligible_rows, offset) &&
                 requested_groups.find(group) != requested_groups.end()) {
                 membership[offset] = true;
             }
@@ -159,10 +167,13 @@ BuildRawMembership(milvus::OpContext* op_ctx,
 }
 
 std::shared_ptr<TargetBitmap>
-CopyBaseFilter(const TargetBitmap* base_filter) {
-    return base_filter == nullptr
-               ? nullptr
-               : std::make_shared<TargetBitmap>(base_filter->clone());
+BuildEligibleRows(const TargetBitmap* base_filter) {
+    if (base_filter == nullptr) {
+        return nullptr;
+    }
+    auto eligible_rows = std::make_shared<TargetBitmap>(base_filter->clone());
+    eligible_rows->flip();
+    return eligible_rows;
 }
 
 }  // namespace
@@ -181,35 +192,35 @@ BuildGroupMembership(milvus::OpContext* op_ctx,
         return std::nullopt;
     }
     auto count = static_cast<size_t>(row_count);
-    auto copied_filter = CopyBaseFilter(base_filter);
-    auto copied_filter_ptr = copied_filter.get();
+    auto eligible_rows = BuildEligibleRows(base_filter);
+    auto eligible_rows_ptr = eligible_rows.get();
     auto eligible_row_count =
-        copied_filter == nullptr ? count : count - copied_filter->count();
+        eligible_rows == nullptr ? count : eligible_rows->count();
 
     // Prefer the scalar index even when raw field data is also loaded. In()
     // obtains all requested offsets without walking the scalar column.
     auto index_probe = BuildIndexMembership<T>(
-        op_ctx, segment, field_id, count, {}, copied_filter_ptr);
+        op_ctx, segment, field_id, count, {}, eligible_rows_ptr);
     if (index_probe.has_value()) {
         std::vector<size_t> group_row_counts;
         group_row_counts.reserve(groups.size());
         for (const auto& group : groups) {
             auto membership = BuildIndexMembership<T>(
-                op_ctx, segment, field_id, count, {group}, copied_filter_ptr);
+                op_ctx, segment, field_id, count, {group}, eligible_rows_ptr);
             if (!membership.has_value()) {
                 return std::nullopt;
             }
             group_row_counts.emplace_back(membership->count());
         }
         auto membership_builder =
-            [op_ctx, &segment, field_id, count, copied_filter](
+            [op_ctx, &segment, field_id, count, eligible_rows](
                 const std::vector<GroupKey<T>>& batch_groups) {
                 return BuildIndexMembership<T>(op_ctx,
                                                segment,
                                                field_id,
                                                count,
                                                batch_groups,
-                                               copied_filter.get());
+                                               eligible_rows.get());
             };
         return GroupMembership<T>(eligible_row_count,
                                   groups,
@@ -226,7 +237,7 @@ BuildGroupMembership(milvus::OpContext* op_ctx,
     std::vector<size_t> group_row_counts(groups.size(), 0);
     auto scanned = ScanRawField<T>(
         op_ctx, segment, field_id, count, [&](size_t offset, auto group) {
-            if (!IsEligible(copied_filter_ptr, offset)) {
+            if (!IsEligible(eligible_rows_ptr, offset)) {
                 return;
             }
             auto found = group_ordinals.find(group);
@@ -239,14 +250,14 @@ BuildGroupMembership(milvus::OpContext* op_ctx,
     }
 
     auto membership_builder =
-        [op_ctx, &segment, field_id, count, copied_filter](
+        [op_ctx, &segment, field_id, count, eligible_rows](
             const std::vector<GroupKey<T>>& batch_groups) {
             return BuildRawMembership<T>(op_ctx,
                                          segment,
                                          field_id,
                                          count,
                                          batch_groups,
-                                         copied_filter.get());
+                                         eligible_rows.get());
         };
     return GroupMembership<T>(eligible_row_count,
                               groups,
