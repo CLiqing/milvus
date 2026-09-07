@@ -77,15 +77,15 @@ TEST(FilterMapTest, BatchPromotionBackfillsOnlyCompletedPrefix) {
     auto map = FilterMap::Adaptive(15, true, 3);
 
     auto first = MakeBitmap(5, {1, 4});
-    map.AssignBatch(TargetBitmapView(first), nullptr, 0, true);
+    map.AssignBitmapBatch(TargetBitmapView(first), nullptr, 0, true);
     EXPECT_EQ(map.capability(), FilterMapCapability::EnumerateOnly);
 
     auto triggering = MakeBitmap(6, {0, 2});
-    map.AssignBatch(TargetBitmapView(triggering), nullptr, 5, true);
+    map.AssignBitmapBatch(TargetBitmapView(triggering), nullptr, 5, true);
     EXPECT_EQ(map.capability(), FilterMapCapability::RandomMembership);
 
     auto tail = MakeBitmap(4, {1, 3});
-    map.AssignBatch(TargetBitmapView(tail), nullptr, 11, true);
+    map.AssignBitmapBatch(TargetBitmapView(tail), nullptr, 11, true);
 
     EXPECT_EQ(CollectUnset(map), (std::vector<int32_t>{1, 4, 5, 7, 12, 14}));
 }
@@ -96,9 +96,38 @@ TEST(FilterMapTest, BatchCombinesValidityBeforeInversion) {
     auto validity = MakeBitmap(8, {0, 2, 3, 4, 5, 6, 7});
     TargetBitmapView validity_view(validity);
 
-    map.AssignBatch(TargetBitmapView(predicate), &validity_view, 0, true);
+    map.AssignBitmapBatch(TargetBitmapView(predicate), &validity_view, 0, true);
     EXPECT_EQ(map.capability(), FilterMapCapability::RandomMembership);
     EXPECT_EQ(CollectUnset(map), (std::vector<int32_t>{0, 2, 6}));
+}
+
+TEST(FilterMapTest, BitmapBatchHandlesUnalignedViewsAndTail) {
+    auto map = FilterMap::Adaptive(10, true, 10);
+    auto predicate = MakeBitmap(20, {4, 7, 11, 12});
+    auto validity = MakeBitmap(24, {6, 9, 13, 17});
+    TargetBitmapView predicate_view(predicate.data(), 3, 10);
+    TargetBitmapView validity_view(validity.data(), 5, 10);
+
+    map.AssignBitmapBatch(predicate_view, &validity_view, 0, true);
+    EXPECT_EQ(map.capability(), FilterMapCapability::EnumerateOnly);
+    EXPECT_EQ(CollectUnset(map), (std::vector<int32_t>{1, 4, 8}));
+}
+
+TEST(FilterMapTest, BitmapBatchSupportsBothPolarities) {
+    auto source = MakeBitmap(7, {1, 5});
+
+    auto default_zero = FilterMap::Adaptive(7, false, 7);
+    default_zero.AssignBitmapBatch(TargetBitmapView(source), nullptr, 0, false);
+    EXPECT_EQ(default_zero.count(), 2);
+    EXPECT_TRUE(default_zero.test(1));
+    EXPECT_TRUE(default_zero.test(5));
+
+    auto default_one = FilterMap::Adaptive(7, true, 7);
+    default_one.AssignBitmapBatch(TargetBitmapView(source), nullptr, 0, false);
+    EXPECT_EQ(default_one.count(), 2);
+    for (size_t id = 0; id < default_one.size(); ++id) {
+        EXPECT_EQ(default_one.test(id), id == 1 || id == 5) << id;
+    }
 }
 
 TEST(FilterMapTest, SparseCopyDetachesOnMutation) {
@@ -139,6 +168,37 @@ TEST(FilterMapTest, DenseOwnerDetachesBeforeMutation) {
     map.set(3);
     EXPECT_TRUE(map.test(3));
     EXPECT_FALSE((*owner)[3]);
+}
+
+TEST(FilterMapTest, AppendsUnorderedUniqueBitsWithoutLookup) {
+    auto map = FilterMap::Adaptive(12, true, 4);
+    const std::array<int32_t, 3> accepted{9, 1, 7};
+    map.AppendUniqueBits(accepted, false);
+
+    EXPECT_EQ(map.capability(), FilterMapCapability::EnumerateOnly);
+    EXPECT_EQ(CollectUnset(map),
+              (std::vector<int32_t>{accepted.begin(), accepted.end()}));
+    EXPECT_EQ(map.count(), 9);
+}
+
+TEST(FilterMapTest, UniqueBitBatchPromotesAndWritesOnlyRemainingSuffix) {
+    auto map = FilterMap::Adaptive(12, true, 3);
+    const std::array<int32_t, 2> first{8, 2};
+    const std::array<int32_t, 3> triggering{10, 1, 6};
+    map.AppendUniqueBits(first, false);
+    map.AppendUniqueBits(triggering, false);
+
+    EXPECT_EQ(map.capability(), FilterMapCapability::RandomMembership);
+    EXPECT_EQ(CollectUnset(map), (std::vector<int32_t>{1, 2, 6, 8, 10}));
+    EXPECT_EQ(map.count(), 7);
+}
+
+TEST(FilterMapTest, UniqueBitBatchValidatesBeforeMutation) {
+    auto map = FilterMap::Adaptive(6, true, 4);
+    const std::array<int32_t, 3> invalid{1, 6, 3};
+    EXPECT_THROW(map.AppendUniqueBits(invalid, false), std::out_of_range);
+    EXPECT_EQ(map.count(), 6);
+    EXPECT_TRUE(CollectUnset(map).empty());
 }
 
 TEST(FilterMapTest, RejectsInvalidStateAndBounds) {

@@ -71,15 +71,22 @@ class FilterMap {
     FilterMapCapability
     capability() const;
 
-    // Assigns one logical batch at offset. source is caller-owned scratch and
-    // may be modified when the final representation is Dense. With validity,
-    // logical bits are source AND validity; invert is applied afterwards.
-    // Producer batches must cover disjoint ranges.
+    // Assigns one bitmap-producing kernel batch at offset. source is
+    // caller-owned scratch and may be modified when the final representation
+    // is Dense. With validity, logical bits are source AND validity; invert is
+    // applied afterwards. Producer batches must cover disjoint ranges.
     void
-    AssignBatch(TargetBitmapView source,
-                const TargetBitmapView* validity,
-                size_t offset,
-                bool invert);
+    AssignBitmapBatch(TargetBitmapView source,
+                      const TargetBitmapView* validity,
+                      size_t offset,
+                      bool invert);
+
+    // Appends a producer-owned batch of unique bit positions without bitmap
+    // materialization or per-ID duplicate lookup. IDs may be unordered, but
+    // must be unique across this and all previous producer batches. This is a
+    // trusted producer boundary, not a replacement for general set/reset.
+    void
+    AppendUniqueBits(std::span<const int32_t> ids, bool value);
 
     // Enumerates logical zero bits without exposing the backing storage.
     size_t
