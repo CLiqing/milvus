@@ -16,14 +16,198 @@
 
 #include <gtest/gtest.h>
 
+#include <unordered_map>
+
 #include "exec/operator/groupby/GroupMembership.h"
 #include "exec/operator/groupby/SearchGroupByOperator.h"
+#include "exec/operator/groupby/StrictGroupPhase2Planner.h"
 #include "index/ScalarIndexSort.h"
 #include "test_utils/DataGen.h"
 #include "test_utils/cachinglayer_test_utils.h"
 #include "test_utils/storage_test_utils.h"
 
 namespace milvus::exec {
+
+namespace {
+
+class SequenceIterator final : public knowhere::IndexNode::iterator {
+ public:
+    explicit SequenceIterator(std::vector<std::pair<int64_t, float>> values)
+        : values_(std::move(values)) {
+    }
+
+    std::pair<int64_t, float>
+    Next() override {
+        return values_.at(position_++);
+    }
+
+    bool
+    HasNext() override {
+        return position_ < values_.size();
+    }
+
+ private:
+    std::vector<std::pair<int64_t, float>> values_;
+    size_t position_{0};
+};
+
+std::shared_ptr<VectorIterator>
+MakeSequenceVectorIterator(
+    const std::vector<std::pair<int64_t, float>>& candidates,
+    const BitsetView& invalid = {}) {
+    std::vector<std::pair<int64_t, float>> eligible;
+    eligible.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        if (invalid.empty() || !invalid.test(candidate.first)) {
+            eligible.emplace_back(candidate);
+        }
+    }
+    auto iterator = std::make_shared<VectorIterator>(
+        /*chunk_count=*/1, /*offset_mapping=*/nullptr);
+    iterator->AddIterator(std::make_shared<SequenceIterator>(eligible));
+    iterator->seal();
+    return iterator;
+}
+
+}  // namespace
+
+TEST(StrictGroupPhase2PlannerTest, UsesOneBatchBelowTenPercent) {
+    auto plan = BuildStrictGroupPhase2Plan(
+        /*eligible_rows=*/10000, /*group_row_counts=*/{200, 300, 499});
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan->batches, (std::vector<std::vector<size_t>>{{0, 1, 2}}));
+}
+
+TEST(StrictGroupPhase2PlannerTest, SplitsSmallGroupsAndCombinesLargeGroups) {
+    std::vector<size_t> counts(12, 90);  // every group is below 1%
+    counts.emplace_back(100);            // exactly 1% is large
+    counts.emplace_back(800);            // large
+
+    auto plan = BuildStrictGroupPhase2Plan(/*eligible_rows=*/10000, counts);
+    ASSERT_TRUE(plan.has_value());
+    ASSERT_EQ(plan->batches.size(), 3);
+    EXPECT_EQ(plan->batches[0],
+              (std::vector<size_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
+    EXPECT_EQ(plan->batches[1], (std::vector<size_t>{11}));
+    EXPECT_EQ(plan->batches[2], (std::vector<size_t>{12, 13}));
+}
+
+TEST(StrictGroupPhase2PlannerTest, TenPercentBoundaryUsesSplitBranch) {
+    auto plan = BuildStrictGroupPhase2Plan(
+        /*eligible_rows=*/1000, /*group_row_counts=*/{9, 9, 82});
+    ASSERT_TRUE(plan.has_value());
+    ASSERT_EQ(plan->batches.size(), 2);
+    EXPECT_EQ(plan->batches[0], (std::vector<size_t>{0, 1}));
+    EXPECT_EQ(plan->batches[1], (std::vector<size_t>{2}));
+}
+
+TEST(StrictGroupPhase2PlannerTest, RejectsEmptyInput) {
+    EXPECT_FALSE(BuildStrictGroupPhase2Plan(0, {1}).has_value());
+    EXPECT_FALSE(BuildStrictGroupPhase2Plan(10, {}).has_value());
+}
+
+TEST(StrictGroupPhase2ExecutorTest,
+     LocksGroupsAndRecreatesOneFilteredIterator) {
+    constexpr int64_t kRowCount = 120;
+    auto schema = std::make_shared<Schema>();
+    auto pk_field = schema->AddDebugField("pk", DataType::INT64);
+    auto group_field = schema->AddDebugField("group", DataType::INT64);
+    schema->set_primary_field_id(pk_field);
+    auto data = segcore::DataGen(schema,
+                                 kRowCount,
+                                 /*seed=*/42,
+                                 /*ts_offset=*/0,
+                                 /*repeat_count=*/4);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, data);
+    auto group_values = data.get_col<int64_t>(group_field);
+
+    std::unordered_map<int64_t, std::vector<int64_t>> rows_by_group;
+    for (int64_t offset = 0; offset < kRowCount; ++offset) {
+        rows_by_group[group_values[offset]].emplace_back(offset);
+    }
+    std::vector<int64_t> locked_groups;
+    for (const auto& [group, rows] : rows_by_group) {
+        if (rows.size() >= 3) {
+            locked_groups.emplace_back(group);
+            if (locked_groups.size() == 2) {
+                break;
+            }
+        }
+    }
+    ASSERT_EQ(locked_groups.size(), 2);
+
+    std::vector<std::pair<int64_t, float>> candidates;
+    candidates.emplace_back(rows_by_group[locked_groups[0]][0], 0.0F);
+    candidates.emplace_back(rows_by_group[locked_groups[1]][0], 1.0F);
+    for (int64_t offset = 0; offset < kRowCount; ++offset) {
+        if (offset != candidates[0].first && offset != candidates[1].first) {
+            candidates.emplace_back(offset,
+                                    static_cast<float>(candidates.size()));
+        }
+    }
+
+    SearchResult search_result;
+    search_result.total_nq_ = 1;
+    search_result.total_data_cnt_ = kRowCount;
+    search_result.vector_iterators_ =
+        std::vector<std::shared_ptr<VectorIterator>>{
+            MakeSequenceVectorIterator(candidates)};
+
+    int recreate_count = 0;
+    TargetBitmap observed_filter;
+    search_result.SetVectorIteratorRecreator(
+        BitsetView{},
+        [&](const BitsetView& invalid, SearchResult& recreated_result) {
+            ++recreate_count;
+            observed_filter = TargetBitmap(invalid.size(), false);
+            for (size_t i = 0; i < invalid.size(); ++i) {
+                observed_filter[i] = invalid.test(i);
+            }
+            recreated_result.vector_iterators_ =
+                std::vector<std::shared_ptr<VectorIterator>>{
+                    MakeSequenceVectorIterator(candidates, invalid)};
+        });
+
+    SearchInfo search_info;
+    search_info.topk_ = 2;
+    search_info.group_size_ = 3;
+    search_info.strict_group_size_ = true;
+    search_info.group_by_field_id_ = group_field;
+    search_info.metric_type_ = knowhere::metric::L2;
+    std::vector<GroupByValueType> output_groups;
+    std::vector<int64_t> offsets;
+    std::vector<float> distances;
+    std::vector<size_t> prefix_sum;
+    SearchGroupBy(nullptr,
+                  *search_result.vector_iterators_,
+                  search_info,
+                  output_groups,
+                  *segment,
+                  offsets,
+                  distances,
+                  prefix_sum,
+                  &search_result);
+
+    EXPECT_EQ(recreate_count, 1);
+    EXPECT_EQ(offsets.size(), 6);
+    EXPECT_EQ(prefix_sum, (std::vector<size_t>{0, 6}));
+    EXPECT_TRUE(observed_filter[candidates[0].first]);
+    EXPECT_TRUE(observed_filter[candidates[1].first]);
+    std::unordered_map<int64_t, size_t> output_counts;
+    for (auto offset : offsets) {
+        ++output_counts[group_values[offset]];
+    }
+    EXPECT_EQ(output_counts[locked_groups[0]], 3);
+    EXPECT_EQ(output_counts[locked_groups[1]], 3);
+    for (int64_t offset = 0; offset < kRowCount; ++offset) {
+        auto belongs_to_locked_group =
+            group_values[offset] == locked_groups[0] ||
+            group_values[offset] == locked_groups[1];
+        if (!belongs_to_locked_group) {
+            EXPECT_TRUE(observed_filter[offset]);
+        }
+    }
+}
 
 TEST(GroupByMapTest, StrictTracksLockedGroupsAndRemainingQuota) {
     GroupByMap<int64_t> groups(/*group_capacity=*/2,
