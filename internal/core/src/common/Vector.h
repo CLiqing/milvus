@@ -23,6 +23,7 @@
 #include "bitset/bitset.h"
 #include "common/FieldData.h"
 #include "common/FieldDataInterface.h"
+#include "common/FilterMap.h"
 #include "common/Types.h"
 
 namespace milvus {
@@ -133,8 +134,16 @@ class ColumnVector final : public SimpleVector {
         : SimpleVector(DataType::INT8, bitmap.size()),
           is_bitmap_(true),
           valid_values_(std::move(valid_bitmap)) {
-        values_ = std::make_shared<FieldBitsetImpl<uint8_t>>(DataType::INT8,
-                                                             std::move(bitmap));
+        bitmap_values_ = std::make_shared<TargetBitmap>(std::move(bitmap));
+    }
+
+    ColumnVector(FilterMap&& bitmap, TargetBitmap&& valid_bitmap)
+        : SimpleVector(DataType::INT8, bitmap.size()),
+          is_bitmap_(true),
+          valid_values_(std::move(valid_bitmap)),
+          filter_map_(std::move(bitmap)) {
+        AssertInfo(valid_values_.size() == length_,
+                   "FilterMap validity must match its universe");
     }
 
     ColumnVector(FieldDataPtr&& value,
@@ -179,7 +188,7 @@ class ColumnVector final : public SimpleVector {
     void
     SetValueAt(size_t index, const T& value) {
         AssertInfo(index < length_, "SetValueAt index out of range");
-        *(reinterpret_cast<T*>(values_->Data()) + index) = value;
+        *(reinterpret_cast<T*>(GetRawData()) + index) = value;
     }
 
     void
@@ -212,7 +221,30 @@ class ColumnVector final : public SimpleVector {
 
     void*
     GetRawData() const {
+        if (is_bitmap_) {
+            // Legacy writable access consumes the map rather than exposing a
+            // mutable alias to its COW storage. Existing snapshots stay intact.
+            if (filter_map_) {
+                bitmap_values_ = std::make_shared<TargetBitmap>(
+                    std::move(*filter_map_).TakeDense());
+                filter_map_.reset();
+            }
+            return bitmap_values_->data();
+        }
         return values_->Data();
+    }
+
+    // Publication boundary: no raw writable borrow may survive this call.
+    // Likewise, GetRawData invalidates this borrowed map reference. A consumer
+    // needing an independent snapshot must copy the FilterMap, not the vector.
+    const FilterMap&
+    GetFilterMap() const {
+        AssertInfo(is_bitmap_, "Only bitmap vectors carry FilterMap");
+        if (!filter_map_) {
+            filter_map_.emplace(FilterMap::FromDense(bitmap_values_));
+            bitmap_values_.reset();
+        }
+        return *filter_map_;
     }
 
     void*
@@ -223,7 +255,7 @@ class ColumnVector final : public SimpleVector {
     template <typename As>
     As*
     RawAsValues() const {
-        return reinterpret_cast<As*>(values_->Data());
+        return reinterpret_cast<As*>(GetRawData());
     }
 
     bool
@@ -276,6 +308,7 @@ class ColumnVector final : public SimpleVector {
 
     void
     append(const ColumnVector& other) {
+        AssertInfo(!is_bitmap_, "Cannot append to bitmap column vector");
         // Validate that both vectors have the same type
         AssertInfo(type() == other.type(),
                    "Cannot append ColumnVector with different type: {} != {}",
@@ -336,7 +369,7 @@ class ColumnVector final : public SimpleVector {
         }
 
         const uint64_t* data =
-            reinterpret_cast<const uint64_t*>(values_->Data());
+            reinterpret_cast<const uint64_t*>(GetRawData());
         const uint64_t* valid =
             reinterpret_cast<const uint64_t*>(valid_values_.data());
 
@@ -378,7 +411,7 @@ class ColumnVector final : public SimpleVector {
         }
 
         const uint64_t* data =
-            reinterpret_cast<const uint64_t*>(values_->Data());
+            reinterpret_cast<const uint64_t*>(GetRawData());
         const uint64_t* valid =
             reinterpret_cast<const uint64_t*>(valid_values_.data());
 
@@ -412,6 +445,8 @@ class ColumnVector final : public SimpleVector {
     bool is_bitmap_;  // TODO: remove the field after implementing BitmapVector
     FieldDataPtr values_;
     TargetBitmap valid_values_;  // false means the value is null
+    mutable std::shared_ptr<TargetBitmap> bitmap_values_;
+    mutable std::optional<FilterMap> filter_map_;
 };
 
 using ColumnVectorPtr = std::shared_ptr<ColumnVector>;

@@ -538,6 +538,15 @@ FilterMap::GetStorage() const {
     return *storage_;
 }
 
+TargetBitmap
+FilterMap::TakeDense() && {
+    EnsureDense();
+    auto result = std::move(GetMutableDense());
+    storage_.reset();
+    ++revision_;
+    return result;
+}
+
 FilterMap::Storage&
 FilterMap::GetMutableStorage() {
     if (storage_ == nullptr) {

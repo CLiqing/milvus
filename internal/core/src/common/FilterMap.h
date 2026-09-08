@@ -118,6 +118,11 @@ class FilterMap {
     const TargetBitmap&
     EnsureDense();
 
+    // Transfers ownership to a legacy mutable consumer. Consumes this map;
+    // shared snapshots are detached, uniquely owned Dense bytes are moved.
+    TargetBitmap
+    TakeDense() &&;
+
  private:
     struct Storage;
 

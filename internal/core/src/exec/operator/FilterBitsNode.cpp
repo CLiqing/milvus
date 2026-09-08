@@ -166,6 +166,7 @@ PhyFilterBitsNode::GetOutput() {
                 cached.result->clone(),
                 cached.valid_result ? cached.valid_result->clone()
                                     : TargetBitmap(need_process_rows_, true)));
+            std::static_pointer_cast<ColumnVector>(col_res.back())->GetFilterMap();
             return std::make_shared<RowVector>(col_res);
         }
     }
@@ -220,6 +221,7 @@ PhyFilterBitsNode::GetOutput() {
         }
 
         std::vector<VectorPtr> col_res;
+        col_vec->GetFilterMap();
         col_res.push_back(std::move(results_[0]));
 
         std::chrono::high_resolution_clock::time_point scalar_end =
@@ -287,6 +289,7 @@ PhyFilterBitsNode::GetOutput() {
     std::vector<VectorPtr> col_res;
     col_res.push_back(std::make_shared<ColumnVector>(std::move(bitset),
                                                      std::move(valid_bitset)));
+    std::static_pointer_cast<ColumnVector>(col_res.back())->GetFilterMap();
     std::chrono::high_resolution_clock::time_point scalar_end =
         std::chrono::high_resolution_clock::now();
     double scalar_cost =
