@@ -16,7 +16,7 @@
 namespace milvus {
 namespace {
 
-struct SparseExceptionBitmapRep {
+struct SparseBitmapRep {
     bool default_bit;
     size_t exception_cap;
     std::vector<int32_t> exceptions;
@@ -143,7 +143,8 @@ AppendBitmapExceptionsWithPolarity(TargetBitmapView source,
 }  // namespace
 
 struct FilterMap::Storage {
-    Storage(size_t universe, SparseExceptionBitmapRep sparse)
+    enum class Construction { Fresh, Bitmap, UniqueIds, Finished };
+    Storage(size_t universe, SparseBitmapRep sparse)
         : universe(universe), value(std::move(sparse)) {
     }
 
@@ -152,11 +153,43 @@ struct FilterMap::Storage {
     }
 
     size_t universe;
-    std::variant<SparseExceptionBitmapRep, DenseBitmapRep> value;
+    Construction construction = Construction::Fresh;
+    size_t next_bitmap_offset = 0;
+    std::variant<SparseBitmapRep, DenseBitmapRep> value;
 };
 
 FilterMap::FilterMap(std::shared_ptr<Storage> storage)
     : storage_(std::move(storage)) {
+}
+
+FilterMap::FilterMap(FilterMap&& other) noexcept
+    : storage_(std::move(other.storage_)),
+      inverted_(other.inverted_),
+      construction_finished_(other.construction_finished_) {
+    ++other.revision_;
+}
+
+FilterMap&
+FilterMap::operator=(const FilterMap& other) {
+    if (this != &other) {
+        storage_ = other.storage_;
+        inverted_ = other.inverted_;
+        construction_finished_ = other.construction_finished_;
+    }
+    ++revision_;
+    return *this;
+}
+
+FilterMap&
+FilterMap::operator=(FilterMap&& other) noexcept {
+    if (this != &other) {
+        storage_ = std::move(other.storage_);
+        inverted_ = other.inverted_;
+        construction_finished_ = other.construction_finished_;
+        ++other.revision_;
+    }
+    ++revision_;
+    return *this;
 }
 
 FilterMap
@@ -164,14 +197,17 @@ FilterMap::FromDense(std::shared_ptr<TargetBitmap> dense) {
     if (dense == nullptr) {
         throw std::invalid_argument("Dense FilterMap requires an owner");
     }
-    return FilterMap(std::make_shared<Storage>(
-        dense->size(), DenseBitmapRep{std::move(dense)}));
+    const auto universe = dense->size();
+    auto storage =
+        std::make_shared<Storage>(universe, DenseBitmapRep{std::move(dense)});
+    storage->construction = Storage::Construction::Finished;
+    return FilterMap(std::move(storage));
 }
 
 FilterMap
 FilterMap::Adaptive(size_t universe, bool default_bit, size_t exception_cap) {
     ValidateUniverse(universe, exception_cap);
-    SparseExceptionBitmapRep sparse{default_bit, exception_cap, {}};
+    SparseBitmapRep sparse{default_bit, exception_cap, {}};
     sparse.exceptions.reserve(exception_cap);
     return FilterMap(std::make_shared<Storage>(universe, std::move(sparse)));
 }
@@ -195,11 +231,13 @@ size_t
 FilterMap::count() const {
     const auto& storage = GetStorage();
     if (const auto* dense = std::get_if<DenseBitmapRep>(&storage.value)) {
-        return dense->bitmap->count();
+        const auto count = dense->bitmap->count();
+        return inverted_ ? storage.universe - count : count;
     }
-    const auto& sparse = std::get<SparseExceptionBitmapRep>(storage.value);
-    return sparse.default_bit ? storage.universe - sparse.exceptions.size()
-                              : sparse.exceptions.size();
+    const auto& sparse = std::get<SparseBitmapRep>(storage.value);
+    return (sparse.default_bit != inverted_)
+               ? storage.universe - sparse.exceptions.size()
+               : sparse.exceptions.size();
 }
 
 bool
@@ -207,12 +245,12 @@ FilterMap::test(size_t id) const {
     CheckId(id);
     const auto& storage = GetStorage();
     if (const auto* dense = std::get_if<DenseBitmapRep>(&storage.value)) {
-        return (*dense->bitmap)[id];
+        return (*dense->bitmap)[id] != inverted_;
     }
-    const auto& sparse = std::get<SparseExceptionBitmapRep>(storage.value);
-    return Contains(sparse.exceptions, static_cast<int32_t>(id))
-               ? !sparse.default_bit
-               : sparse.default_bit;
+    const auto& sparse = std::get<SparseBitmapRep>(storage.value);
+    return (Contains(sparse.exceptions, static_cast<int32_t>(id))
+                ? !sparse.default_bit
+                : sparse.default_bit) != inverted_;
 }
 
 void
@@ -228,13 +266,15 @@ FilterMap::reset(size_t id) {
 void
 FilterMap::set(size_t id, bool value) {
     CheckId(id);
+    value = value != inverted_;
     auto& storage = GetMutableStorage();
+    storage.construction = Storage::Construction::Finished;
     if (std::holds_alternative<DenseBitmapRep>(storage.value)) {
         GetMutableDense().set(id, value);
         return;
     }
 
-    auto& sparse = std::get<SparseExceptionBitmapRep>(storage.value);
+    auto& sparse = std::get<SparseBitmapRep>(storage.value);
     const auto row_id = static_cast<int32_t>(id);
     const auto it =
         std::find(sparse.exceptions.begin(), sparse.exceptions.end(), row_id);
@@ -257,13 +297,21 @@ FilterMap::set(size_t id, bool value) {
     GetMutableDense().set(id, value);
 }
 
+void
+FilterMap::flip() {
+    (void)GetStorage();
+    inverted_ = !inverted_;
+    construction_finished_ = true;
+    ++revision_;
+}
+
 FilterMapCapability
 FilterMap::capability() const {
     const auto& storage = GetStorage();
     if (std::holds_alternative<DenseBitmapRep>(storage.value)) {
         return FilterMapCapability::RandomMembership;
     }
-    if (std::get<SparseExceptionBitmapRep>(storage.value).default_bit) {
+    if (std::get<SparseBitmapRep>(storage.value).default_bit != inverted_) {
         return FilterMapCapability::EnumerateOnly;
     }
     throw std::logic_error(
@@ -283,13 +331,24 @@ FilterMap::AssignBitmapBatch(TargetBitmapView source,
     if (offset > universe || source.size() > universe - offset) {
         throw std::out_of_range("FilterMap batch exceeds universe");
     }
+    const auto& prior = GetStorage();
+    if (construction_finished_ ||
+        (prior.construction != Storage::Construction::Fresh &&
+         prior.construction != Storage::Construction::Bitmap) ||
+        offset < prior.next_bitmap_offset) {
+        throw std::logic_error(
+            "FilterMap bitmap batches require increasing, disjoint initial "
+            "construction");
+    }
+    auto& storage = GetMutableStorage();
+    storage.construction = Storage::Construction::Bitmap;
+    storage.next_bitmap_offset = offset + source.size();
     if (IsDense()) {
         WriteDenseBatch(source, validity, offset, invert);
         return;
     }
 
-    auto& storage = GetMutableStorage();
-    auto& sparse = std::get<SparseExceptionBitmapRep>(storage.value);
+    auto& sparse = std::get<SparseBitmapRep>(storage.value);
     const auto retained_prefix = sparse.exceptions.size();
 
     // exception = logical XOR default_bit, while logical is source XOR
@@ -350,6 +409,12 @@ FilterMap::AssignBitmapBatch(TargetBitmapView source,
 void
 FilterMap::AppendUniqueBits(std::span<const int32_t> ids, bool value) {
     const auto universe = size();
+    const auto mode = GetStorage().construction;
+    if (construction_finished_ || (mode != Storage::Construction::Fresh &&
+                                   mode != Storage::Construction::UniqueIds)) {
+        throw std::logic_error(
+            "FilterMap unique-ID batches require unmixed initial construction");
+    }
     for (const auto id : ids) {
         if (id < 0 || static_cast<size_t>(id) >= universe) {
             throw std::out_of_range(
@@ -361,6 +426,7 @@ FilterMap::AppendUniqueBits(std::span<const int32_t> ids, bool value) {
     }
 
     auto& storage = GetMutableStorage();
+    storage.construction = Storage::Construction::UniqueIds;
     if (std::holds_alternative<DenseBitmapRep>(storage.value)) {
         auto& dense = GetMutableDense();
         for (const auto id : ids) {
@@ -369,7 +435,7 @@ FilterMap::AppendUniqueBits(std::span<const int32_t> ids, bool value) {
         return;
     }
 
-    auto& sparse = std::get<SparseExceptionBitmapRep>(storage.value);
+    auto& sparse = std::get<SparseBitmapRep>(storage.value);
     if (value == sparse.default_bit) {
         return;
     }
@@ -392,14 +458,20 @@ FilterMap::AppendUniqueBits(std::span<const int32_t> ids, bool value) {
 size_t
 FilterMap::ReadUnsetBatch(FilterMapCursor& cursor,
                           std::span<int32_t> output) const {
+    if (cursor.owner_ != nullptr &&
+        (cursor.owner_ != this || cursor.revision_ != revision_)) {
+        throw std::logic_error(
+            "FilterMap cursor was invalidated or belongs to another map");
+    }
     if (output.empty()) {
         return 0;
     }
 
     const auto& storage = GetStorage();
-    if (const auto* sparse =
-            std::get_if<SparseExceptionBitmapRep>(&storage.value);
-        sparse != nullptr && sparse->default_bit) {
+    cursor.owner_ = this;
+    cursor.revision_ = revision_;
+    if (const auto* sparse = std::get_if<SparseBitmapRep>(&storage.value);
+        sparse != nullptr && (sparse->default_bit != inverted_)) {
         const auto remaining =
             sparse->exceptions.size() -
             std::min(cursor.position, sparse->exceptions.size());
@@ -412,22 +484,50 @@ FilterMap::ReadUnsetBatch(FilterMapCursor& cursor,
         return count;
     }
 
+    const auto* dense = std::get_if<DenseBitmapRep>(&storage.value);
+    if (dense == nullptr) {
+        throw std::logic_error(
+            "default-zero Sparse FilterMap requires EnsureDense for unset-ID "
+            "access");
+    }
+    using Word = TargetBitmapView::data_type;
+    constexpr size_t bits = sizeof(Word) * 8;
     size_t written = 0;
-    while (cursor.position < storage.universe && written < output.size()) {
-        const auto id = cursor.position++;
-        if (!test(id)) {
-            output[written++] = static_cast<int32_t>(id);
+    while (cursor.position < storage.universe) {
+        const size_t base = cursor.position / bits * bits;
+        const size_t used = std::min(bits, storage.universe - base);
+        const Word stored = dense->bitmap->data()[base / bits];
+        Word word = inverted_ ? stored : ~stored;
+        word &= ~Word{0} << (cursor.position - base);
+        if (used < bits) {
+            word &= (Word{1} << used) - 1;
         }
+        while (word != 0) {
+            const size_t id = base + std::countr_zero(word);
+            output[written++] = static_cast<int32_t>(id);
+            cursor.position = id + 1;
+            word &= word - 1;
+            if (written == output.size()) {
+                return written;
+            }
+        }
+        cursor.position = base + used;
     }
     return written;
 }
 
-TargetBitmap&
+const TargetBitmap&
 FilterMap::EnsureDense() {
     if (!IsDense()) {
         PromoteToDense();
     }
-    return GetMutableDense();
+    auto& storage = GetMutableStorage();
+    storage.construction = Storage::Construction::Finished;
+    if (inverted_) {
+        GetMutableDense().flip();
+        inverted_ = false;
+    }
+    return *std::get<DenseBitmapRep>(storage.value).bitmap;
 }
 
 const FilterMap::Storage&
@@ -446,6 +546,7 @@ FilterMap::GetMutableStorage() {
     if (!storage_.unique()) {
         storage_ = std::make_shared<Storage>(*storage_);
     }
+    ++revision_;
     return *storage_;
 }
 
@@ -465,7 +566,7 @@ FilterMap::GetMutableDense() {
 void
 FilterMap::PromoteToDense() {
     auto& storage = GetMutableStorage();
-    auto* sparse = std::get_if<SparseExceptionBitmapRep>(&storage.value);
+    auto* sparse = std::get_if<SparseBitmapRep>(&storage.value);
     if (sparse == nullptr) {
         return;
     }
