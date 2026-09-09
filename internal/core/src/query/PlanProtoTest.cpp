@@ -331,15 +331,15 @@ TEST(PlanProto, ParsesAnnFilterFusingRequestIndependentlyFromIterative) {
     ProtoParser parser(schema);
 
     auto no_hint = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
-    auto parsed = parser.ParseSearchInfo(no_hint.vector_anns());
+    auto parsed = parser.PlanNodeFromProto(no_hint)->search_info_;
     EXPECT_EQ(parsed.ann_filter_fusing_request,
               AnnFilterFusingRequest::Baseline);
     EXPECT_FALSE(parsed.iterative_filter_execution);
 
     auto top_level = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
     top_level.mutable_vector_anns()->mutable_query_info()->set_hints(
-        milvus::DOWNPUSH);
-    parsed = parser.ParseSearchInfo(top_level.vector_anns());
+        DOWNPUSH);
+    parsed = parser.PlanNodeFromProto(top_level)->search_info_;
     EXPECT_EQ(parsed.ann_filter_fusing_request,
               AnnFilterFusingRequest::ExplicitFusing);
     EXPECT_FALSE(parsed.iterative_filter_execution);
@@ -348,15 +348,15 @@ TEST(PlanProto, ParsesAnnFilterFusingRequestIndependentlyFromIterative) {
     search_params.mutable_vector_anns()
         ->mutable_query_info()
         ->set_search_params(R"({"hints":"downpush"})");
-    parsed = parser.ParseSearchInfo(search_params.vector_anns());
+    parsed = parser.PlanNodeFromProto(search_params)->search_info_;
     EXPECT_EQ(parsed.ann_filter_fusing_request,
               AnnFilterFusingRequest::ExplicitFusing);
     EXPECT_FALSE(parsed.iterative_filter_execution);
 
     auto iterative = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
     iterative.mutable_vector_anns()->mutable_query_info()->set_hints(
-        milvus::ITERATIVE_FILTER);
-    parsed = parser.ParseSearchInfo(iterative.vector_anns());
+        ITERATIVE_FILTER);
+    parsed = parser.PlanNodeFromProto(iterative)->search_info_;
     EXPECT_EQ(parsed.ann_filter_fusing_request,
               AnnFilterFusingRequest::Baseline);
     EXPECT_TRUE(parsed.iterative_filter_execution);

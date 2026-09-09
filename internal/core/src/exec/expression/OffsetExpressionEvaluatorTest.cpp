@@ -17,6 +17,7 @@
 #include "expr/ITypeExpr.h"
 #include "segcore/SegmentSealed.h"
 #include "test_utils/DataGen.h"
+#include "test_utils/storage_test_utils.h"
 
 namespace milvus::exec {
 namespace {
@@ -39,12 +40,13 @@ struct EvaluatorFixture {
             ids[row] = row;
             values[row] = row - 100;
         }
-        InsertCol(insert_data.get(), ids, (*schema)[id_field], false);
+        segcore::InsertCol(insert_data.get(), ids, (*schema)[id_field], false);
         // For a nullable field random_valid=false produces the deterministic
         // validity pattern row % 2 == 0.
-        InsertCol(insert_data.get(), values, (*schema)[value_field], false);
+        segcore::InsertCol(
+            insert_data.get(), values, (*schema)[value_field], false);
 
-        GeneratedData data;
+        segcore::GeneratedData data;
         data.schema_ = schema;
         data.raw_ = insert_data.release();
         data.raw_->set_num_rows(kRows);
@@ -52,7 +54,7 @@ struct EvaluatorFixture {
             data.row_ids_.push_back(row);
             data.timestamps_.push_back(row);
         }
-        segcore::LoadGeneratedDataIntoSegment(data, segment.get(), true);
+        LoadGeneratedDataIntoSegment(data, segment.get(), true);
 
         query_context = std::make_unique<QueryContext>(
             "offset-expression-test", segment.get(), kRows, MAX_TIMESTAMP);
