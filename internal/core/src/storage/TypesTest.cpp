@@ -21,6 +21,9 @@
 namespace milvus::storage {
 namespace {
 
+// Older standard libraries do not support constexpr std::string yet.
+// Keep the runtime test below on those toolchains.
+#if defined(__cpp_lib_constexpr_string) && __cpp_lib_constexpr_string >= 201907L
 consteval bool
 DefaultIndexMetaHasSafeValues() {
     IndexMeta index_meta;
@@ -35,6 +38,7 @@ DefaultIndexMetaHasSafeValues() {
 }
 
 static_assert(DefaultIndexMetaHasSafeValues());
+#endif
 
 TEST(StorageTypesTest, DefaultIndexMetaHasSafeValues) {
     IndexMeta index_meta;
