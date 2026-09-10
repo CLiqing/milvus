@@ -1,5 +1,9 @@
 # Explicit ann_fusing through the shared offset evaluator
 
+Acceptance correction (2026-09-10): the historical performance graph has a
+confirmed reachability defect. Its ABBA timings do not establish performance
+benefit at acceptable recall. See [the recall investigation](20260910-ann-fusing-recall-investigation.md).
+
 This is the clean Stage 2 / Stage 3A development slice, not a production-ready
 filter planner. `ann_fusing` is the public hint. Historical benchmark binaries
 use the old spelling `downpush`; that is not an additional new hint alias.
