@@ -319,6 +319,23 @@ FilterMap::capability() const {
 }
 
 void
+FilterMap::InplaceOr(TargetBitmapView mask) {
+    if (mask.size() != size()) {
+        throw std::invalid_argument("FilterMap OR requires the same universe");
+    }
+    auto& storage = GetMutableStorage();
+    storage.construction = Storage::Construction::Finished;
+    construction_finished_ = true;
+    if (auto* sparse = std::get_if<SparseBitmapRep>(&storage.value);
+        sparse != nullptr && sparse->default_bit != inverted_) {
+        std::erase_if(sparse->exceptions, [&](int32_t id) { return mask[id]; });
+        return;
+    }
+    EnsureDense();
+    GetMutableDense().inplace_or(mask, mask.size());
+}
+
+void
 FilterMap::AssignBitmapBatch(TargetBitmapView source,
                              const TargetBitmapView* validity,
                              size_t offset,

@@ -81,6 +81,11 @@ class FilterMap {
     void
     flip();
 
+    // Logical OR with a same-universe bitmap (e.g. visibility exclusions).
+    // Retains enumerable zero exceptions when possible; preserves COW.
+    void
+    InplaceOr(TargetBitmapView mask);
+
     FilterMapCapability
     capability() const;
 

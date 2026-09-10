@@ -512,5 +512,54 @@ TEST(FilterMapTest, FlipClosesConstructionAndRespectsNullBits) {
     EXPECT_TRUE(map.test(6));
 }
 
+TEST(FilterMapTest, VisibilityOrPreservesEnumerableSnapshot) {
+    auto map = FilterMap::Adaptive(129, true, 4);
+    const std::array<int32_t, 4> ids{128, 0, 64, 31};
+    map.AppendUniqueBits(ids, false);
+    auto snapshot = map;
+    FilterMapCursor cursor;
+    std::array<int32_t, 1> out;
+    map.ReadUnsetBatch(cursor, out);
+    auto mask = MakeBitmap(129, {0, 31, 63});
+    map.InplaceOr(TargetBitmapView(mask));
+    EXPECT_EQ(map.capability(), FilterMapCapability::EnumerateOnly);
+    EXPECT_EQ(CollectUnset(map), (std::vector<int32_t>{128, 64}));
+    EXPECT_EQ(CollectUnset(snapshot), (std::vector<int32_t>{128, 0, 64, 31}));
+    EXPECT_THROW(map.ReadUnsetBatch(cursor, out), std::logic_error);
+    EXPECT_EQ(map.count(), 127);
+}
+
+TEST(FilterMapTest, VisibilityOrHandlesBothPolaritiesAndDense) {
+    for (bool default_bit : {false, true}) {
+        for (bool invert : {false, true}) {
+            for (size_t cap : {size_t{1}, size_t{10}}) {
+                auto map = FilterMap::Adaptive(129, default_bit, cap);
+                map.set(0, !default_bit);
+                map.set(64, !default_bit);
+                if (invert) {
+                    map.flip();
+                }
+                std::vector<bool> expected(129);
+                for (size_t i = 0; i < 129; ++i) {
+                    expected[i] = map.test(i);
+                }
+                auto mask = MakeBitmap(129, {1, 64, 128});
+                map.InplaceOr(TargetBitmapView(mask));
+                for (size_t i = 0; i < 129; ++i) {
+                    EXPECT_EQ(map.test(i), expected[i] || mask[i]);
+                }
+            }
+        }
+    }
+}
+
+TEST(FilterMapTest, VisibilityOrRejectsWrongUniverseWithoutMutation) {
+    auto map = FilterMap::Adaptive(65, true, 1);
+    map.reset(64);
+    auto wrong = MakeBitmap(64, {0});
+    EXPECT_THROW(map.InplaceOr(TargetBitmapView(wrong)), std::invalid_argument);
+    EXPECT_EQ(CollectUnset(map), (std::vector<int32_t>{64}));
+}
+
 }  // namespace
 }  // namespace milvus

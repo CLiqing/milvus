@@ -247,6 +247,14 @@ class ColumnVector final : public SimpleVector {
         return *filter_map_;
     }
 
+    // Mutating publication boundary: previously borrowed map references and
+    // cursors must not be retained by the caller. Independent snapshots use COW.
+    void
+    ApplyFilterMask(TargetBitmapView excluded) {
+        GetFilterMap();
+        filter_map_->InplaceOr(excluded);
+    }
+
     void*
     GetValidRawData() {
         return valid_values_.data();
