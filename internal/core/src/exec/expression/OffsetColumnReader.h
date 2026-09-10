@@ -70,6 +70,30 @@ class OffsetColumnReader {
         transient_.reset();
     }
 
+    // Copy only requested values in caller order. Consume each span before
+    // the next Read may evict its owner; no unowned spans escape this gather.
+    // Validity accompanies the values, but predicate semantics stay in Expr.
+    template <typename T>
+    bool
+    Gather(milvus::OpContext* context,
+           const int32_t* rows,
+           size_t count,
+           T* values,
+           bool* valid) {
+        bool all_valid = true;
+        for (size_t i = 0; i < count; ++i) {
+            int64_t offset;
+            auto span = Read(context, rows[i], offset);
+            AssertInfo(span.element_sizeof() == sizeof(T),
+                       "offset reader scalar width mismatch");
+            auto chunk = static_cast<Span<T>>(span);
+            values[i] = chunk[offset];
+            valid[i] = chunk.is_valid(offset);
+            all_valid &= valid[i];
+        }
+        return all_valid;
+    }
+
     size_t reads() const { return reads_; }
     size_t misses() const { return misses_; }
     size_t peak_bytes() const { return peak_bytes_; }

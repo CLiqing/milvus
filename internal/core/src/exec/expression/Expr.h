@@ -1042,21 +1042,24 @@ class SegmentExpr : public Expr {
                         }
                     }
                     if (offset_reader_) {
-                        // Preserve the existing size=1 MOD kernel and input
-                        // order. This step changes only read preparation and
-                        // pin lifetime, not batch arithmetic or skip semantics.
-                        for (size_t i = 0; i < input->size(); ++i) {
-                            int64_t offset;
-                            auto span = offset_reader_->Read(
-                                op_ctx_, (*input)[i], offset);
-                            AssertInfo(span.element_sizeof() == sizeof(T),
-                                       "offset reader scalar width mismatch");
-                            auto chunk = static_cast<Span<T>>(span);
+                        // Bound scratch space even for large iterative input.
+                        // Gather in input order, then reuse the SAME random
+                        // arithmetic kernel; do not switch to SIMD semantics.
+                        constexpr size_t kGatherRows = 64;
+                        std::array<T, kGatherRows> gathered;
+                        std::array<bool, kGatherRows> validity;
+                        for (size_t i = 0; i < input->size(); i += kGatherRows) {
+                            const auto count =
+                                std::min(kGatherRows, input->size() - i);
+                            const bool all_valid = offset_reader_->Gather<T>(
+                                op_ctx_, input->data() + i, count,
+                                gathered.data(), validity.data());
                             evaluate_batch.template operator()<FilterType::random>(
-                                chunk.data() + offset,
-                                chunk.validity().Subview(offset),
+                                gathered.data(),
+                                all_valid ? ValidityView{}
+                                          : ValidityView::FromExpanded(validity.data()),
                                 nullptr,
-                                1,
+                                count,
                                 res + i,
                                 valid_res + i,
                                 values...);
