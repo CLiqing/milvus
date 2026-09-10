@@ -18,6 +18,7 @@
 #include "exec/expression/OffsetExpressionEvaluator.h"
 #include "exec/expression/OffsetExpressionCallback.h"
 #include "expr/ITypeExpr.h"
+#include "knowhere/index/index_factory.h"
 #include "segcore/SegmentSealed.h"
 #include "test_utils/DataGen.h"
 #include "test_utils/storage_test_utils.h"
@@ -327,6 +328,96 @@ TEST(OffsetExpressionCallbackTest, DirectVersusCallbackBatch32Overhead) {
         RecordProperty("direct_us_" + std::to_string(round), std::to_string((a1 + a2) / 2));
         RecordProperty("callback_us_" + std::to_string(round), std::to_string((b1 + b2) / 2));
     }
+}
+
+TEST(AnnFusingGraphDemoTest, SharedModCallbackAndUnsupportedFallback) {
+    EvaluatorFixture fixture({}, false);
+    constexpr int dim =
+        64;  // Functional smoke only, NOT the 768D performance anchor.
+    std::vector<float> vectors(fixture.kRows * dim);
+    for (int row = 0; row < fixture.kRows; ++row) {
+        for (int col = 0; col < dim; ++col) {
+            vectors[row * dim + col] = float((row * 17 + col * 31) % 997) / 997;
+        }
+    }
+    auto index = knowhere::IndexFactory::Instance()
+                     .Create<knowhere::fp32>("HNSW", 10)
+                     .value();
+    auto dataset = knowhere::GenDataSet(fixture.kRows, dim, vectors.data());
+    knowhere::Json config = {{"dim", dim},
+                             {"metric_type", "L2"},
+                             {"M", 16},
+                             {"efConstruction", 100},
+                             // Compare semantic filtering against raw L2,
+                             // not the default RBQ8 refinement approximation.
+                             {"refine_quant_type", "NONE"},
+                             {"index_algo", "GRAPH"}};
+    ASSERT_EQ(index.Build(dataset, config), knowhere::Status::success);
+    ASSERT_EQ(index.Node()->FinalizeIdMap(), knowhere::Status::success);
+    if (!index.Node()->SupportsAnnFusingDemo()) {
+        GTEST_SKIP() << "requires Cardinal-enabled build with the graph demo";
+    }
+    OffsetExpressionCallback factory(
+        fixture.ModLessThan(5, 3), fixture.exec_context.get(), fixture.kRows);
+    auto view = factory.view();
+    std::vector<uint8_t> mandatory((fixture.kRows + 7) / 8, 0);
+    mandatory[0] = 0xff;  // Independently reject the first eight rows.
+    knowhere::BitsetView filter(mandatory.data(), fixture.kRows);
+    filter.set_candidate_evaluator(&view);
+    auto queries = knowhere::GenDataSet(5, dim, vectors.data());
+    knowhere::Json search = {
+        {"metric_type", "L2"},
+        {"k", 5},
+        {"level", 1},
+        // Exhaustive graph budget for this small semantic
+        // fixture; the 768D performance anchor keeps ef=20.
+        {"ef", fixture.kRows},
+        {"index_algo", "GRAPH"}};
+    auto result = index.Search(queries, search, filter);
+    ASSERT_TRUE(result.has_value()) << result.what();
+    for (int i = 0; i < 25; ++i) {
+        const auto row = result.value()->GetIds()[i];
+        ASSERT_GE(row, 8);
+        ASSERT_LT(row, fixture.kRows);
+        EXPECT_LT(fixture.values[row] % 5, 3);
+    }
+    // Independent exact-distance oracle, rather than assuming baseline's
+    // heuristic route is graph. Accept any ID tied at the exact kth distance.
+    for (int q = 0; q < 5; ++q) {
+        std::vector<float> distances;
+        for (int row = 8; row < fixture.kRows; ++row) {
+            if (fixture.values[row] % 5 >= 3) {
+                continue;
+            }
+            float distance = 0;
+            for (int col = 0; col < dim; ++col) {
+                const float delta =
+                    vectors[q * dim + col] - vectors[row * dim + col];
+                distance += delta * delta;
+            }
+            distances.push_back(distance);
+        }
+        std::sort(distances.begin(), distances.end());
+        int exact_hits = 0;
+        for (int k = 0; k < 5; ++k) {
+            exact_hits += result.value()->GetDistance()[q * 5 + k] <=
+                          distances[4] + 1e-4f;
+        }
+        EXPECT_GE(exact_hits, 4);
+    }
+
+    // Every nonnegative fixture value has remainder >= 0; threshold below -4
+    // rejects even the negative rows. Underfill must error before IVF/BF.
+    OffsetExpressionCallback reject(
+        fixture.ModLessThan(5, -5), fixture.exec_context.get(), fixture.kRows);
+    auto reject_view = reject.view();
+    filter.set_candidate_evaluator(&reject_view);
+    EXPECT_FALSE(index.Search(queries, search, filter).has_value());
+
+    auto old_backend = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>("HNSW", 0)
+                           .value();
+    EXPECT_FALSE(old_backend.Node()->SupportsAnnFusingDemo());
 }
 
 TEST(OffsetExpressionEvaluatorTest, ReusesExprSetForModUnaryAndLogicalTree) {

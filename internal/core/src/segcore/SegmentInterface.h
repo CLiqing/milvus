@@ -323,6 +323,11 @@ class SegmentInterface {
     }
 
     virtual bool
+    SupportsAnnFusingDemo(milvus::OpContext*, FieldId) const {
+        return false;
+    }
+
+    virtual bool
     IsIndexRefineEnabled(FieldId field_id) const {
         return IsIndexRefineEnabled(nullptr, field_id);
     }

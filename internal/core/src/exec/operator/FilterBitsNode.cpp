@@ -28,6 +28,8 @@
 #include "exec/QueryContext.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/ExprCache.h"
+#include "exec/expression/OffsetExpressionCallback.h"
+#include "query/PlanImpl.h"
 #include "expr/ITypeExpr.h"
 #include "fmt/core.h"
 #include "log/Log.h"
@@ -100,14 +102,52 @@ PhyFilterBitsNode::PhyFilterBitsNode(
 
     if (query_context_->get_search_info().ann_filter_fusing_request ==
         AnnFilterFusingRequest::ExplicitFusing) {
-        // Stage 1 is intentionally observational: the request has reached the
-        // filter decision boundary, but execution stays on the baseline path
-        // until the loaded-index planner and callback transport are connected.
-        LOG_DEBUG("hint=ann_fusing reached FilterBitsNode; "
-                  "decision=baseline reason=not_connected");
+        // Demo eligibility only, not another evaluator/operator implementation.
+        // Unsupported shapes keep baseline before any bitmap is skipped.
+        const auto info = query_context_->get_search_info();
+        const auto* segment = query_context_->get_segment();
+        const auto* placeholders = query_context_->get_placeholder_group();
+        const auto mod =
+            std::dynamic_pointer_cast<const expr::BinaryArithOpEvalRangeExpr>(
+                filter->filter());
+        const auto schema = segment->get_schema_snapshot();
+        if (segment->type() == SegmentType::Sealed && placeholders != nullptr &&
+            placeholders->size() == 1 && !placeholders->at(0).element_level_ &&
+            !schema->get_ttl_field_id().has_value() &&
+            !(*schema)[info.field_id_].is_nullable() &&
+            (*schema)[info.field_id_].get_data_type() ==
+                DataType::VECTOR_FLOAT &&
+            !info.iterative_filter_execution &&
+            !info.iterator_v2_info_.has_value() &&
+            info.group_by_field_ids_.empty() &&
+            !info.materialized_view_involved &&
+            !info.search_params_.contains("radius") &&
+            !info.global_refine_enable_ && mod != nullptr &&
+            mod->column_.data_type_ == DataType::INT64 &&
+            !mod->column_.nullable_ &&
+            mod->arith_op_type_ == proto::plan::ArithOpType::Mod &&
+            mod->right_operand_.has_int64_val() &&
+            mod->right_operand_.int64_val() > 0 &&
+            segment->SupportsAnnFusingDemo(query_context_->get_op_context(),
+                                           info.field_id_)) {
+            auto factory = std::make_shared<OffsetExpressionCallback>(
+                filter->filter(), exec_context, need_process_rows_);
+            auto view = factory->view();
+            void* probe = nullptr;
+            if (view.create_worker(view.context, &probe) ==
+                knowhere::CandidateEvalStatus::Success) {
+                view.destroy_worker(probe);
+                query_context_->set_ann_fusing_callback(std::move(factory));
+            }
+        }
+        LOG_DEBUG(
+            "hint=ann_fusing reached FilterBitsNode; decision={} "
+            "reason=graph_only_mod_demo",
+            query_context_->get_ann_fusing_callback() ? "fusing" : "baseline");
     }
 
-    enable_expr_cache_ = query_context_->get_enable_expr_cache();
+    enable_expr_cache_ = query_context_->get_enable_expr_cache() &&
+                         !query_context_->get_ann_fusing_callback();
     if (enable_expr_cache_) {
         // Only cache the predicate result when EVERY expression in it is
         // cacheable. A bloom_match subtree is non-cacheable (its slim ToString
@@ -151,6 +191,18 @@ PhyFilterBitsNode::GetOutput() {
 
     if (AllInputProcessed()) {
         return nullptr;
+    }
+
+    if (query_context_->get_ann_fusing_callback()) {
+        // Only mandatory visibility bitmap storage remains; MvccNode applies
+        // timestamps/deletions as usual. Do not Eval() the user predicate here.
+        num_processed_rows_ = need_process_rows_;
+        LOG_DEBUG("ann_fusing skipped_user_predicate_bitmap rows={}",
+                  need_process_rows_);
+        return std::make_shared<RowVector>(
+            std::vector<VectorPtr>{std::make_shared<ColumnVector>(
+                TargetBitmap(need_process_rows_),
+                TargetBitmap(need_process_rows_, true))});
     }
 
     // Cache read: Stage 2 of two-stage search reuses the bitset cached by Stage 1.

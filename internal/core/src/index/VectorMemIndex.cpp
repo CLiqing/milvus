@@ -760,6 +760,9 @@ VectorMemIndex<T>::Query(const DatasetPtr dataset,
                          const BitsetView& bitset,
                          milvus::OpContext* op_context,
                          SearchResult& search_result) const {
+    AssertInfo(
+        bitset.candidate_evaluator() == nullptr || SupportsAnnFusingDemo(),
+        "ann_fusing demo: unsupported loaded vector index");
     //    AssertInfo(GetMetricType() == search_info.metric_type_,
     //               "Metric type of field index isn't the same with search info");
 

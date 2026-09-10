@@ -88,6 +88,11 @@ class VectorIndex : public IndexBase {
     virtual bool
     IsIndexRefineEnabled() const = 0;
 
+    virtual bool
+    SupportsAnnFusingDemo() const {
+        return false;
+    }
+
     virtual knowhere::IdMap&
     GetIdMap() = 0;
 

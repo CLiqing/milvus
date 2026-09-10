@@ -725,6 +725,8 @@ VectorDiskAnnIndex<T>::Query(const DatasetPtr dataset,
                              const BitsetView& bitset,
                              milvus::OpContext* op_context,
                              SearchResult& search_result) const {
+    AssertInfo(!bitset.candidate_evaluator() || SupportsAnnFusingDemo(),
+               "ann_fusing demo: loaded index no longer supports memory graph");
     AssertInfo(GetMetricType() == search_info.metric_type_,
                "Metric type of field index isn't the same with search info");
     auto num_rows = dataset->GetRows();
@@ -858,6 +860,14 @@ VectorDiskAnnIndex<T>::VectorIterators(const DatasetPtr dataset,
         return make_empty_iterators(num_queries);
     }
     return this->index_.AnnIterator(dataset, conf, bitset, false, op_context);
+}
+
+template <typename T>
+bool
+VectorDiskAnnIndex<T>::SupportsAnnFusingDemo() const {
+    // UseDiskLoad also selects this wrapper for HNSW. File loading is not a
+    // search-path capability: the actual Cardinal backend makes that choice.
+    return index_.Node() != nullptr && index_.Node()->SupportsAnnFusingDemo();
 }
 
 template <typename T>

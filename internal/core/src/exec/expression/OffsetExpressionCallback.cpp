@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "common/EasyAssert.h"
+#include "log/Log.h"
 
 namespace milvus::exec {
 using Status = knowhere::CandidateEvalStatus;
@@ -92,6 +93,8 @@ OffsetExpressionCallback::EvalBatch(void* worker,
     try {
         *accepted_mask =
             state.workspace->EvalAcceptedBatch(row_ids, count, active_mask);
+        LOG_DEBUG("ann_fusing callback batch count={} active={} accepted={}",
+                  count, active_mask, *accepted_mask);
         return Status::Success;
     } catch (...) {
         return Status::Failed;

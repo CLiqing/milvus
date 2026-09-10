@@ -35,6 +35,8 @@
 
 namespace milvus::exec {
 
+class OffsetExpressionCallback;
+
 enum class ContextScope { GLOBAL = 0, SESSION = 1, QUERY = 2, Executor = 3 };
 
 class BaseConfig {
@@ -225,6 +227,17 @@ class QueryContext : public Context {
         return search_info_;
     }
 
+    void
+    set_ann_fusing_callback(
+        std::shared_ptr<OffsetExpressionCallback> callback) {
+        ann_fusing_callback_ = std::move(callback);
+    }
+
+    const std::shared_ptr<OffsetExpressionCallback>&
+    get_ann_fusing_callback() const {
+        return ann_fusing_callback_;
+    }
+
     knowhere::MetricType
     get_metric_type() {
         return search_info_.metric_type_;
@@ -366,6 +379,7 @@ class QueryContext : public Context {
     milvus::Timestamp collection_ttl_timestamp_;
     // used for vector search
     milvus::SearchInfo search_info_;
+    std::shared_ptr<OffsetExpressionCallback> ann_fusing_callback_;
     const query::PlaceholderGroup* placeholder_group_;
 
     // used for store segment search result

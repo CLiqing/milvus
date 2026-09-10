@@ -32,6 +32,7 @@
 #include "common/Utils.h"
 #include "exec/QueryContext.h"
 #include "exec/expression/Utils.h"
+#include "exec/expression/OffsetExpressionCallback.h"
 #include "exec/operator/Utils.h"
 #include "monitor/Monitor.h"
 #include "opentelemetry/trace/span.h"
@@ -185,6 +186,13 @@ PhyVectorSearchNode::GetOutput() {
     }
 
     // Single search + metrics path
+    // Descriptor and query-owned factory outlive the synchronous search and
+    // all joined Cardinal workers. The view never owns expression state.
+    knowhere::CandidateEvaluatorViewV1 callback_view;
+    if (const auto& callback = query_context_->get_ann_fusing_callback()) {
+        callback_view = callback->view();
+        search_view.set_candidate_evaluator(&callback_view);
+    }
     milvus::SearchResult search_result;
     auto op_context = query_context_->get_op_context();
     segment_->vector_search(search_info_,
