@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "bitset/bitset.h"
+#include "query/FilterMapView.h"
 #include "common/ArrayOffsets.h"
 #include "common/BitsetView.h"
 #include "common/EasyAssert.h"
@@ -168,20 +169,33 @@ PhyVectorSearchNode::GetOutput() {
         }
 
         auto col_input = GetColumnVector(input_);
-        TargetBitmapView view(col_input->GetRawData(), col_input->size());
+        const auto& map = col_input->GetFilterMap();
+        if (!ph.element_level_ &&
+            map.capability() == FilterMapCapability::EnumerateOnly) {
+            if (map.count() == map.size()) {
+                auto search_result = empty_search_result(num_queries);
+                search_result.total_data_cnt_ = data_cnt;
+                query_context_->set_search_result(std::move(search_result));
+                return input_;
+            }
+            search_view = BitsetView(query::MakeFilterMapView(map));
+            data_cnt = map.size();
+        } else {
+            TargetBitmapView view(col_input->GetRawData(), col_input->size());
 
-        if (view.all()) {
-            auto search_result = empty_search_result(num_queries);
-            search_result.total_data_cnt_ = data_cnt;
-            search_result.element_level_ = ph.element_level_;
-            query_context_->set_search_result(std::move(search_result));
-            return input_;
+            if (view.all()) {
+                auto search_result = empty_search_result(num_queries);
+                search_result.total_data_cnt_ = data_cnt;
+                search_result.element_level_ = ph.element_level_;
+                query_context_->set_search_result(std::move(search_result));
+                return input_;
+            }
+
+            // TODO: uniform knowhere BitsetView and milvus BitsetView
+            search_view = milvus::BitsetView((uint8_t*)col_input->GetRawData(),
+                                             col_input->size());
+            data_cnt = search_view.size();
         }
-
-        // TODO: uniform knowhere BitsetView and milvus BitsetView
-        search_view = milvus::BitsetView((uint8_t*)col_input->GetRawData(),
-                                         col_input->size());
-        data_cnt = search_view.size();
     }
 
     // Single search + metrics path

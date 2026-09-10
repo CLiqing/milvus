@@ -76,6 +76,25 @@ PhyMvccNode::GetOutput() {
     tracer::AddEvent(fmt::format("input_rows: {}", active_count_));
     WaitPrefetch();
 
+    if (!is_source_node_) {
+        auto column = GetColumnVector(input_);
+        if (column->GetFilterMap().capability() ==
+            FilterMapCapability::EnumerateOnly) {
+            AssertInfo(column->size() == active_count_,
+                       "FilterMap visibility universe mismatch");
+            TargetBitmap excluded(active_count_);
+            TargetBitmapView mask(excluded);
+            // Keep the same timestamp/delete snapshot operations as Dense.
+            // No deleted-count shortcut and no TTL/latest-only correctness gate.
+            segment_->mask_with_timestamps(
+                mask, query_timestamp_, collection_ttl_timestamp_);
+            segment_->mask_with_delete(mask, active_count_, query_timestamp_);
+            column->ApplyFilterMask(mask);
+            is_finished_ = true;
+            return input_;
+        }
+    }
+
     // ── Sealed-segment fast path (skip timestamp mask) ──
     // On a sealed segment without TTL, when query_ts covers all inserts,
     // mask_with_timestamps is redundant (all rows pass).  Only apply the

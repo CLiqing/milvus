@@ -33,6 +33,10 @@ class BitsetView : public knowhere::BitsetView {
     BitsetView() = default;
     ~BitsetView() = default;
 
+    explicit BitsetView(knowhere::BitsetView view)
+        : knowhere::BitsetView(std::move(view)) {
+    }
+
     BitsetView(const std::nullptr_t value)  // NOLINT
         : knowhere::BitsetView(value) {     // NOLINT
     }
@@ -100,7 +104,7 @@ class BitsetView : public knowhere::BitsetView {
                    offset,
                    size,
                    this->size());
-        return {data() + (offset >> 3), size};
+        return BitsetView(knowhere::BitsetView::DenseSubview(offset, size));
     }
 };
 
