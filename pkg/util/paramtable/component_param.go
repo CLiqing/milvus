@@ -4015,6 +4015,10 @@ type queryNodeConfig struct {
 
 	ExprEvalBatchSize ParamItem `refreshable:"false"`
 
+	FilterMapEnabled  ParamItem `refreshable:"false"`
+	FilterMapMinRows  ParamItem `refreshable:"false"`
+	FilterMapMaxRatio ParamItem `refreshable:"false"`
+
 	// delete snapshot dump batch size
 	DeleteDumpBatchSize ParamItem `refreshable:"false"`
 
@@ -5306,6 +5310,22 @@ user-task-polling:
 		Doc:          "expr eval batch size for getnext interface",
 	}
 	p.ExprEvalBatchSize.Init(base.mgr)
+
+	p.FilterMapEnabled = ParamItem{
+		Key: "queryNode.segcore.filterMap.enabled", DefaultValue: "false",
+		Doc: "Allow adaptive filter producers; disabled preserves the Dense baseline.", Export: true,
+	}
+	p.FilterMapEnabled.Init(base.mgr)
+	p.FilterMapMinRows = ParamItem{
+		Key: "queryNode.segcore.filterMap.minRows", DefaultValue: "50000",
+		Doc: "Minimum per-segment row count for adaptive filter production.", Export: true,
+	}
+	p.FilterMapMinRows.Init(base.mgr)
+	p.FilterMapMaxRatio = ParamItem{
+		Key: "queryNode.segcore.filterMap.maxRatio", DefaultValue: "0.004",
+		Doc: "Sparse exception cap as a fraction of segment rows, in [0, 1].", Export: true,
+	}
+	p.FilterMapMaxRatio.Init(base.mgr)
 
 	p.DeleteDumpBatchSize = ParamItem{
 		Key:          "queryNode.segcore.deleteDumpBatchSize",

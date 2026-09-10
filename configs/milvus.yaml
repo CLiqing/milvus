@@ -578,6 +578,10 @@ queryNode:
   stats:
     publishInterval: 1000 # The interval that query node publishes the node statistics information, including segment status, cpu usage, memory usage, health status, etc. Unit: ms.
   segcore:
+    filterMap:
+      enabled: false # Opt-in adaptive filter production. Restart required.
+      minRows: 50000 # Minimum rows per segment. Restart required.
+      maxRatio: 0.004 # Sparse cap = floor(segment rows * ratio). Restart required.
     knowhereThreadPoolNumRatio: 4 # The number of threads in knowhere's thread pool. If disk is enabled, the pool size will multiply with knowhereThreadPoolNumRatio([1, 32]).
     chunkRows: 128 # Row count by which Segcore divides a segment into chunks.
     interimIndex:

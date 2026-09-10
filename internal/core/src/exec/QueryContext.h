@@ -26,6 +26,7 @@
 #include <folly/CancellationToken.h>
 
 #include "common/Common.h"
+#include "common/FilterMapConfig.h"
 #include "common/Types.h"
 #include "common/Exception.h"
 #include "common/ArrayOffsets.h"
@@ -107,11 +108,19 @@ class QueryConfig : public MemConfig {
 
     QueryConfig() = default;
 
+    const FilterMapConfig&
+    filter_map_config() const {
+        return filter_map_config_;
+    }
+
     int64_t
     get_expr_batch_size() const {
         return BaseConfig::Get<int64_t>(kExprEvalBatchSize,
                                         EXEC_EVAL_EXPR_BATCH_SIZE.load());
     }
+
+ private:
+    const FilterMapConfig filter_map_config_ = GetDefaultFilterMapConfig();
 };
 
 class Context {

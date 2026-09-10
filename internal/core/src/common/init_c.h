@@ -49,6 +49,9 @@ SetThreadPoolMaxThreadsSize(const int);
 void
 SetDefaultExprEvalBatchSize(int64_t val);
 
+bool
+SetDefaultFilterMapConfig(bool enabled, int64_t min_rows, double max_ratio);
+
 void
 SetDefaultDeleteDumpBatchSize(int64_t val);
 

@@ -25,6 +25,7 @@
 #include <openssl/evp.h>
 #include "common/init_c.h"
 #include "common/Common.h"
+#include "common/FilterMapConfig.h"
 #include "common/Tracer.h"
 #include "common/init_c.h"
 #include "monitor/Monitor.h"
@@ -79,6 +80,11 @@ SetThreadPoolMaxThreadsSize(const int value) {
 void
 SetDefaultExprEvalBatchSize(int64_t val) {
     milvus::SetDefaultExecEvalExprBatchSize(val);
+}
+
+bool
+SetDefaultFilterMapConfig(bool enabled, int64_t min_rows, double max_ratio) {
+    return milvus::SetDefaultFilterMapConfig({enabled, min_rows, max_ratio});
 }
 
 void

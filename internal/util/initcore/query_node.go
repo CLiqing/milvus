@@ -140,6 +140,14 @@ func doInitQueryNodeOnce(ctx context.Context) error {
 	cExprBatchSize := C.int64_t(paramtable.Get().QueryNodeCfg.ExprEvalBatchSize.GetAsInt64())
 	C.SetDefaultExprEvalBatchSize(cExprBatchSize)
 
+	filterMapConfig := &paramtable.Get().QueryNodeCfg
+	if !bool(C.SetDefaultFilterMapConfig(
+		C.bool(filterMapConfig.FilterMapEnabled.GetAsBool()),
+		C.int64_t(filterMapConfig.FilterMapMinRows.GetAsInt64()),
+		C.double(filterMapConfig.FilterMapMaxRatio.GetAsFloat()))) {
+		return merr.WrapErrParameterInvalidMsg("queryNode.segcore.filterMap requires minRows >= 0 and finite maxRatio in [0, 1]")
+	}
+
 	cDeleteDumpBatchSize := C.int64_t(paramtable.Get().QueryNodeCfg.DeleteDumpBatchSize.GetAsInt64())
 	C.SetDefaultDeleteDumpBatchSize(cDeleteDumpBatchSize)
 
