@@ -17,6 +17,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -891,6 +892,52 @@ class SegmentExpr : public Expr {
             }
         }
 
+        // The prepared MOD path never uses SkipIndex. In particular, do not
+        // acquire its shared segment snapshot on every candidate batch.
+        if constexpr (std::is_same_v<T, int64_t>) {
+            if (use_prepared_offset_reader_ &&
+                segment_->type() == SegmentType::Sealed) {
+                if (!offset_reader_attempted_) {
+                    offset_reader_attempted_ = true;
+                    auto column = segment_->CaptureOffsetColumn(field_id_);
+                    if (column && column->NumRows() >= active_count_) {
+                        offset_reader_ = std::make_unique<OffsetColumnReader>(
+                            std::move(column));
+                    }
+                }
+                if (offset_reader_) {
+                    // Bound scratch space even for large iterative input.
+                    // Gather in input order, then reuse the SAME random
+                    // arithmetic kernel; do not switch to SIMD semantics.
+                    constexpr size_t kGatherRows = 64;
+                    std::array<T, kGatherRows> gathered;
+                    std::array<bool, kGatherRows> validity;
+                    for (size_t i = 0; i < input->size(); i += kGatherRows) {
+                        const auto count =
+                            std::min(kGatherRows, input->size() - i);
+                        const bool all_valid = offset_reader_->Gather<T>(
+                            op_ctx_,
+                            input->data() + i,
+                            count,
+                            gathered.data(),
+                            validity.data());
+                        evaluate_batch.template operator()<FilterType::random>(
+                            gathered.data(),
+                            all_valid
+                                ? ValidityView{}
+                                : ValidityView::FromExpanded(validity.data()),
+                            nullptr,
+                            count,
+                            res + i,
+                            valid_res + i,
+                            values...);
+                    }
+                    offset_reader_->EndBatch();
+                    return input->size();
+                }
+            }
+        }
+
         auto skip_index = segment_->GetSkipIndex();
 
         // Read arbitrary offsets from non-owning view columns. Input order is
@@ -1031,44 +1078,6 @@ class SegmentExpr : public Expr {
             // pinned chunk across iterations and only re-pin/resolve when the
             // chunk id actually changes, avoiding a per-row GroupChunk pin +
             // shared_ptr lookup on storage v2.
-            if constexpr (std::is_same_v<T, int64_t>) {
-                if (use_prepared_offset_reader_) {
-                    if (!offset_reader_attempted_) {
-                        offset_reader_attempted_ = true;
-                        auto column = segment_->CaptureOffsetColumn(field_id_);
-                        if (column && column->NumRows() >= active_count_) {
-                            offset_reader_ = std::make_unique<OffsetColumnReader>(
-                                std::move(column));
-                        }
-                    }
-                    if (offset_reader_) {
-                        // Bound scratch space even for large iterative input.
-                        // Gather in input order, then reuse the SAME random
-                        // arithmetic kernel; do not switch to SIMD semantics.
-                        constexpr size_t kGatherRows = 64;
-                        std::array<T, kGatherRows> gathered;
-                        std::array<bool, kGatherRows> validity;
-                        for (size_t i = 0; i < input->size(); i += kGatherRows) {
-                            const auto count =
-                                std::min(kGatherRows, input->size() - i);
-                            const bool all_valid = offset_reader_->Gather<T>(
-                                op_ctx_, input->data() + i, count,
-                                gathered.data(), validity.data());
-                            evaluate_batch.template operator()<FilterType::random>(
-                                gathered.data(),
-                                all_valid ? ValidityView{}
-                                          : ValidityView::FromExpanded(validity.data()),
-                                nullptr,
-                                count,
-                                res + i,
-                                valid_res + i,
-                                values...);
-                        }
-                        offset_reader_->EndBatch();
-                        return input->size();
-                    }
-                }
-            }
             int64_t cached_chunk_id = -1;
             std::optional<PinWrapper<Span<T>>> pw;
             const T* chunk_base = nullptr;
