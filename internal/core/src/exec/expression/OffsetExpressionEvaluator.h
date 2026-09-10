@@ -69,7 +69,7 @@ class OffsetExpressionWorkspace final {
 
  private:
     OffsetExpressionTruth
-    EvaluateBatch(const int32_t* row_ids, uint32_t count, uint64_t active_mask);
+    EvalBatchImpl(const int32_t* row_ids, uint32_t count, uint64_t active_mask);
 
     ExecContext* exec_context_;
     bool null_rejecting_;

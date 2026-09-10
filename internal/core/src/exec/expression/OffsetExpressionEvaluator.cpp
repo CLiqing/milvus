@@ -75,18 +75,18 @@ OffsetExpressionWorkspace::EvalTruthBatch(const int32_t* row_ids,
                                           uint32_t count,
                                           uint64_t active_mask) {
     AssertInfo(!null_rejecting_, "exact truth requires null_rejecting=false");
-    return EvaluateBatch(row_ids, count, active_mask);
+    return EvalBatchImpl(row_ids, count, active_mask);
 }
 
 uint64_t
 OffsetExpressionWorkspace::EvalAcceptedBatch(const int32_t* row_ids,
                                              uint32_t count,
                                              uint64_t active_mask) {
-    return EvaluateBatch(row_ids, count, active_mask).accepted_mask();
+    return EvalBatchImpl(row_ids, count, active_mask).accepted_mask();
 }
 
 OffsetExpressionTruth
-OffsetExpressionWorkspace::EvaluateBatch(const int32_t* row_ids,
+OffsetExpressionWorkspace::EvalBatchImpl(const int32_t* row_ids,
                                          uint32_t count,
                                          uint64_t active_mask) {
     AssertInfo(
