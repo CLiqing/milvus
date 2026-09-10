@@ -338,7 +338,7 @@ TEST(PlanProto, ParsesAnnFilterFusingRequestIndependentlyFromIterative) {
 
     auto top_level = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
     top_level.mutable_vector_anns()->mutable_query_info()->set_hints(
-        DOWNPUSH);
+        ANN_FUSING);
     parsed = parser.PlanNodeFromProto(top_level)->search_info_;
     EXPECT_EQ(parsed.ann_filter_fusing_request,
               AnnFilterFusingRequest::ExplicitFusing);
@@ -347,19 +347,72 @@ TEST(PlanProto, ParsesAnnFilterFusingRequestIndependentlyFromIterative) {
     auto search_params = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
     search_params.mutable_vector_anns()
         ->mutable_query_info()
-        ->set_search_params(R"({"hints":"downpush"})");
+        ->set_search_params(R"({"hints":"ann_fusing"})");
     parsed = parser.PlanNodeFromProto(search_params)->search_info_;
     EXPECT_EQ(parsed.ann_filter_fusing_request,
               AnnFilterFusingRequest::ExplicitFusing);
     EXPECT_FALSE(parsed.iterative_filter_execution);
 
     auto iterative = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
+    // PlanNodeFromProto disables iterative execution when there is no filter.
+    // Exercise a real filtered search, not that intentional no-filter bypass.
+    auto* predicate = iterative.mutable_vector_anns()
+                          ->mutable_predicates()->mutable_unary_range_expr();
+    predicate->mutable_column_info()->set_field_id(
+        schema->get_field_id(milvus::FieldName("age")).get());
+    predicate->mutable_column_info()->set_data_type(milvus::proto::schema::Int64);
+    predicate->set_op(milvus::proto::plan::GreaterThan);
+    predicate->mutable_value()->set_int64_val(0);
     iterative.mutable_vector_anns()->mutable_query_info()->set_hints(
         ITERATIVE_FILTER);
     parsed = parser.PlanNodeFromProto(iterative)->search_info_;
     EXPECT_EQ(parsed.ann_filter_fusing_request,
               AnnFilterFusingRequest::Baseline);
     EXPECT_TRUE(parsed.iterative_filter_execution);
+}
+
+TEST(PlanProto, AnnFusingHintPrecedenceAndLegacySpelling) {
+    using milvus::AnnFilterFusingRequest;
+    auto schema = BuildSchema();
+    const auto field_id = schema->get_field_id(milvus::FieldName("fakevec"));
+    milvus::query::ProtoParser parser(schema);
+    auto node = BuildSearchPlanNode(0, 0, field_id);
+    auto* predicate = node.mutable_vector_anns()
+                          ->mutable_predicates()->mutable_unary_range_expr();
+    predicate->mutable_column_info()->set_field_id(
+        schema->get_field_id(milvus::FieldName("age")).get());
+    predicate->mutable_column_info()->set_data_type(milvus::proto::schema::Int64);
+    predicate->set_op(milvus::proto::plan::GreaterThan);
+    predicate->mutable_value()->set_int64_val(0);
+    auto* info = node.mutable_vector_anns()->mutable_query_info();
+    info->set_search_params(R"({"hints":"ann_fusing"})");
+    info->set_hints("disable");
+    auto parsed = parser.PlanNodeFromProto(node)->search_info_;
+    EXPECT_EQ(parsed.ann_filter_fusing_request, AnnFilterFusingRequest::Baseline);
+    EXPECT_FALSE(parsed.iterative_filter_execution);
+    info->set_hints(ITERATIVE_FILTER);
+    parsed = parser.PlanNodeFromProto(node)->search_info_;
+    EXPECT_EQ(parsed.ann_filter_fusing_request, AnnFilterFusingRequest::Baseline);
+    EXPECT_TRUE(parsed.iterative_filter_execution);
+    info->set_hints(ANN_FUSING);
+    info->set_search_params(R"({"hints":"iterative_filter"})");
+    parsed = parser.PlanNodeFromProto(node)->search_info_;
+    EXPECT_EQ(parsed.ann_filter_fusing_request,
+              AnnFilterFusingRequest::ExplicitFusing);
+    EXPECT_FALSE(parsed.iterative_filter_execution);
+
+    info->set_search_params("{}");
+    info->set_hints("downpush");
+    EXPECT_ANY_THROW(parser.PlanNodeFromProto(node));
+    info->set_hints("");
+    info->set_search_params(R"({"hints":"downpush"})");
+    EXPECT_ANY_THROW(parser.PlanNodeFromProto(node));
+    // Range search still carries intent but must not become iterative.
+    info->set_search_params(R"({"hints":"ann_fusing","radius":10})");
+    parsed = parser.PlanNodeFromProto(node)->search_info_;
+    EXPECT_EQ(parsed.ann_filter_fusing_request,
+              AnnFilterFusingRequest::ExplicitFusing);
+    EXPECT_FALSE(parsed.iterative_filter_execution);
 }
 
 TEST(PlanProto, VectorArrayFieldIdGapInStructArray) {

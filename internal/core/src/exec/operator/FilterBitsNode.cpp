@@ -103,7 +103,7 @@ PhyFilterBitsNode::PhyFilterBitsNode(
         // Stage 1 is intentionally observational: the request has reached the
         // filter decision boundary, but execution stays on the baseline path
         // until the loaded-index planner and callback transport are connected.
-        LOG_DEBUG("ANN filter fusing request reached FilterBitsNode; "
+        LOG_DEBUG("hint=ann_fusing reached FilterBitsNode; "
                   "decision=baseline reason=not_connected");
     }
 
