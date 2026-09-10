@@ -185,6 +185,35 @@ PhyFilterBitsNode::GetOutput() {
     TargetBitmap bitset;
     TargetBitmap valid_bitset;
 
+    if (auto cap =
+            query_context_->query_config()->filter_map_config().ExceptionCap(
+                need_process_rows_)) {
+        auto map = exprs_->exprs().front()->EvalFilterMap(
+            eval_ctx, need_process_rows_, *cap);
+        num_processed_rows_ = need_process_rows_;
+        if (can_use_cache) {
+            ExprResCacheManager::Key key{cache_segment->get_segment_id(),
+                                         expr_cache_key_};
+            ExprResCacheManager::Value cached;
+            // The cache owns an independent Dense compatibility copy. Do not
+            // promote the live result merely to store that legacy copy.
+            auto snapshot = map;
+            cached.result =
+                std::make_shared<TargetBitmap>(std::move(snapshot).TakeDense());
+            cached.valid_result =
+                std::make_shared<TargetBitmap>(need_process_rows_, true);
+            cached.active_count = need_process_rows_;
+            ExprResCacheManager::Instance().Put(key, cached);
+        }
+        milvus::monitor::internal_core_search_latency_scalar.Observe(
+            std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - scalar_start)
+                .count());
+        return std::make_shared<RowVector>(
+            std::vector<VectorPtr>{std::make_shared<ColumnVector>(
+                std::move(map), TargetBitmap(need_process_rows_, true))});
+    }
+
     // optimization: if all expressions can be executed at once,
     // execute in a single pass and flip in-place to avoid bitmap copies.
     if (exprs_->CanExecuteAllAtOnce()) {
@@ -235,16 +264,6 @@ PhyFilterBitsNode::GetOutput() {
         return std::make_shared<RowVector>(col_res);
     }
 
-    // Bitmap-native kernels retain their existing bounded SIMD scratch. Feed
-    // those batches directly into the map instead of first assembling an N-bit
-    // predicate bitmap. All-at-once index producers above stay unchanged until
-    // their native row-ID interface is migrated separately.
-    std::optional<FilterMap> adaptive;
-    if (auto cap = query_context_->query_config()
-                       ->filter_map_config()
-                       .ExceptionCap(need_process_rows_)) {
-        adaptive.emplace(FilterMap::Adaptive(need_process_rows_, true, *cap));
-    }
     while (num_processed_rows_ < need_process_rows_) {
         exprs_->Eval(0, 1, true, eval_ctx, results_);
 
@@ -259,20 +278,8 @@ PhyFilterBitsNode::GetOutput() {
                 TargetBitmapView view(col_vec->GetRawData(), col_vec_size);
                 TargetBitmapView valid_view(col_vec->GetValidRawData(),
                                             col_vec_size);
-                if (adaptive) {
-                    AssertInfo(col_vec_size > 0 &&
-                                   col_vec_size <= need_process_rows_ -
-                                                       num_processed_rows_,
-                               "Invalid filter producer batch size: {}",
-                               col_vec_size);
-                    adaptive->AssignBitmapBatch(view,
-                                                &valid_view,
-                                                num_processed_rows_,
-                                                /*invert=*/true);
-                } else {
-                    bitset.append(view);
-                    valid_bitset.append(valid_view);
-                }
+                bitset.append(view);
+                valid_bitset.append(valid_view);
                 num_processed_rows_ += col_vec_size;
             } else {
                 ThrowInfo(UnexpectedError,
@@ -283,11 +290,7 @@ PhyFilterBitsNode::GetOutput() {
                       "PhyFilterBitsNode result should be ColumnVector");
         }
     }
-    if (adaptive) {
-        // UNKNOWN has already been folded into filtered=!(predicate & valid)
-        // during ingestion. The filter result itself therefore has no NULLs.
-        valid_bitset = TargetBitmap(need_process_rows_, true);
-    } else {
+    {
         TargetBitmapView bitset_view(bitset);
         TargetBitmapView valid_bitset_view(valid_bitset);
         ConvertPredicateToFilteredBitset(
@@ -306,12 +309,7 @@ PhyFilterBitsNode::GetOutput() {
         ExprResCacheManager::Key key{cache_segment->get_segment_id(),
                                      expr_cache_key_};
         ExprResCacheManager::Value v;
-        // The current cache is a legacy Dense consumer. Keep it enabled and
-        // use the central compatibility boundary until cache migration lands.
-        v.result = adaptive
-                       ? std::make_shared<TargetBitmap>(
-                             adaptive->EnsureDense().clone())
-                       : std::make_shared<TargetBitmap>(bitset.clone());
+        v.result = std::make_shared<TargetBitmap>(bitset.clone());
         v.valid_result = std::make_shared<TargetBitmap>(valid_bitset.clone());
         v.active_count = need_process_rows_;
         ExprResCacheManager::Instance().Put(key, v);
@@ -319,11 +317,8 @@ PhyFilterBitsNode::GetOutput() {
 
     // num_processed_rows_ = need_process_rows_;
     std::vector<VectorPtr> col_res;
-    col_res.push_back(
-        adaptive ? std::make_shared<ColumnVector>(std::move(*adaptive),
-                                                 std::move(valid_bitset))
-                 : std::make_shared<ColumnVector>(std::move(bitset),
-                                                 std::move(valid_bitset)));
+    col_res.push_back(std::make_shared<ColumnVector>(std::move(bitset),
+                                                     std::move(valid_bitset)));
     std::static_pointer_cast<ColumnVector>(col_res.back())->GetFilterMap();
     std::chrono::high_resolution_clock::time_point scalar_end =
         std::chrono::high_resolution_clock::now();

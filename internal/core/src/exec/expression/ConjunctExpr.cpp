@@ -48,6 +48,30 @@ PhyConjunctFilterExpr::ResolveType(const std::vector<DataType>& inputs) {
     return DataType::BOOL;
 }
 
+FilterMap
+PhyConjunctFilterExpr::EvalFilterMap(EvalCtx& context,
+                                     size_t universe,
+                                     size_t cap,
+                                     std::optional<FilterMap> input) {
+    // OR/3VL and runtime-fused LIKE retain the established evaluator. Never
+    // treat an OR successor as a refinement of its predecessor's accepted IDs.
+    if (!is_and_ || !null_rejecting_ || !like_indices_.empty()) {
+        return Expr::EvalFilterMap(context, universe, cap, std::move(input));
+    }
+    if (input_order_.empty()) {
+        for (size_t i = 0; i < inputs_.size(); ++i) {
+            input_order_.push_back(i);
+        }
+    }
+    for (const auto index : input_order_) {
+        AssertInfo(index < inputs_.size(), "Invalid AND input order");
+        input = inputs_[index]->EvalFilterMap(
+            context, universe, cap, std::move(input));
+    }
+    AssertInfo(input.has_value(), "AND requires at least one predicate");
+    return std::move(*input);
+}
+
 TargetBitmap
 PhyConjunctFilterExpr::BuildActiveBitmap(const ColumnVectorPtr& vec) {
     // Rows that still need the following expressions.

@@ -64,6 +64,12 @@ class PhyConjunctFilterExpr : public Expr {
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
+    FilterMap
+    EvalFilterMap(EvalCtx& context,
+                  size_t universe,
+                  size_t cap,
+                  std::optional<FilterMap> input = std::nullopt) override;
+
     void
     MoveCursor() override {
         if (!has_offset_input_) {

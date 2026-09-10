@@ -196,6 +196,15 @@ class Expr : public std::enable_shared_from_this<Expr> {
         ThrowInfo(ErrorCode::NotImplemented, "not implemented");
     }
 
+    // Full-segment, null-rejecting filter boundary. Kernel batches remain
+    // bitmap-native; an incoming enumerable map limits evaluation to its IDs.
+    // Expressions are consumed once, in the executor's chosen order.
+    virtual FilterMap
+    EvalFilterMap(EvalCtx& context,
+                  size_t universe,
+                  size_t cap,
+                  std::optional<FilterMap> input = std::nullopt);
+
     // Only move cursor to next batch
     // but not do real eval for optimization
     virtual void
