@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <future>
 #include <limits>
@@ -15,6 +16,7 @@
 #include "exec/QueryContext.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/OffsetExpressionEvaluator.h"
+#include "exec/expression/OffsetExpressionCallback.h"
 #include "expr/ITypeExpr.h"
 #include "segcore/SegmentSealed.h"
 #include "test_utils/DataGen.h"
@@ -192,6 +194,140 @@ ExpectEvaluatorMatchesExprSet(const expr::TypedExprPtr& expression,
 }
 
 }  // namespace
+
+TEST(OffsetExpressionCallbackTest, FixedVersionAndBatchContract) {
+    EvaluatorFixture fixture;
+    OffsetExpressionCallback factory(fixture.ModLessThan(5, 3),
+                                     fixture.exec_context.get(), fixture.kRows);
+    auto view = factory.view();
+    ASSERT_TRUE(view.valid());
+    auto invalid = view;
+    invalid.abi_major++;
+    EXPECT_FALSE(invalid.valid());
+    invalid = view;
+    invalid.struct_size++;
+    EXPECT_FALSE(invalid.valid());
+    invalid = view;
+    invalid.eval_batch = nullptr;
+    EXPECT_FALSE(invalid.valid());
+
+    using Status = knowhere::CandidateEvalStatus;
+    void* worker = nullptr;
+    ASSERT_EQ(view.create_worker(view.context, &worker), Status::Success);
+    std::unique_ptr<void, knowhere::CandidateDestroyWorkerFn> owner(worker, view.destroy_worker);
+    auto reference = PreparedOffsetExpressionEvaluator(
+        fixture.ModLessThan(5, 3), fixture.exec_context.get(), true).CreateWorkspace();
+    std::array<int32_t, 64> ids;
+    for (uint32_t lane = 0; lane < ids.size(); ++lane) {
+        ids[lane] = (lane * 11 + 7) % fixture.kRows;
+    }
+    for (uint32_t count : {0U, 1U, 8U, 17U, 31U, 32U, 64U}) {
+        const uint64_t lanes = count == 64 ? ~uint64_t{0} : (uint64_t{1} << count) - 1;
+        for (uint64_t active : std::array<uint64_t, 3>{lanes, lanes & 0x5555555555555555ULL, 0}) {
+            uint64_t accepted = ~uint64_t{0};
+            ASSERT_EQ(view.eval_batch(worker, ids.data(), count, active, &accepted), Status::Success);
+            EXPECT_EQ(accepted, reference->EvalAcceptedBatch(ids.data(), count, active));
+        }
+    }
+    uint64_t accepted = 99;
+    EXPECT_EQ(view.eval_batch(worker, nullptr, 0, 0, &accepted), Status::Success);
+    EXPECT_EQ(accepted, 0);
+    EXPECT_EQ(view.eval_batch(worker, ids.data(), 65, 0, &accepted), Status::InvalidArgument);
+    EXPECT_EQ(view.eval_batch(worker, ids.data(), 1, 2, &accepted), Status::InvalidArgument);
+    EXPECT_EQ(view.eval_batch(worker, nullptr, 1, 1, &accepted), Status::InvalidArgument);
+    EXPECT_EQ(view.eval_batch(nullptr, ids.data(), 1, 1, &accepted), Status::InvalidArgument);
+    EXPECT_EQ(view.eval_batch(worker, ids.data(), 1, 1, nullptr), Status::InvalidArgument);
+    ids[0] = -1;
+    EXPECT_EQ(view.eval_batch(worker, ids.data(), 1, 1, &accepted), Status::InvalidArgument);
+    EXPECT_EQ(view.eval_batch(worker, ids.data(), 1, 0, &accepted), Status::Success);
+    ids[0] = fixture.kRows;
+    EXPECT_EQ(view.eval_batch(worker, ids.data(), 1, 1, &accepted), Status::InvalidArgument);
+    EXPECT_EQ(accepted, 0);
+    void* missing = worker;
+    EXPECT_EQ(view.create_worker(nullptr, &missing), Status::InvalidArgument);
+    EXPECT_EQ(missing, nullptr);
+    EXPECT_EQ(view.create_worker(view.context, nullptr), Status::InvalidArgument);
+    view.destroy_worker(nullptr);
+}
+
+TEST(OffsetExpressionCallbackTest, FakeConsumerOwnsConcurrentWorkers) {
+    EvaluatorFixture fixture;
+    OffsetExpressionCallback factory(fixture.ModLessThan(5, 3),
+                                     fixture.exec_context.get(), fixture.kRows);
+    const auto view = factory.view();
+    using Status = knowhere::CandidateEvalStatus;
+    // The fake consumer knows only the public descriptor, not ExprSet/AST.
+    std::vector<std::future<std::vector<uint64_t>>> futures;
+    for (int worker_id = 0; worker_id < 8; ++worker_id) {
+        void* worker = nullptr;
+        ASSERT_EQ(view.create_worker(view.context, &worker), Status::Success);
+        futures.push_back(std::async(std::launch::async, [view, worker, worker_id] {
+            std::unique_ptr<void, knowhere::CandidateDestroyWorkerFn> owner(worker, view.destroy_worker);
+            std::vector<uint64_t> outputs;
+            for (int batch = 0; batch < 100; ++batch) {
+                std::array<int32_t, 32> ids;
+                for (int lane = 0; lane < 32; ++lane) {
+                    ids[lane] = (worker_id * 13 + batch * 7 + lane * 3) % EvaluatorFixture::kRows;
+                }
+                uint64_t accepted = 0;
+                EXPECT_EQ(view.eval_batch(worker, ids.data(), 32, 0xffffffff, &accepted), Status::Success);
+                outputs.push_back(accepted);
+            }
+            return outputs;
+        }));
+    }
+    for (int worker_id = 0; worker_id < 8; ++worker_id) {
+        const auto outputs = futures[worker_id].get();
+        for (int batch = 0; batch < 100; ++batch) {
+            uint64_t expected = 0;
+            for (int lane = 0; lane < 32; ++lane) {
+                int row = (worker_id * 13 + batch * 7 + lane * 3) % fixture.kRows;
+                if (row % 2 == 0 && fixture.values[row] % 5 < 3) {
+                    expected |= uint64_t{1} << lane;
+                }
+            }
+            EXPECT_EQ(outputs[batch], expected);
+        }
+    }
+}
+
+TEST(OffsetExpressionCallbackTest, DirectVersusCallbackBatch32Overhead) {
+    EvaluatorFixture fixture({}, false);
+    auto expression = fixture.ModLessThan(5, 3);
+    OffsetExpressionCallback factory(expression, fixture.exec_context.get(), fixture.kRows);
+    auto direct = PreparedOffsetExpressionEvaluator(expression, fixture.exec_context.get(), true).CreateWorkspace();
+    auto view = factory.view();
+    void* worker = nullptr;
+    ASSERT_EQ(view.create_worker(view.context, &worker), knowhere::CandidateEvalStatus::Success);
+    std::unique_ptr<void, knowhere::CandidateDestroyWorkerFn> owner(worker, view.destroy_worker);
+    std::array<int32_t, 32> ids;
+    for (int lane = 0; lane < 32; ++lane) {
+        ids[lane] = (lane * 7) % fixture.kRows;
+    }
+    const auto expected = direct->EvalAcceptedBatch(ids.data(), 32, 0xffffffff);
+    auto measure = [&](bool callback) {
+        auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 2000; ++i) {
+            uint64_t mask = 0;
+            if (callback) {
+                EXPECT_EQ(view.eval_batch(worker, ids.data(), 32, 0xffffffff, &mask),
+                          knowhere::CandidateEvalStatus::Success);
+            } else {
+                mask = direct->EvalAcceptedBatch(ids.data(), 32, 0xffffffff);
+            }
+            EXPECT_EQ(mask, expected);
+        }
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / 2000;
+    };
+    measure(false);
+    measure(true);
+    for (int round = 0; round < 5; ++round) {
+        const auto a1 = measure(false), b1 = measure(true), b2 = measure(true), a2 = measure(false);
+        // Diagnostic only: full graph/standalone performance is Stage 3A's gate.
+        RecordProperty("direct_us_" + std::to_string(round), std::to_string((a1 + a2) / 2));
+        RecordProperty("callback_us_" + std::to_string(round), std::to_string((b1 + b2) / 2));
+    }
+}
 
 TEST(OffsetExpressionEvaluatorTest, ReusesExprSetForModUnaryAndLogicalTree) {
     EvaluatorFixture fixture;
