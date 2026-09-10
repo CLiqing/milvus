@@ -431,6 +431,13 @@ class SegmentInternalInterface : public SegmentInterface {
                                  int64_t count,
                                  TargetBitmapView valid_result) const = 0;
 
+    // Owned immutable column view for repeated offset reads. Unsupported
+    // layouts return null and keep the original expression access path.
+    virtual std::shared_ptr<const ChunkedColumnInterface>
+    CaptureOffsetColumn(FieldId field_id) const {
+        return nullptr;
+    }
+
     template <typename T>
     PinWrapper<Span<T>>
     chunk_data(milvus::OpContext* op_ctx,

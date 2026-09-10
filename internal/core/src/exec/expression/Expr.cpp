@@ -57,6 +57,11 @@ namespace milvus {
 namespace exec {
 
 SegmentExpr::~SegmentExpr() {
+    if (offset_reader_) {
+        LOG_DEBUG("offset reader release field={} reads={} misses={} peak_pins={} peak_bytes={}",
+                  field_id_.get(), offset_reader_->reads(), offset_reader_->misses(),
+                  offset_reader_->peak_pins(), offset_reader_->peak_bytes());
+    }
     // record accumulated json filter latencies as segment-level metrics.
     // latencies are accumulated in microseconds and converted to milliseconds for Observe.
     // this avoids per-batch metric overhead and provides more meaningful

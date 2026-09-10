@@ -3349,6 +3349,17 @@ ChunkedSegmentSealedImpl::ApplyFieldValidDataByOffsets(
         count);
 }
 
+std::shared_ptr<const ChunkedColumnInterface>
+ChunkedSegmentSealedImpl::CaptureOffsetColumn(FieldId field_id) const {
+    auto snapshot = CapturePublishedState();
+    if (!get_bit(snapshot->field_data_ready_bitset, field_id)) {
+        return nullptr;
+    }
+    // The returned column retains its group/cache slot and immutable metadata
+    // even if a subsequent publication replaces the segment's field map.
+    return get_column(snapshot->runtime, field_id);
+}
+
 cachinglayer::PinWrapper<SpanBase>
 ChunkedSegmentSealedImpl::chunk_data_impl(milvus::OpContext* op_ctx,
                                           FieldId field_id,

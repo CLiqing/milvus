@@ -34,6 +34,7 @@
 #include "common/Types.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/ExprCacheHelper.h"
+#include "exec/expression/OffsetColumnReader.h"
 #include "exec/expression/Utils.h"
 #include "exec/QueryContext.h"
 #include "expr/ITypeExpr.h"
@@ -1030,6 +1031,41 @@ class SegmentExpr : public Expr {
             // pinned chunk across iterations and only re-pin/resolve when the
             // chunk id actually changes, avoiding a per-row GroupChunk pin +
             // shared_ptr lookup on storage v2.
+            if constexpr (std::is_same_v<T, int64_t>) {
+                if (use_prepared_offset_reader_) {
+                    if (!offset_reader_attempted_) {
+                        offset_reader_attempted_ = true;
+                        auto column = segment_->CaptureOffsetColumn(field_id_);
+                        if (column && column->NumRows() >= active_count_) {
+                            offset_reader_ = std::make_unique<OffsetColumnReader>(
+                                std::move(column));
+                        }
+                    }
+                    if (offset_reader_) {
+                        // Preserve the existing size=1 MOD kernel and input
+                        // order. This step changes only read preparation and
+                        // pin lifetime, not batch arithmetic or skip semantics.
+                        for (size_t i = 0; i < input->size(); ++i) {
+                            int64_t offset;
+                            auto span = offset_reader_->Read(
+                                op_ctx_, (*input)[i], offset);
+                            AssertInfo(span.element_sizeof() == sizeof(T),
+                                       "offset reader scalar width mismatch");
+                            auto chunk = static_cast<Span<T>>(span);
+                            evaluate_batch.template operator()<FilterType::random>(
+                                chunk.data() + offset,
+                                chunk.validity().Subview(offset),
+                                nullptr,
+                                1,
+                                res + i,
+                                valid_res + i,
+                                values...);
+                        }
+                        offset_reader_->EndBatch();
+                        return input->size();
+                    }
+                }
+            }
             int64_t cached_chunk_id = -1;
             std::optional<PinWrapper<Span<T>>> pw;
             const T* chunk_base = nullptr;
@@ -3030,6 +3066,11 @@ class SegmentExpr : public Expr {
     // Execution path determined once, preferably by PrefetchAsync() on the
     // prefetch pool. Direct callers that do not prefetch determine it lazily.
     ExprExecPath exec_path_{ExprExecPath::RawData};
+    // Enabled only by the INT64 MOD raw-offset path. Physical Expr objects
+    // belong to one worker; iterative and fusing reuse this same reader.
+    bool use_prepared_offset_reader_{false};
+    bool offset_reader_attempted_{false};
+    std::unique_ptr<OffsetColumnReader> offset_reader_;
     mutable std::once_flag determine_exec_path_once_;
     // Flag set by SetExecuteAllAtOnce() to enable move-based fast paths,
     // avoiding bitmap copies in ProcessIndexChunks/SliceCachedResult.

@@ -618,6 +618,9 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
                                  int64_t count,
                                  TargetBitmapView valid_result) const override;
 
+    std::shared_ptr<const ChunkedColumnInterface>
+    CaptureOffsetColumn(FieldId field_id) const override;
+
  protected:
     // blob and row_count
     PinWrapper<SpanBase>

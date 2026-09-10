@@ -518,6 +518,17 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
             std::move(chunk_wrapper), std::move(content));
     }
 
+    std::pair<PinWrapper<SpanBase>, size_t>
+    PinOffsetSpan(milvus::OpContext* op_ctx, int64_t chunk_id) const override {
+        auto owner = group_->GetGroupChunk(op_ctx, chunk_id);
+        const auto bytes = owner.get()->Size();
+        auto chunk = owner.get()->GetChunk(field_id_);
+        auto* fixed = dynamic_cast<FixedWidthChunk*>(chunk.get());
+        AssertInfo(fixed != nullptr, "offset span requires fixed-width storage");
+        auto span = fixed->Span();
+        return {PinWrapper<SpanBase>(std::move(owner), span), bytes};
+    }
+
     std::pair<size_t, size_t>
     GetChunkIDByOffset(int64_t offset) const override {
         return group_->GetChunkIDByOffset(offset);

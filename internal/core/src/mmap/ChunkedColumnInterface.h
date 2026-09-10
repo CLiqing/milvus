@@ -92,6 +92,14 @@ class ChunkedColumnInterface {
     virtual PinWrapper<SpanBase>
     Span(milvus::OpContext* op_ctx, int64_t chunk_id) const = 0;
 
+    // Span plus backing bytes retained by its owner, not merely field bytes.
+    // Default conservatively charges the whole column; grouped storage must
+    // charge the entire group cell so sibling fields are not undercounted.
+    virtual std::pair<PinWrapper<SpanBase>, size_t>
+    PinOffsetSpan(milvus::OpContext* op_ctx, int64_t chunk_id) const {
+        return {Span(op_ctx, chunk_id), DataByteSize()};
+    }
+
     virtual void
     PrefetchChunks(milvus::OpContext* op_ctx,
                    const std::vector<int64_t>& chunk_ids) const = 0;
