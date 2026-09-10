@@ -20,16 +20,25 @@ LaneMask(uint32_t count) {
                : (count == 0 ? uint64_t{0} : (uint64_t{1} << count) - 1);
 }
 
+std::vector<expr::TypedExprPtr>
+CheckedRoot(expr::TypedExprPtr expression, ExecContext* exec_context) {
+    AssertInfo(expression != nullptr,
+               "offset expression evaluator requires a nonnull root");
+    AssertInfo(exec_context != nullptr,
+               "offset expression evaluator requires an ExecContext");
+    return {std::move(expression)};
+}
 }  // namespace
 
 OffsetExpressionWorkspace::OffsetExpressionWorkspace(
-    const std::vector<expr::TypedExprPtr>& logical_expressions,
+    expr::TypedExprPtr expression,
     ExecContext* exec_context,
     bool null_rejecting)
     : exec_context_(exec_context),
-      expr_set_(logical_expressions, exec_context, null_rejecting) {
-    AssertInfo(exec_context_ != nullptr,
-               "offset expression evaluator requires an ExecContext");
+      null_rejecting_(null_rejecting),
+      expr_set_(CheckedRoot(std::move(expression), exec_context),
+                exec_context,
+                null_rejecting) {
     compact_offsets_.reserve(64);
     compact_to_lane_.reserve(64);
 }
@@ -62,12 +71,26 @@ OffsetExpressionWorkspace::EvalOffsets(OffsetVector& row_ids) {
 }
 
 OffsetExpressionTruth
-OffsetExpressionWorkspace::EvalBatch(const int32_t* row_ids,
-                                     uint32_t count,
-                                     uint64_t active_mask) {
-    AssertInfo(count <= 64,
-               "offset expression batch size {} exceeds 64",
-               count);
+OffsetExpressionWorkspace::EvalTruthBatch(const int32_t* row_ids,
+                                          uint32_t count,
+                                          uint64_t active_mask) {
+    AssertInfo(!null_rejecting_, "exact truth requires null_rejecting=false");
+    return EvaluateBatch(row_ids, count, active_mask);
+}
+
+uint64_t
+OffsetExpressionWorkspace::EvalAcceptedBatch(const int32_t* row_ids,
+                                             uint32_t count,
+                                             uint64_t active_mask) {
+    return EvaluateBatch(row_ids, count, active_mask).accepted_mask();
+}
+
+OffsetExpressionTruth
+OffsetExpressionWorkspace::EvaluateBatch(const int32_t* row_ids,
+                                         uint32_t count,
+                                         uint64_t active_mask) {
+    AssertInfo(
+        count <= 64, "offset expression batch size {} exceeds 64", count);
     const auto lane_mask = LaneMask(count);
     AssertInfo((active_mask & ~lane_mask) == 0,
                "offset expression active mask contains lanes outside batch");
@@ -106,14 +129,14 @@ OffsetExpressionWorkspace::EvalBatch(const int32_t* row_ids,
 }
 
 PreparedOffsetExpressionEvaluator::PreparedOffsetExpressionEvaluator(
-    std::vector<expr::TypedExprPtr> logical_expressions,
+    expr::TypedExprPtr expression,
     ExecContext* exec_context,
     bool null_rejecting)
-    : logical_expressions_(std::move(logical_expressions)),
+    : expression_(std::move(expression)),
       exec_context_(exec_context),
       null_rejecting_(null_rejecting) {
-    AssertInfo(!logical_expressions_.empty(),
-               "offset expression evaluator requires an expression");
+    AssertInfo(expression_ != nullptr,
+               "offset expression evaluator requires a nonnull root");
     AssertInfo(exec_context_ != nullptr,
                "offset expression evaluator requires an ExecContext");
 }
@@ -121,7 +144,7 @@ PreparedOffsetExpressionEvaluator::PreparedOffsetExpressionEvaluator(
 std::unique_ptr<OffsetExpressionWorkspace>
 PreparedOffsetExpressionEvaluator::CreateWorkspace() const {
     return std::make_unique<OffsetExpressionWorkspace>(
-        logical_expressions_, exec_context_, null_rejecting_);
+        expression_, exec_context_, null_rejecting_);
 }
 
 }  // namespace milvus::exec

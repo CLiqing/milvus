@@ -32,27 +32,35 @@ struct OffsetExpressionTruth {
 // opaque C callback and never sees ExprSet, EvalCtx or expression operators.
 class OffsetExpressionWorkspace final {
  public:
-    OffsetExpressionWorkspace(
-        const std::vector<expr::TypedExprPtr>& logical_expressions,
-        ExecContext* exec_context,
-        bool null_rejecting);
+    OffsetExpressionWorkspace(expr::TypedExprPtr expression,
+                              ExecContext* exec_context,
+                              bool null_rejecting);
 
     bool
     SupportsOffsetInput() const;
 
     // Native Milvus entry used by iterative filtering.  It preserves the
     // existing OffsetVector -> ColumnVector path without repacking or a
-    // 64-lane limit; EvalBatch below is only the future callback-shaped view.
+    // 64-lane limit. Under null rejection only data & validity is guaranteed;
+    // FALSE and UNKNOWN need not remain distinguishable.
     std::shared_ptr<ColumnVector>
     EvalOffsets(OffsetVector& row_ids);
 
     // Evaluate the active lanes in row_ids.  Inactive lanes are not read, so a
     // caller may leave their IDs unspecified.  count is limited to 64 to map
-    // directly to the eventual callback ABI.
+    // directly to the eventual callback ABI. This exact SQL truth entry is
+    // only available when the workspace was prepared without null rejection.
     OffsetExpressionTruth
-    EvalBatch(const int32_t* row_ids,
-              uint32_t count,
-              uint64_t active_mask);
+    EvalTruthBatch(const int32_t* row_ids,
+                   uint32_t count,
+                   uint64_t active_mask);
+
+    // Root-level filter result: bit i is set iff active input i is TRUE.
+    // FALSE and UNKNOWN are both rejected. Supports null-rejecting execution.
+    uint64_t
+    EvalAcceptedBatch(const int32_t* row_ids,
+                      uint32_t count,
+                      uint64_t active_mask);
 
     ExprSet&
     expr_set() {
@@ -60,7 +68,11 @@ class OffsetExpressionWorkspace final {
     }
 
  private:
+    OffsetExpressionTruth
+    EvaluateBatch(const int32_t* row_ids, uint32_t count, uint64_t active_mask);
+
     ExecContext* exec_context_;
+    bool null_rejecting_;
     ExprSet expr_set_;
     OffsetVector compact_offsets_;
     std::vector<uint32_t> compact_to_lane_;
@@ -70,19 +82,21 @@ class OffsetExpressionWorkspace final {
 // Immutable query-scoped description.  Each graph/iterator worker asks it for
 // a private workspace, avoiding concurrent access to ExprSet cursor/cache
 // state while keeping all predicate semantics in the original Milvus Expr
-// implementations.
+// implementations. This description BORROWS ExecContext and its query/segment;
+// the caller must keep them alive until every workspace is destroyed. Creating
+// private ExprSets does not make shared query/segment state thread-safe by itself.
 class PreparedOffsetExpressionEvaluator final {
  public:
-    PreparedOffsetExpressionEvaluator(
-        std::vector<expr::TypedExprPtr> logical_expressions,
-        ExecContext* exec_context,
-        bool null_rejecting = true);
+    PreparedOffsetExpressionEvaluator(expr::TypedExprPtr expression,
+                                      ExecContext* exec_context,
+                                      bool null_rejecting = false);
 
     std::unique_ptr<OffsetExpressionWorkspace>
     CreateWorkspace() const;
 
  private:
-    std::vector<expr::TypedExprPtr> logical_expressions_;
+    // One root; AND/OR/NOT composition belongs inside this expression tree.
+    expr::TypedExprPtr expression_;
     ExecContext* exec_context_;
     bool null_rejecting_;
 };

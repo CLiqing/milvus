@@ -63,13 +63,11 @@ PhyIterativeFilterNode::PhyIterativeFilterNode(
                "PhyIterativeFilterNode") {
     ExecContext* exec_context = operator_context_->get_exec_context();
     query_context_ = exec_context->get_query_context();
-    std::vector<expr::TypedExprPtr> filters;
-    filters.emplace_back(filter->filter());
     // This operator reads only the data bits of the predicate output, so
     // UNKNOWN rows are excluded exactly like FALSE — a null-rejecting
     // consumer.
     offset_evaluator_ = std::make_shared<PreparedOffsetExpressionEvaluator>(
-        std::move(filters), exec_context, /*null_rejecting=*/true);
+        filter->filter(), exec_context, /*null_rejecting=*/true);
     offset_workspace_ = offset_evaluator_->CreateWorkspace();
     is_native_supported_ = offset_workspace_->SupportsOffsetInput();
     need_process_rows_ = query_context_->get_active_count();
