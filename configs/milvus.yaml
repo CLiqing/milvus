@@ -476,6 +476,7 @@ queryCoord:
 # Related configuration of queryNode, used to run hybrid search between vector and scalar data.
 queryNode:
   groupBy:
+    strictGroupStrategy: sampling # Strict group completion strategy: sampling or per_group. Acceptance threshold zero disables both.
     strictGroupAcceptanceThreshold: 0.1 # Recreate a strict group iterator only below this acceptance ratio [0,1]. Zero disables the optimization.
     strictGroupProbeCandidates: 100 # Positive consumer candidate budget after locking strict groups, not a backend graph visit budget.
   stats:

@@ -211,6 +211,10 @@ std::map<std::string, std::string> strictGroupMembershipBuildLatencyLabels{
     {"type", "membership_build_latency"}};
 std::map<std::string, std::string> strictGroupBitmapBuildLatencyLabels{
     {"type", "bitmap_build_latency"}};
+std::map<std::string, std::string> strictGroupRecreateLatencyLabels{
+    {"type", "strict_group_recreate_latency"}};
+std::map<std::string, std::string> strictGroupSearchLatencyLabels{
+    {"type", "strict_group_search_latency"}};
 std::map<std::string, std::string> strictGroupAcceptanceRatioLabels{
     {"type", "probe_acceptance_ratio"}};
 
@@ -315,6 +319,12 @@ DEFINE_PROMETHEUS_HISTOGRAM(
     internal_core_strict_group_phase2_bitmap_build_latency,
     internal_core_search_latency,
     strictGroupBitmapBuildLatencyLabels)
+DEFINE_PROMETHEUS_HISTOGRAM(internal_core_strict_group_phase2_recreate_latency,
+                            internal_core_search_latency,
+                            strictGroupRecreateLatencyLabels)
+DEFINE_PROMETHEUS_HISTOGRAM(internal_core_strict_group_phase2_search_latency,
+                            internal_core_search_latency,
+                            strictGroupSearchLatencyLabels)
 DEFINE_PROMETHEUS_HISTOGRAM_WITH_BUCKETS(
     internal_core_strict_group_phase2_acceptance_ratio,
     internal_core_strict_group_phase2_ratio,

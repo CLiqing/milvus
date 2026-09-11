@@ -989,14 +989,19 @@ func TestQueryNodeStrictGroupSettings(t *testing.T) {
 	cfg := &params.QueryNodeCfg
 	assert.Equal(t, 0.1, cfg.StrictGroupAcceptanceThreshold.GetAsFloat())
 	assert.Equal(t, 100, cfg.StrictGroupProbeCandidates.GetAsInt())
+	assert.Equal(t, "sampling", cfg.StrictGroupStrategy.GetValue())
 	params.Save(cfg.StrictGroupAcceptanceThreshold.Key, "0")
 	params.Save(cfg.StrictGroupProbeCandidates.Key, "17")
+	params.Save(cfg.StrictGroupStrategy.Key, "per_group")
 	assert.Equal(t, 0.0, cfg.StrictGroupAcceptanceThreshold.GetAsFloat())
 	assert.Equal(t, 17, cfg.StrictGroupProbeCandidates.GetAsInt())
+	assert.Equal(t, "per_group", cfg.StrictGroupStrategy.GetValue())
 	params.Reset(cfg.StrictGroupAcceptanceThreshold.Key)
 	params.Reset(cfg.StrictGroupProbeCandidates.Key)
+	params.Reset(cfg.StrictGroupStrategy.Key)
 	assert.Equal(t, 0.1, cfg.StrictGroupAcceptanceThreshold.GetAsFloat())
 	assert.Equal(t, 100, cfg.StrictGroupProbeCandidates.GetAsInt())
+	assert.Equal(t, "sampling", cfg.StrictGroupStrategy.GetValue())
 }
 
 func TestQueryNodeMaxLoadingMemoryRatio(t *testing.T) {

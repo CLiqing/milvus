@@ -47,7 +47,7 @@ SearchOnSealedIndex(const Schema& schema,
             !search_result.vector_iterators_.has_value()) {
             return;
         }
-        search_result.SetVectorIteratorRecreator(
+        search_result.SetVectorSearchProvider(
             bitset,
             [schema_ptr,
              record_ptr,
@@ -56,16 +56,18 @@ SearchOnSealedIndex(const Schema& schema,
              query_offsets,
              num_queries,
              op_context](const BitsetView& combined_filter,
+                         std::optional<int64_t> remaining_topk,
                          SearchResult& recreated_result) {
-                SearchOnSealedIndex(*schema_ptr,
-                                    *record_ptr,
-                                    recreate_search_info,
-                                    query_data,
-                                    query_offsets,
-                                    num_queries,
-                                    combined_filter,
-                                    op_context,
-                                    recreated_result);
+                SearchOnSealedIndex(
+                    *schema_ptr,
+                    *record_ptr,
+                    StrictGroupSearchInfo(recreate_search_info, remaining_topk),
+                    query_data,
+                    query_offsets,
+                    num_queries,
+                    combined_filter,
+                    op_context,
+                    recreated_result);
             });
     };
 
@@ -191,7 +193,7 @@ SearchOnSealedColumn(const Schema& schema,
             !result.vector_iterators_.has_value()) {
             return;
         }
-        result.SetVectorIteratorRecreator(
+        result.SetVectorSearchProvider(
             bitview,
             [schema_ptr,
              column,
@@ -202,18 +204,20 @@ SearchOnSealedColumn(const Schema& schema,
              num_queries,
              row_count,
              op_context](const BitsetView& combined_filter,
+                         std::optional<int64_t> remaining_topk,
                          SearchResult& recreated_result) {
-                SearchOnSealedColumn(*schema_ptr,
-                                     column,
-                                     recreate_search_info,
-                                     recreate_index_info,
-                                     query_data,
-                                     query_offsets,
-                                     num_queries,
-                                     row_count,
-                                     combined_filter,
-                                     op_context,
-                                     recreated_result);
+                SearchOnSealedColumn(
+                    *schema_ptr,
+                    column,
+                    StrictGroupSearchInfo(recreate_search_info, remaining_topk),
+                    recreate_index_info,
+                    query_data,
+                    query_offsets,
+                    num_queries,
+                    row_count,
+                    combined_filter,
+                    op_context,
+                    recreated_result);
             });
     };
 

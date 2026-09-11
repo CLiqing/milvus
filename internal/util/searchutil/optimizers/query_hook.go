@@ -137,11 +137,18 @@ func applyStrictGroupSettings(info *planpb.QueryInfo) (bool, error) {
 	}
 	_, hadThreshold := params[common.StrictGroupAcceptanceThresholdKey]
 	_, hadProbe := params[common.StrictGroupProbeCandidatesKey]
+	_, hadStrategy := params[common.StrictGroupStrategyKey]
 	delete(params, common.StrictGroupAcceptanceThresholdKey)
 	delete(params, common.StrictGroupProbeCandidatesKey)
+	delete(params, common.StrictGroupStrategyKey)
 	eligible := info.GetStrictGroupSize() && info.GetGroupSize() > 1 && info.GetGroupByFieldId() > 0
 	if eligible {
 		cfg := &paramtable.Get().QueryNodeCfg
+		strategy := cfg.StrictGroupStrategy.GetValue()
+		if strategy != "sampling" && strategy != "per_group" {
+			return false, merr.WrapErrServiceUnavailable("invalid server config: " + cfg.StrictGroupStrategy.Key)
+		}
+		params[common.StrictGroupStrategyKey] = json.RawMessage(strconv.Quote(strategy))
 		threshold, err := strconv.ParseFloat(cfg.StrictGroupAcceptanceThreshold.GetValue(), 64)
 		if err != nil || math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold < 0 || threshold > 1 {
 			return false, merr.WrapErrServiceUnavailable("invalid server config: " + cfg.StrictGroupAcceptanceThreshold.Key)
@@ -153,7 +160,7 @@ func applyStrictGroupSettings(info *planpb.QueryInfo) (bool, error) {
 		params[common.StrictGroupAcceptanceThresholdKey] = json.RawMessage(strconv.FormatFloat(threshold, 'g', -1, 64))
 		params[common.StrictGroupProbeCandidatesKey] = json.RawMessage(strconv.FormatInt(probe, 10))
 	}
-	if !eligible && !hadThreshold && !hadProbe {
+	if !eligible && !hadThreshold && !hadProbe && !hadStrategy {
 		return false, nil
 	}
 	encoded, err := json.Marshal(params)

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <memory>
 #include <unordered_set>
+#include <unordered_map>
 
 #include "index/ScalarIndex.h"
 #include "segcore/SegmentChunkReader.h"
@@ -188,6 +189,59 @@ ScanRawField(milvus::OpContext* op_ctx,
 }
 
 }  // namespace
+
+template <typename T>
+std::optional<std::vector<std::vector<int64_t>>>
+BuildGroupOffsets(milvus::OpContext* op_ctx,
+                  const segcore::SegmentInternalInterface& segment,
+                  FieldId field_id,
+                  int64_t row_count,
+                  const std::vector<GroupKey<T>>& groups,
+                  const TargetBitmap* base_filter) {
+    if (row_count < 0 || (base_filter && base_filter->size() !=
+                                             static_cast<size_t>(row_count))) {
+        return std::nullopt;
+    }
+    std::unordered_map<GroupKey<T>, size_t> group_ids;
+    for (size_t i = 0; i < groups.size(); ++i) {
+        if (!group_ids.emplace(groups[i], i).second) {
+            return std::nullopt;
+        }
+    }
+    std::vector<std::vector<int64_t>> offsets(groups.size());
+    if (!ScanRawField<T>(op_ctx,
+                         segment,
+                         field_id,
+                         row_count,
+                         [&](size_t offset, const auto& group) {
+                             if (IsEligible(base_filter, offset)) {
+                                 auto it = group_ids.find(group);
+                                 if (it != group_ids.end()) {
+                                     offsets[it->second].push_back(offset);
+                                 }
+                             }
+                         })) {
+        return std::nullopt;
+    }
+    return offsets;
+}
+
+#define INSTANTIATE_GROUP_OFFSETS(T)                               \
+    template std::optional<std::vector<std::vector<int64_t>>>      \
+    BuildGroupOffsets<T>(milvus::OpContext*,                       \
+                         const segcore::SegmentInternalInterface&, \
+                         FieldId,                                  \
+                         int64_t,                                  \
+                         const std::vector<std::optional<T>>&,     \
+                         const TargetBitmap*);
+
+INSTANTIATE_GROUP_OFFSETS(bool)
+INSTANTIATE_GROUP_OFFSETS(int8_t)
+INSTANTIATE_GROUP_OFFSETS(int16_t)
+INSTANTIATE_GROUP_OFFSETS(int32_t)
+INSTANTIATE_GROUP_OFFSETS(int64_t)
+INSTANTIATE_GROUP_OFFSETS(std::string)
+#undef INSTANTIATE_GROUP_OFFSETS
 
 template <typename T>
 std::optional<TargetBitmap>

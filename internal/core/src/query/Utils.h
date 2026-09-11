@@ -26,6 +26,26 @@
 #include "common/Utils.h"
 
 namespace milvus::query {
+// A quota requests ordinary vector Search; no quota recreates the original
+// iterator. Never mutate the phase-one search settings or its backend budget.
+inline SearchInfo
+StrictGroupSearchInfo(const SearchInfo& original,
+                      std::optional<int64_t> remaining_topk) {
+    auto info = original;
+    if (remaining_topk) {
+        info.topk_ = *remaining_topk;
+        info.group_by_field_id_.reset();
+        info.group_size_ = 1;
+        info.strict_group_size_ = false;
+        info.iterative_filter_execution = false;
+        info.iterator_v2_info_.reset();
+        // Group-by consumes unrounded iterator distances; preserve that here.
+        info.round_decimal_ = -1;
+        info.search_params_[knowhere::meta::TOPK] = *remaining_topk;
+    }
+    return info;
+}
+
 inline bool
 CanUseStrictGroupFilteredIterator(const SearchInfo& search_info,
                                   int64_t num_queries) {

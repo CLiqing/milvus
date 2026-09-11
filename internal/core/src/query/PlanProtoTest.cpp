@@ -136,6 +136,26 @@ TEST(PlanProto, StrictGroupSettings) {
             search.search_params_.contains(kStrictGroupProbeCandidates));
         EXPECT_EQ(search.search_params_["nprobe"], 128);
     }
+    for (const auto& strategy : {"sampling", "per_group"}) {
+        info->set_search_params(
+            knowhere::Json{{kStrictGroupStrategy, strategy}}.dump());
+        auto parsed = query::ProtoParser(schema).PlanNodeFromProto(node);
+        EXPECT_EQ(parsed->search_info_.strict_group_strategy_,
+                  std::string(strategy) == "per_group"
+                      ? StrictGroupStrategy::PerGroup
+                      : StrictGroupStrategy::Sampling);
+        EXPECT_FALSE(
+            parsed->search_info_.search_params_.contains(kStrictGroupStrategy));
+    }
+    for (const auto& value : {knowhere::Json("invalid"),
+                              knowhere::Json(1),
+                              knowhere::Json(nullptr),
+                              knowhere::Json(true)}) {
+        info->set_search_params(
+            knowhere::Json{{kStrictGroupStrategy, value}}.dump());
+        EXPECT_THROW(query::ProtoParser(schema).PlanNodeFromProto(node),
+                     SegcoreError);
+    }
     for (const auto& key :
          {kStrictGroupAcceptanceThreshold, kStrictGroupProbeCandidates}) {
         for (const auto& value : {knowhere::Json(nullptr),

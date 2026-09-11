@@ -109,6 +109,9 @@ DECLARE_PROMETHEUS_HISTOGRAM(
 DECLARE_PROMETHEUS_HISTOGRAM(
     internal_core_strict_group_phase2_bitmap_build_latency);
 DECLARE_PROMETHEUS_HISTOGRAM(
+    internal_core_strict_group_phase2_recreate_latency);
+DECLARE_PROMETHEUS_HISTOGRAM(internal_core_strict_group_phase2_search_latency);
+DECLARE_PROMETHEUS_HISTOGRAM(
     internal_core_strict_group_phase2_acceptance_ratio);
 
 // async cgo metrics

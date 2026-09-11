@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "common/BitsetView.h"
@@ -150,6 +151,41 @@ AssertRecreatedIteratorUsesCombinedLogicalFilter(
     }
     EXPECT_EQ(search_result.pinned_bitsets_.size(), original_pinned_bitsets);
     EXPECT_EQ(search_result.chunk_buffers_.size(), original_chunk_buffers);
+
+    // Exercise ordinary Search through each real provider (sealed index,
+    // nullable raw chunks, growing). Quotas differ from the phase-one topK.
+    ASSERT_TRUE(search_result.CanSearchFilteredVectors());
+    auto shared_filter =
+        std::make_shared<TargetBitmap>(additional_filter.clone());
+    for (int64_t remaining : {1, 2}) {
+        auto searched =
+            search_result.SearchFilteredVectors(shared_filter, remaining);
+        ASSERT_TRUE(searched);
+        const auto& batch = **searched;
+        EXPECT_FALSE(batch.vector_iterators_.has_value());
+        EXPECT_FALSE(batch.CanSearchFilteredVectors());
+        EXPECT_EQ(batch.total_nq_, 1);
+        EXPECT_EQ(batch.unity_topK_, remaining);
+        ASSERT_EQ(batch.seg_offsets_.size(), remaining);
+        ASSERT_EQ(batch.distances_.size(), remaining);
+        std::unordered_set<int64_t> seen;
+        for (auto offset : batch.seg_offsets_) {
+            ASSERT_GE(offset, 0);
+            ASSERT_LT(offset, additional_filter.size());
+            EXPECT_TRUE(seen.insert(offset).second);
+            EXPECT_FALSE(IsFiltered(base_filter, offset));
+            EXPECT_FALSE(additional_filter[offset]);
+            EXPECT_TRUE(is_valid(offset));
+        }
+    }
+    for (size_t i = 0; i < shared_filter->size(); ++i) {
+        (*shared_filter)[i] = true;
+    }
+    auto empty = search_result.SearchFilteredVectors(shared_filter, 2);
+    ASSERT_TRUE(empty);
+    EXPECT_FALSE((**empty).vector_iterators_.has_value());
+    EXPECT_EQ((**empty).seg_offsets_,
+              (std::vector<int64_t>{INVALID_SEG_OFFSET, INVALID_SEG_OFFSET}));
 }
 
 std::unique_ptr<bool[]>

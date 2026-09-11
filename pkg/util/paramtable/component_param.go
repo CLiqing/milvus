@@ -3444,6 +3444,7 @@ Set to 0 to disable the penalty period.`,
 type queryNodeConfig struct {
 	StrictGroupAcceptanceThreshold ParamItem `refreshable:"true"`
 	StrictGroupProbeCandidates     ParamItem `refreshable:"true"`
+	StrictGroupStrategy            ParamItem `refreshable:"true"`
 	SoPath                         ParamItem `refreshable:"false"`
 
 	// stats
@@ -3665,6 +3666,12 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 		Doc: "Positive consumer candidate budget after locking strict groups, not a backend graph visit budget.",
 	}
 	p.StrictGroupProbeCandidates.Init(base.mgr)
+	p.StrictGroupStrategy = ParamItem{
+		Key:     "queryNode.groupBy.strictGroupStrategy",
+		Version: "2.6.23", DefaultValue: "sampling", Export: true,
+		Doc: "Strict group completion strategy: sampling or per_group. Acceptance threshold zero disables both.",
+	}
+	p.StrictGroupStrategy.Init(base.mgr)
 	p.IDFPreload = ParamItem{
 		Key:          "queryNode.idfOracle.preload",
 		Version:      "2.6.8",

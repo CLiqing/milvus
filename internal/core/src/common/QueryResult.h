@@ -236,6 +236,8 @@ struct VectorIterator {
 struct SearchResult {
     using VectorIteratorRecreateFn =
         std::function<void(const BitsetView&, SearchResult&)>;
+    using FilteredVectorSearchFn =
+        std::function<void(const BitsetView&, int64_t, SearchResult&)>;
 
     SearchResult() = default;
 
@@ -304,11 +306,30 @@ struct SearchResult {
             GetVectorIteratorBaseFilter();
         }
         vector_iterator_recreate_fn_ = std::move(recreate_fn);
+        filtered_vector_search_fn_ = {};
+    }
+
+    void
+    SetVectorSearchProvider(const BitsetView& base_filter,
+                            std::function<void(const BitsetView&,
+                                               std::optional<int64_t>,
+                                               SearchResult&)> provider) {
+        SetVectorIteratorRecreator(
+            base_filter,
+            [provider](const BitsetView& filter, SearchResult& out) {
+                provider(filter, std::nullopt, out);
+            });
+        filtered_vector_search_fn_ = [provider](const BitsetView& filter,
+                                                int64_t topk,
+                                                SearchResult& out) {
+            provider(filter, topk, out);
+        };
     }
 
     void
     ClearVectorIteratorRecreator() {
         vector_iterator_recreate_fn_ = {};
+        filtered_vector_search_fn_ = {};
         vector_iterator_base_filter_view_ = {};
         vector_iterator_base_filter_.reset();
         vector_iterator_filter_owner_.reset();
@@ -375,6 +396,36 @@ struct SearchResult {
         return recreated_result;
     }
 
+    bool
+    CanSearchFilteredVectors() const {
+        return allow_vector_iterator_recreation_ &&
+               static_cast<bool>(filtered_vector_search_fn_);
+    }
+
+    // Synchronous ordinary top-k search. Serial callers may reuse the bitmap
+    // after releasing the result; each invocation gets a fresh BitsetView.
+    std::optional<std::unique_ptr<SearchResult>>
+    SearchFilteredVectors(const std::shared_ptr<TargetBitmap>& filter,
+                          int64_t topk) {
+        if (!filter || topk <= 0 || !CanSearchFilteredVectors()) {
+            return std::nullopt;
+        }
+        const auto* base = GetVectorIteratorBaseFilter();
+        if (base && base->size() != filter->size()) {
+            return std::nullopt;
+        }
+        if (base) {
+            *filter |= *base;
+        }
+        auto result = std::make_unique<SearchResult>();
+        result->allow_vector_iterator_recreation_ = false;
+        result->vector_iterator_filter_owner_ = filter;
+        filtered_vector_search_fn_(BitsetView(*filter), topk, *result);
+        AssertInfo(!result->vector_iterators_.has_value(),
+                   "ordinary filtered search must not return iterators");
+        return result;
+    }
+
  public:
     int64_t total_nq_;
     int64_t unity_topK_;
@@ -413,6 +464,7 @@ struct SearchResult {
     // exclusion bitmap. The callback re-enters the same sealed/growing search
     // provider so offset mapping and backend selection stay centralized there.
     VectorIteratorRecreateFn vector_iterator_recreate_fn_{};
+    FilteredVectorSearchFn filtered_vector_search_fn_{};
     TargetBitmapPtr vector_iterator_base_filter_{};
     BitsetView vector_iterator_base_filter_view_{};
     std::shared_ptr<const void> vector_iterator_filter_owner_{};

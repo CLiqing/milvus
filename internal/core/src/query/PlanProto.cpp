@@ -41,6 +41,16 @@ namespace {
 void
 ParseStrictGroupSettings(SearchInfo& info) {
     auto& params = info.search_params_;
+    if (auto it = params.find(kStrictGroupStrategy); it != params.end()) {
+        if (!it->is_string() || (*it != "sampling" && *it != "per_group")) {
+            ThrowInfo(InvalidParameter,
+                      "strict group strategy must be sampling or per_group");
+        }
+        info.strict_group_strategy_ = *it == "per_group"
+                                          ? StrictGroupStrategy::PerGroup
+                                          : StrictGroupStrategy::Sampling;
+        params.erase(it);
+    }
     if (auto it = params.find(kStrictGroupAcceptanceThreshold);
         it != params.end()) {
         if (!it->is_number()) {

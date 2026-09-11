@@ -22,6 +22,7 @@
 #include "knowhere/comp/index_param.h"
 
 const int64_t INVALID_FIELD_ID = -1;
+inline constexpr char kStrictGroupStrategy[] = "strict_group_strategy";
 inline constexpr char kStrictGroupAcceptanceThreshold[] =
     "strict_group_acceptance_threshold";
 inline constexpr char kStrictGroupProbeCandidates[] =

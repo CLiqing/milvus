@@ -88,7 +88,7 @@ SearchOnGrowing(const segcore::SegmentGrowingImpl& segment,
             !search_result.vector_iterators_.has_value()) {
             return;
         }
-        search_result.SetVectorIteratorRecreator(
+        search_result.SetVectorSearchProvider(
             bitset,
             [segment_ptr,
              recreate_search_info = info,
@@ -97,16 +97,18 @@ SearchOnGrowing(const segcore::SegmentGrowingImpl& segment,
              num_queries,
              timestamp,
              op_context](const BitsetView& combined_filter,
+                         std::optional<int64_t> remaining_topk,
                          SearchResult& recreated_result) {
-                SearchOnGrowing(*segment_ptr,
-                                recreate_search_info,
-                                query_data,
-                                query_offsets,
-                                num_queries,
-                                timestamp,
-                                combined_filter,
-                                op_context,
-                                recreated_result);
+                SearchOnGrowing(
+                    *segment_ptr,
+                    StrictGroupSearchInfo(recreate_search_info, remaining_topk),
+                    query_data,
+                    query_offsets,
+                    num_queries,
+                    timestamp,
+                    combined_filter,
+                    op_context,
+                    recreated_result);
             });
     };
 
