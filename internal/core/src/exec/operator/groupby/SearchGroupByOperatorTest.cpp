@@ -810,6 +810,8 @@ TEST(StrictGroupPerGroupTest, IsolatedFiltersReuseStorageAndResumeOriginal) {
                     for (size_t i = 0; i < labels.size(); ++i) {
                         EXPECT_EQ(invalid.test(i), i != 5 && i != 6);
                     }
+                    EXPECT_EQ(invalid.get_filtered_out_num_(),
+                              labels.size() - 2);
                     if (response != 3) {
                         batch.seg_offsets_ = {5,
                                               response == 1
@@ -858,13 +860,25 @@ TEST(StrictGroupPerGroupTest, IsolatedFiltersReuseStorageAndResumeOriginal) {
     }
 }
 
-TEST(StrictGroupPerGroupTest, MultipleGroupsAndSharedFilterLifetime) {
-    constexpr int64_t n = 120;
+class StrictGroupPerGroupPaddingTest
+    : public ::testing::TestWithParam<int64_t> {};
+
+TEST_P(StrictGroupPerGroupPaddingTest, MultipleGroupsAndSharedFilterLifetime) {
+    const int64_t n = GetParam();
     auto schema = std::make_shared<Schema>();
     auto pk = schema->AddDebugField("pk", DataType::INT64);
     auto field = schema->AddDebugField("group", DataType::INT64);
     schema->set_primary_field_id(pk);
     auto data = segcore::DataGen(schema, n, 42, 0, 4);
+    // Keep group quotas satisfiable for every logical-size remainder.
+    for (auto& column : *data.raw_->mutable_fields_data()) {
+        if (column.field_id() == field.get()) {
+            auto* values = column.mutable_scalars()->mutable_long_data();
+            for (int64_t i = 0; i < n; ++i) {
+                values->set_data(i, i % 4);
+            }
+        }
+    }
     auto segment = CreateSealedWithFieldDataLoaded(schema, data);
     auto labels = data.get_col<int64_t>(field);
     std::unordered_map<int64_t, std::vector<int64_t>> by_group;
@@ -911,6 +925,11 @@ TEST(StrictGroupPerGroupTest, MultipleGroupsAndSharedFilterLifetime) {
                 EXPECT_EQ(invalid.test(i),
                           base[i] || labels[i] != target || accepted);
             }
+            size_t expected_filtered = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                expected_filtered += invalid.test(i);
+            }
+            EXPECT_EQ(invalid.get_filtered_out_num_(), expected_filtered);
             for (int64_t i = 0; i < n && batch.seg_offsets_.size() < *topk;
                  ++i) {
                 if (!invalid.test(i)) {
@@ -945,6 +964,11 @@ TEST(StrictGroupPerGroupTest, MultipleGroupsAndSharedFilterLifetime) {
         std::unordered_set<int64_t>(offsets.begin(), offsets.end()).size(), 9);
     EXPECT_EQ(std::count(offsets.begin(), offsets.end(), excluded), 0);
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    AllByteRemainders,
+    StrictGroupPerGroupPaddingTest,
+    ::testing::Values(120, 121, 122, 123, 124, 125, 126, 127));
 
 TEST(StrictGroupPhase2ExecutorTest, ProbeBoundaryAndOnlyOneDecision) {
     for (int accepted : {9, 10, 11}) {

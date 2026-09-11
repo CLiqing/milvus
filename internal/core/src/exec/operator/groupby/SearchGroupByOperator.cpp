@@ -404,7 +404,10 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
 
         auto bitmap_start = std::chrono::steady_clock::now();
         auto filter = std::make_shared<TargetBitmap>(
-            context->search_result->total_data_cnt_, true);
+            context->search_result->total_data_cnt_, false);
+        // Flip only logical rows: Knowhere counts every bit in the last byte,
+        // so padding bits must stay zero even for an all-invalid filter.
+        filter->flip();
         stats.bitmap_build_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - bitmap_start)
