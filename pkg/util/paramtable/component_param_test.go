@@ -987,6 +987,11 @@ func TestQueryNodeStrictGroupSettings(t *testing.T) {
 	params := &ComponentParam{}
 	params.Init(NewBaseTable(SkipRemote(true)))
 	cfg := &params.QueryNodeCfg
+	assert.False(t, cfg.StrictGroupDebug.GetAsBool())
+	params.Save(cfg.StrictGroupDebug.Key, "true")
+	assert.True(t, cfg.StrictGroupDebug.GetAsBool())
+	params.Reset(cfg.StrictGroupDebug.Key)
+	assert.False(t, cfg.StrictGroupDebug.GetAsBool())
 	assert.Equal(t, 0.1, cfg.StrictGroupAcceptanceThreshold.GetAsFloat())
 	assert.Equal(t, 100, cfg.StrictGroupProbeCandidates.GetAsInt())
 	assert.Equal(t, "sampling", cfg.StrictGroupStrategy.GetValue())
@@ -996,6 +1001,8 @@ func TestQueryNodeStrictGroupSettings(t *testing.T) {
 	assert.Equal(t, 0.0, cfg.StrictGroupAcceptanceThreshold.GetAsFloat())
 	assert.Equal(t, 17, cfg.StrictGroupProbeCandidates.GetAsInt())
 	assert.Equal(t, "per_group", cfg.StrictGroupStrategy.GetValue())
+	params.Save(cfg.StrictGroupStrategy.Key, "filtered_iterator")
+	assert.Equal(t, "filtered_iterator", cfg.StrictGroupStrategy.GetValue())
 	params.Reset(cfg.StrictGroupAcceptanceThreshold.Key)
 	params.Reset(cfg.StrictGroupProbeCandidates.Key)
 	params.Reset(cfg.StrictGroupStrategy.Key)

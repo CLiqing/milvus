@@ -25,7 +25,7 @@
 
 namespace milvus {
 
-enum class StrictGroupStrategy { Sampling, PerGroup };
+enum class StrictGroupStrategy { Sampling, FilteredIterator, PerGroup };
 
 struct SearchIteratorV2Info {
     std::string token = "";
@@ -40,6 +40,7 @@ struct SearchInfo {
     double strict_group_acceptance_threshold_{0.1};
     int64_t strict_group_probe_candidates_{100};
     StrictGroupStrategy strict_group_strategy_{StrictGroupStrategy::Sampling};
+    bool strict_group_debug_{false};
     int64_t round_decimal_{0};
     FieldId field_id_;
     MetricType metric_type_;

@@ -3445,6 +3445,7 @@ type queryNodeConfig struct {
 	StrictGroupAcceptanceThreshold ParamItem `refreshable:"true"`
 	StrictGroupProbeCandidates     ParamItem `refreshable:"true"`
 	StrictGroupStrategy            ParamItem `refreshable:"true"`
+	StrictGroupDebug               ParamItem `refreshable:"true"`
 	SoPath                         ParamItem `refreshable:"false"`
 
 	// stats
@@ -3669,9 +3670,15 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 	p.StrictGroupStrategy = ParamItem{
 		Key:     "queryNode.groupBy.strictGroupStrategy",
 		Version: "2.6.23", DefaultValue: "sampling", Export: true,
-		Doc: "Strict group completion strategy: sampling or per_group. Acceptance threshold zero disables both.",
+		Doc: "Strict group completion strategy: sampling, filtered_iterator or per_group. Acceptance threshold zero disables all strategies.",
 	}
 	p.StrictGroupStrategy.Init(base.mgr)
+	p.StrictGroupDebug = ParamItem{
+		Key:     "queryNode.groupBy.strictGroupDebug",
+		Version: "2.6.23", DefaultValue: "false", Export: true,
+		Doc: "Opt-in segment/stage diagnostic logs; no per-candidate logs or customer field values.",
+	}
+	p.StrictGroupDebug.Init(base.mgr)
 	p.IDFPreload = ParamItem{
 		Key:          "queryNode.idfOracle.preload",
 		Version:      "2.6.8",

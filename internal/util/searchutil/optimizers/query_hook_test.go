@@ -3,6 +3,7 @@ package optimizers
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/mock"
@@ -248,9 +249,11 @@ func (suite *QueryHookSuite) TestStrictGroupServerSettings() {
 	vKey := cfg.QueryNodeCfg.StrictGroupAcceptanceThreshold.Key
 	tKey := cfg.QueryNodeCfg.StrictGroupProbeCandidates.Key
 	sKey := cfg.QueryNodeCfg.StrictGroupStrategy.Key
+	dKey := cfg.QueryNodeCfg.StrictGroupDebug.Key
 	defer cfg.Reset(vKey)
 	defer cfg.Reset(tKey)
 	defer cfg.Reset(sKey)
+	defer cfg.Reset(dKey)
 	defer cfg.Reset(cfg.AutoIndexConfig.Enable.Key)
 	makeRequest := func(strict bool, raw string) *querypb.SearchRequest {
 		p := &planpb.PlanNode{Node: &planpb.PlanNode_VectorAnns{VectorAnns: &planpb.VectorANNS{
@@ -270,7 +273,7 @@ func (suite *QueryHookSuite) TestStrictGroupServerSettings() {
 		suite.Require().NoError(json.Unmarshal([]byte(p.GetVectorAnns().GetQueryInfo().GetSearchParams()), &values))
 		return values
 	}
-	raw := `{"large":9007199254740993,"text":"0.5","strict_group_acceptance_threshold":"bad","strict_group_probe_candidates":-1,"strict_group_strategy":"invalid-client"}`
+	raw := `{"large":9007199254740993,"text":"0.5","strict_group_acceptance_threshold":"bad","strict_group_probe_candidates":-1,"strict_group_strategy":"invalid-client","strict_group_debug":"invalid-client"}`
 	// Exercise no hook, AutoIndex disabled, a hook dropping all caller keys,
 	// and a hook injecting conflicting/invalid values.
 	for _, enabled := range []string{"false", "true"} {
@@ -289,18 +292,21 @@ func (suite *QueryHookSuite) TestStrictGroupServerSettings() {
 			cfg.Save(vKey, "0.5")
 			cfg.Save(tKey, "17")
 			cfg.Save(sKey, "per_group")
+			cfg.Save(dKey, "true")
 			req, err := OptimizeSearchParams(context.Background(), makeRequest(true, raw), hook, 1)
 			suite.Require().NoError(err)
 			values := readParams(req)
 			suite.Equal("0.5", string(values[common.StrictGroupAcceptanceThresholdKey]))
 			suite.Equal("17", string(values[common.StrictGroupProbeCandidatesKey]))
 			suite.Equal(`"per_group"`, string(values[common.StrictGroupStrategyKey]))
+			suite.Equal("true", string(values[common.StrictGroupDebugKey]))
 			suite.Equal("9007199254740993", string(values["large"]))
 			suite.Equal(`"0.5"`, string(values["text"]))
 			// Updating config affects a later request, not the serialized snapshot.
 			cfg.Save(vKey, "0")
 			cfg.Save(tKey, "1")
 			cfg.Save(sKey, "sampling")
+			cfg.Save(dKey, "false")
 			next, err := OptimizeSearchParams(context.Background(), makeRequest(true, raw), nil, 1)
 			suite.Require().NoError(err)
 			suite.Equal("0", string(readParams(next)[common.StrictGroupAcceptanceThresholdKey]))
@@ -308,6 +314,8 @@ func (suite *QueryHookSuite) TestStrictGroupServerSettings() {
 			suite.Equal("17", string(readParams(req)[common.StrictGroupProbeCandidatesKey]))
 			suite.Equal(`"sampling"`, string(readParams(next)[common.StrictGroupStrategyKey]))
 			suite.Equal(`"per_group"`, string(readParams(req)[common.StrictGroupStrategyKey]))
+			suite.Equal("false", string(readParams(next)[common.StrictGroupDebugKey]))
+			suite.Equal("true", string(readParams(req)[common.StrictGroupDebugKey]))
 		}
 	}
 	cfg.Reset(vKey)
@@ -318,16 +326,27 @@ func (suite *QueryHookSuite) TestStrictGroupServerSettings() {
 	suite.Equal("0.1", string(readParams(defaultReq)[common.StrictGroupAcceptanceThresholdKey]))
 	suite.Equal("100", string(readParams(defaultReq)[common.StrictGroupProbeCandidatesKey]))
 	suite.Equal(`"sampling"`, string(readParams(defaultReq)[common.StrictGroupStrategyKey]))
+	suite.Equal("false", string(readParams(defaultReq)[common.StrictGroupDebugKey]))
+	// All strategies are server controlled, including direct union filtering.
+	for _, strategy := range []string{"sampling", "filtered_iterator", "per_group"} {
+		cfg.Save(sKey, strategy)
+		req, err := OptimizeSearchParams(context.Background(), makeRequest(true, raw), nil, 1)
+		suite.Require().NoError(err)
+		suite.Equal(strconv.Quote(strategy), string(readParams(req)[common.StrictGroupStrategyKey]))
+	}
+	cfg.Reset(sKey)
 	// Caller-controlled values are removed even on non-strict queries.
 	plain, err := OptimizeSearchParams(context.Background(), makeRequest(false, raw), nil, 1)
 	suite.Require().NoError(err)
 	suite.NotContains(readParams(plain), common.StrictGroupAcceptanceThresholdKey)
 	suite.NotContains(readParams(plain), common.StrictGroupProbeCandidatesKey)
 	suite.NotContains(readParams(plain), common.StrictGroupStrategyKey)
+	suite.NotContains(readParams(plain), common.StrictGroupDebugKey)
 	for key, badValues := range map[string][]string{
 		vKey: {"-0.1", "1.1", "NaN", "+Inf", "bad"},
 		tKey: {"0", "-1", "1.5", "9223372036854775808", "bad"},
 		sKey: {"", "PER_GROUP", "other", "1"},
+		dKey: {"", "other", "0.5"},
 	} {
 		for _, value := range badValues {
 			cfg.Save(key, value)

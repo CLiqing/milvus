@@ -41,14 +41,28 @@ namespace {
 void
 ParseStrictGroupSettings(SearchInfo& info) {
     auto& params = info.search_params_;
-    if (auto it = params.find(kStrictGroupStrategy); it != params.end()) {
-        if (!it->is_string() || (*it != "sampling" && *it != "per_group")) {
-            ThrowInfo(InvalidParameter,
-                      "strict group strategy must be sampling or per_group");
+    if (auto it = params.find(kStrictGroupDebug); it != params.end()) {
+        if (!it->is_boolean()) {
+            ThrowInfo(InvalidParameter, "strict group debug must be boolean");
         }
-        info.strict_group_strategy_ = *it == "per_group"
-                                          ? StrictGroupStrategy::PerGroup
-                                          : StrictGroupStrategy::Sampling;
+        info.strict_group_debug_ = it->get<bool>();
+        params.erase(it);
+    }
+    if (auto it = params.find(kStrictGroupStrategy); it != params.end()) {
+        if (!it->is_string() ||
+            (*it != "sampling" && *it != "filtered_iterator" &&
+             *it != "per_group")) {
+            ThrowInfo(InvalidParameter,
+                      "strict group strategy must be sampling, "
+                      "filtered_iterator or per_group");
+        }
+        if (*it == "per_group") {
+            info.strict_group_strategy_ = StrictGroupStrategy::PerGroup;
+        } else if (*it == "filtered_iterator") {
+            info.strict_group_strategy_ = StrictGroupStrategy::FilteredIterator;
+        } else {
+            info.strict_group_strategy_ = StrictGroupStrategy::Sampling;
+        }
         params.erase(it);
     }
     if (auto it = params.find(kStrictGroupAcceptanceThreshold);

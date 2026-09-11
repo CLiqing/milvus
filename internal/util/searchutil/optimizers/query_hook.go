@@ -138,14 +138,21 @@ func applyStrictGroupSettings(info *planpb.QueryInfo) (bool, error) {
 	_, hadThreshold := params[common.StrictGroupAcceptanceThresholdKey]
 	_, hadProbe := params[common.StrictGroupProbeCandidatesKey]
 	_, hadStrategy := params[common.StrictGroupStrategyKey]
+	_, hadDebug := params[common.StrictGroupDebugKey]
 	delete(params, common.StrictGroupAcceptanceThresholdKey)
 	delete(params, common.StrictGroupProbeCandidatesKey)
 	delete(params, common.StrictGroupStrategyKey)
+	delete(params, common.StrictGroupDebugKey)
 	eligible := info.GetStrictGroupSize() && info.GetGroupSize() > 1 && info.GetGroupByFieldId() > 0
 	if eligible {
 		cfg := &paramtable.Get().QueryNodeCfg
+		debug, err := strconv.ParseBool(cfg.StrictGroupDebug.GetValue())
+		if err != nil {
+			return false, merr.WrapErrServiceUnavailable("invalid server config: " + cfg.StrictGroupDebug.Key)
+		}
+		params[common.StrictGroupDebugKey] = json.RawMessage(strconv.FormatBool(debug))
 		strategy := cfg.StrictGroupStrategy.GetValue()
-		if strategy != "sampling" && strategy != "per_group" {
+		if strategy != "sampling" && strategy != "filtered_iterator" && strategy != "per_group" {
 			return false, merr.WrapErrServiceUnavailable("invalid server config: " + cfg.StrictGroupStrategy.Key)
 		}
 		params[common.StrictGroupStrategyKey] = json.RawMessage(strconv.Quote(strategy))
@@ -160,7 +167,7 @@ func applyStrictGroupSettings(info *planpb.QueryInfo) (bool, error) {
 		params[common.StrictGroupAcceptanceThresholdKey] = json.RawMessage(strconv.FormatFloat(threshold, 'g', -1, 64))
 		params[common.StrictGroupProbeCandidatesKey] = json.RawMessage(strconv.FormatInt(probe, 10))
 	}
-	if !eligible && !hadThreshold && !hadProbe && !hadStrategy {
+	if !eligible && !hadThreshold && !hadProbe && !hadStrategy && !hadDebug {
 		return false, nil
 	}
 	encoded, err := json.Marshal(params)

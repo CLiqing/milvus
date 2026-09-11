@@ -179,6 +179,7 @@ const (
 	StrictGroupAcceptanceThresholdKey = "strict_group_acceptance_threshold"
 	StrictGroupProbeCandidatesKey     = "strict_group_probe_candidates"
 	StrictGroupStrategyKey            = "strict_group_strategy"
+	StrictGroupDebugKey               = "strict_group_debug"
 	SegmentNumKey                     = "segment_num"
 	WithFilterKey                     = "with_filter"
 	DataTypeKey                       = "data_type"
