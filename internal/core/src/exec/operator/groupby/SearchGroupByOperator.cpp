@@ -42,8 +42,35 @@ enum class StrictGroupPhase2FallbackReason {
     MembershipUnavailable,
     ProbeAcceptanceHigh,
     RecreateUnavailable,
-    RecreatedExhausted,
 };
+
+enum class StrictGroupCompletionReason {
+    None,
+    QuotaSatisfied,
+    NoAvailableRows,
+    InsufficientAvailableRows,
+    SearchShortResult,
+    FilteredIteratorExhausted,
+};
+
+const char*
+CompletionReasonName(StrictGroupCompletionReason reason) {
+    switch (reason) {
+        case StrictGroupCompletionReason::None:
+            return "none";
+        case StrictGroupCompletionReason::QuotaSatisfied:
+            return "quota_satisfied";
+        case StrictGroupCompletionReason::NoAvailableRows:
+            return "no_available_rows";
+        case StrictGroupCompletionReason::InsufficientAvailableRows:
+            return "insufficient_available_rows";
+        case StrictGroupCompletionReason::SearchShortResult:
+            return "search_short_result";
+        case StrictGroupCompletionReason::FilteredIteratorExhausted:
+            return "filtered_iterator_exhausted";
+    }
+    return "unknown";
+}
 
 enum class StrictGroupDecision {
     NotEvaluated,
@@ -73,6 +100,9 @@ DecisionName(StrictGroupDecision decision) {
 struct StrictGroupPhase2Stats {
     bool attempted = false;
     bool used = false;
+    bool original_iterator_skipped = false;
+    StrictGroupCompletionReason completion_reason =
+        StrictGroupCompletionReason::None;
     size_t phase1_candidates = 0;
     size_t phase2_candidates = 0;
     size_t probe_candidates = 0;
@@ -133,8 +163,6 @@ FallbackReasonName(StrictGroupPhase2FallbackReason reason) {
             return "probe_acceptance_high";
         case StrictGroupPhase2FallbackReason::RecreateUnavailable:
             return "recreate_unavailable";
-        case StrictGroupPhase2FallbackReason::RecreatedExhausted:
-            return "recreated_exhausted";
     }
     return "unknown";
 }
@@ -294,6 +322,9 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
             {"group_ordinal", group_ordinal},
             {"requested_k", requested_k},
             {"fallback", FallbackReasonName(stats.fallback_reason)},
+            {"completion_reason",
+             CompletionReasonName(stats.completion_reason)},
+            {"original_iterator_skipped", stats.original_iterator_skipped},
             {"decision", DecisionName(stats.decision)},
             {"phase1_candidates_including_probe", stats.phase1_candidates},
             {"probe_candidates", stats.probe_candidates},
@@ -324,6 +355,10 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
     }
     stats.attempted = true;
     auto finish = [&] {
+        if (group_map.IsGroupResEnough()) {
+            stats.completion_reason =
+                StrictGroupCompletionReason::QuotaSatisfied;
+        }
         RecordStrictGroupPhase2Stats(stats);
         diagnostic("finish");
     };
@@ -413,6 +448,8 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
                 std::chrono::steady_clock::now() - bitmap_start)
                 .count();
         collector.EnableOffsetDeduplication();
+        bool insufficient_available = false;
+        bool had_available_rows = false;
         for (size_t i = 0; i < groups.size(); ++i) {
             segcore::CheckCancellation(context->op_ctx,
                                        context->segment.get_segment_id(),
@@ -432,10 +469,16 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
                     .count();
             const auto remaining = group_map.GetRemainingGroupSize(groups[i]);
             diagnostic("group_search_begin", available, i, remaining);
+            if (available < remaining) {
+                insufficient_available = true;
+                diagnostic(
+                    "group_search_insufficient", available, i, remaining);
+            }
             if (available == 0) {
                 diagnostic("group_search_empty", available, i, remaining);
                 continue;
             }
+            had_available_rows = true;
             auto search_start = std::chrono::steady_clock::now();
             auto batch = context->search_result->SearchFilteredVectors(
                 filter, remaining);
@@ -483,11 +526,16 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
                     std::chrono::steady_clock::now() - bitmap_start)
                     .count();
         }
-        if (!group_map.IsGroupResEnough()) {
-            stats.fallback_reason =
-                StrictGroupPhase2FallbackReason::RecreatedExhausted;
-            return continue_original();
-        }
+        // A successful ordinary Search may return fewer rows than requested.
+        // Preserve those rows for reduction; never chase the missing quota in
+        // the original, unfiltered iterator (local groups may be too small).
+        stats.original_iterator_skipped = true;
+        stats.completion_reason =
+            !had_available_rows
+                ? StrictGroupCompletionReason::NoAvailableRows
+                : (insufficient_available
+                       ? StrictGroupCompletionReason::InsufficientAvailableRows
+                       : StrictGroupCompletionReason::SearchShortResult);
         finish();
         return true;
     }
@@ -528,14 +576,17 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
     }
 
     std::vector<std::optional<T>> unfinished_groups;
+    int64_t requested_rows = 0;
     for (const auto& group : group_map.GetGroupOrder()) {
         if (!group_map.IsGroupFull(group)) {
             unfinished_groups.emplace_back(group);
+            requested_rows += group_map.GetRemainingGroupSize(group);
         }
     }
     AssertInfo(!unfinished_groups.empty(),
                "strict group phase2 has no unfinished group");
 
+    int64_t available_rows = -1;
     auto prepare = [&]() -> std::optional<std::unique_ptr<SearchResult>> {
         auto membership_start = std::chrono::steady_clock::now();
         auto membership = BuildGroupMembership<T>(
@@ -558,15 +609,21 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
         auto bitmap_start = std::chrono::steady_clock::now();
         membership->flip();
         collector.ExcludeAcceptedOffsets(*membership);
+        // Count logical bits after applying visibility and accepted-row
+        // exclusions. This one word-wise pass also avoids creating an iterator
+        // for an empty filter; it is required even when diagnostics are off.
+        available_rows = membership->size() - membership->count();
         stats.bitmap_build_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - bitmap_start)
                 .count();
-        // A full bitmap count is diagnostic-only; do not add it to timing runs.
-        diagnostic("union_filter_ready",
-                   debug ? static_cast<int64_t>(membership->size() -
-                                                membership->count())
-                         : -1);
+        diagnostic("union_filter_ready", available_rows);
+        if (available_rows < requested_rows) {
+            diagnostic("union_filter_insufficient", available_rows);
+        }
+        if (available_rows == 0) {
+            return std::nullopt;
+        }
         auto recreate_start = std::chrono::steady_clock::now();
         auto result = context->search_result->RecreateVectorIterators(
             std::move(*membership));
@@ -583,6 +640,13 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
     } catch (const std::exception& error) {
         LOG_WARN("strict group iterator preparation failed: {}", error.what());
         throw;
+    }
+    if (available_rows == 0) {
+        stats.original_iterator_skipped = true;
+        stats.completion_reason = StrictGroupCompletionReason::NoAvailableRows;
+        diagnostic("union_filter_empty", available_rows);
+        finish();
+        return true;
     }
     if (!recreated.has_value()) {
         if (stats.fallback_reason == StrictGroupPhase2FallbackReason::None) {
@@ -612,11 +676,13 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
     diagnostic("filtered_consume_end");
     context->search_result->search_storage_cost_ +=
         batch_result.search_storage_cost_;
-    if (!group_map.IsGroupResEnough()) {
-        stats.fallback_reason =
-            StrictGroupPhase2FallbackReason::RecreatedExhausted;
-        return continue_original();
-    }
+    // Normal exhaustion is terminal, not a preparation failure. In particular,
+    // no iterator can fill a quota larger than this segment's eligible group.
+    stats.original_iterator_skipped = true;
+    stats.completion_reason =
+        available_rows < requested_rows
+            ? StrictGroupCompletionReason::InsufficientAvailableRows
+            : StrictGroupCompletionReason::FilteredIteratorExhausted;
     finish();
     return true;
 }

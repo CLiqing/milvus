@@ -101,7 +101,7 @@ func OptimizeSearchParams(ctx context.Context, req *querypb.SearchRequest, query
 				req.Req.IsRecallEvaluation = false
 			}
 		}
-		changed, err := applyStrictGroupSettings(queryInfo)
+		changed, err := applyStrictGroupSettings(ctx, queryInfo)
 		if err != nil {
 			return nil, err
 		}
@@ -123,7 +123,7 @@ func OptimizeSearchParams(ctx context.Context, req *querypb.SearchRequest, query
 // applyStrictGroupSettings runs after the hook, including when it is disabled.
 // Server settings override caller/hook values; unrelated JSON values retain
 // their exact numeric/string types. The serialized plan freezes this snapshot.
-func applyStrictGroupSettings(info *planpb.QueryInfo) (bool, error) {
+func applyStrictGroupSettings(ctx context.Context, info *planpb.QueryInfo) (bool, error) {
 	raw := info.GetSearchParams()
 	if raw == "" {
 		raw = "{}"
@@ -166,6 +166,16 @@ func applyStrictGroupSettings(info *planpb.QueryInfo) (bool, error) {
 		}
 		params[common.StrictGroupAcceptanceThresholdKey] = json.RawMessage(strconv.FormatFloat(threshold, 'g', -1, 64))
 		params[common.StrictGroupProbeCandidatesKey] = json.RawMessage(strconv.FormatInt(probe, 10))
+		if debug {
+			// Log the exact snapshot injected after the hook, not another config
+			// read that might race a refresh. Never log caller search payloads.
+			log.Ctx(ctx).Info("strict_group_config_snapshot",
+				zap.Int64("node_id", paramtable.GetNodeID()),
+				zap.String("strategy", strategy),
+				zap.Float64("acceptance_threshold", threshold),
+				zap.Int64("probe_budget", probe),
+				zap.Bool("strict_group_debug", debug))
+		}
 	}
 	if !eligible && !hadThreshold && !hadProbe && !hadStrategy && !hadDebug {
 		return false, nil

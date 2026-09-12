@@ -37,6 +37,29 @@ namespace milvus::exec {
 
 namespace {
 
+class StrictGroupLogSink final : public google::LogSink {
+ public:
+    std::mutex mutex;
+    std::vector<knowhere::Json> records;
+    void
+    send(google::LogSeverity,
+         const char*,
+         const char*,
+         int,
+         const std::tm*,
+         const char* message,
+         size_t length) override {
+        const std::string text(message, length);
+        const std::string marker = "strict_group_diagnostic ";
+        auto pos = text.find(marker);
+        if (pos != std::string::npos) {
+            std::lock_guard<std::mutex> lock(mutex);
+            records.push_back(
+                knowhere::Json::parse(text.substr(pos + marker.size())));
+        }
+    }
+};
+
 class CountingScalarIndex : public index::ScalarIndexSort<int64_t> {
  public:
     size_t in_calls = 0;
@@ -483,28 +506,7 @@ CheckProbeScenario(
 }  // namespace
 
 TEST(StrictGroupDiagnosticsTest, OptInAndFallbackStages) {
-    class Sink final : public google::LogSink {
-     public:
-        std::mutex mutex;
-        std::vector<knowhere::Json> records;
-        void
-        send(google::LogSeverity,
-             const char*,
-             const char*,
-             int,
-             const std::tm*,
-             const char* message,
-             size_t length) override {
-            const std::string text(message, length);
-            const std::string marker = "strict_group_diagnostic ";
-            auto pos = text.find(marker);
-            if (pos != std::string::npos) {
-                std::lock_guard<std::mutex> lock(mutex);
-                records.push_back(
-                    knowhere::Json::parse(text.substr(pos + marker.size())));
-            }
-        }
-    } sink;
+    StrictGroupLogSink sink;
     google::AddLogSink(&sink);
     Defer remove_sink([&] { google::RemoveLogSink(&sink); });
     std::vector<int64_t> labels(300, 2);
@@ -514,7 +516,7 @@ TEST(StrictGroupDiagnosticsTest, OptInAndFallbackStages) {
                           StrictGroupStrategy::PerGroup}) {
         for (bool debug : {false, true}) {
             sink.records.clear();
-            // Return a short filtered iterator to exercise original fallback.
+            // A short filtered iterator ends locally, without original fallback.
             // The test provider has no ordinary Search, so per_group falls back.
             const bool per_group = strategy == StrictGroupStrategy::PerGroup;
             CheckProbeScenario(labels,
@@ -522,7 +524,7 @@ TEST(StrictGroupDiagnosticsTest, OptInAndFallbackStages) {
                                1,
                                3,
                                per_group ? 0 : 1,
-                               3,
+                               per_group ? 3 : 2,
                                std::nullopt,
                                nullptr,
                                nullptr,
@@ -538,7 +540,13 @@ TEST(StrictGroupDiagnosticsTest, OptInAndFallbackStages) {
             ASSERT_FALSE(sink.records.empty());
             EXPECT_EQ(sink.records.front()["stage"], "begin");
             EXPECT_EQ(sink.records.back()["stage"], "finish");
-            EXPECT_EQ(sink.records.back()["remaining_locked_rows"], 0);
+            EXPECT_EQ(sink.records.back()["remaining_locked_rows"],
+                      per_group ? 0 : 1);
+            EXPECT_EQ(sink.records.back()["original_iterator_skipped"],
+                      !per_group);
+            EXPECT_EQ(
+                sink.records.back()["completion_reason"],
+                per_group ? "quota_satisfied" : "filtered_iterator_exhausted");
             bool saw_fallback = false;
             for (const auto& record : sink.records) {
                 EXPECT_EQ(record["acceptance_threshold"], 0.1);
@@ -555,7 +563,7 @@ TEST(StrictGroupDiagnosticsTest, OptInAndFallbackStages) {
                     EXPECT_EQ(record["available_rows"], 2);
                 }
             }
-            EXPECT_TRUE(saw_fallback);
+            EXPECT_EQ(saw_fallback, per_group);
         }
         sink.records.clear();
         CheckProbeScenario(labels,
@@ -578,7 +586,7 @@ TEST(StrictGroupDiagnosticsTest, OptInAndFallbackStages) {
     }
 }
 
-TEST(StrictGroupForcedIteratorTest, UnionFilterSkipsProbeAndPreservesFallback) {
+TEST(StrictGroupForcedIteratorTest, UnionFilterSkipsProbeAndStopsOnExhaustion) {
     // A fills before B/C lock; one B row is excluded by the original filter.
     const std::vector<int64_t> labels{
         10, 10, 10, 20, 30, 99, 20, 20, 20, 30, 30};
@@ -669,10 +677,13 @@ TEST(StrictGroupForcedIteratorTest, UnionFilterSkipsProbeAndPreservesFallback) {
                               prefix,
                               &result);
                 EXPECT_EQ(recreated, threshold > 0 ? 1 : 0);
-                EXPECT_EQ(offsets.size(), 9);
+                const bool partial = threshold > 0 && short_batch;
+                EXPECT_EQ(offsets.size(), partial ? 7 : 9);
                 EXPECT_EQ(
                     std::unordered_set<int64_t>(offsets.begin(), offsets.end()),
-                    (std::unordered_set<int64_t>{0, 1, 2, 3, 4, 7, 8, 9, 10}));
+                    (partial ? std::unordered_set<int64_t>{0, 1, 2, 3, 4, 7, 9}
+                             : std::unordered_set<int64_t>{
+                                   0, 1, 2, 3, 4, 7, 8, 9, 10}));
                 EXPECT_EQ(milvus::monitor::
                               internal_core_strict_group_phase2_probe_candidates
                                   .Collect()
@@ -701,6 +712,201 @@ TEST(StrictGroupForcedIteratorTest, BackendErrorsPropagate) {
                                     100,
                                     StrictGroupStrategy::FilteredIterator),
                  SegcoreError);
+}
+
+TEST(StrictGroupLocalExhaustionTest,
+     AvailabilityAndPartialResultsAcrossStrategies) {
+    StrictGroupLogSink sink;
+    google::AddLogSink(&sink);
+    Defer remove_sink([&] { google::RemoveLogSink(&sink); });
+    for (auto strategy : {StrictGroupStrategy::Sampling,
+                          StrictGroupStrategy::FilteredIterator,
+                          StrictGroupStrategy::PerGroup}) {
+        for (int n = 120; n < 128; ++n) {
+            for (int available : {0, 1, 2, 4}) {
+                for (int topk : {1, 3}) {
+                    for (bool debug : {false, true}) {
+                        SCOPED_TRACE(testing::Message()
+                                     << static_cast<int>(strategy) << "/" << n
+                                     << "/" << available << "/" << topk << "/"
+                                     << debug);
+                        sink.records.clear();
+                        auto schema = std::make_shared<Schema>();
+                        auto pk = schema->AddDebugField("pk", DataType::INT64);
+                        auto field =
+                            schema->AddDebugField("group", DataType::INT64);
+                        schema->set_primary_field_id(pk);
+                        std::vector<int64_t> labels(n, 99);
+                        labels[0] = 10;
+                        if (topk == 3) {
+                            labels[1] = 20;
+                            labels[2] = 30;  // This group has no remaining row.
+                            for (int i = n - 3; i < n; ++i) labels[i] = 20;
+                        }
+                        for (int i = 0; i < available; ++i)
+                            labels[n - 10 + i] = 10;
+                        labels[n - 6] = 10;
+                        TargetBitmap base(n, false);
+                        base[n - 6] =
+                            true;  // Excluded by the original predicate.
+                        auto data = segcore::DataGen(schema, n);
+                        for (auto& column : *data.raw_->mutable_fields_data()) {
+                            if (column.field_id() == field.get()) {
+                                auto* values = column.mutable_scalars()
+                                                   ->mutable_long_data();
+                                for (int i = 0; i < n; ++i)
+                                    values->set_data(i, labels[i]);
+                            }
+                        }
+                        auto segment =
+                            CreateSealedWithFieldDataLoaded(schema, data);
+                        std::vector<std::pair<int64_t, float>> candidates;
+                        for (int i = 0; i < n; ++i)
+                            candidates.emplace_back(i, i);
+                        SearchResult result;
+                        result.total_nq_ = 1;
+                        result.total_data_cnt_ = n;
+                        auto original = MakeSequenceVectorIterator(
+                            candidates, BitsetView(base));
+                        result.vector_iterators_ =
+                            std::vector<std::shared_ptr<VectorIterator>>{
+                                original};
+                        size_t provider_calls = 0;
+                        result.SetVectorSearchProvider(
+                            BitsetView(base),
+                            [&](const BitsetView& invalid,
+                                std::optional<int64_t> k,
+                                SearchResult& batch) {
+                                ++provider_calls;
+                                EXPECT_EQ(
+                                    k.has_value(),
+                                    strategy == StrictGroupStrategy::PerGroup);
+                                EXPECT_TRUE(invalid.test(n - 6));
+                                for (int i = 0; i < topk; ++i)
+                                    EXPECT_TRUE(invalid.test(i));
+                                size_t valid_count = 0;
+                                for (int i = 0; i < n; ++i)
+                                    valid_count += !invalid.test(i);
+                                EXPECT_GT(
+                                    valid_count,
+                                    0);  // Empty filters never reach the backend.
+                                EXPECT_EQ(invalid.get_filtered_out_num_(),
+                                          n - valid_count);
+                                if (k) {
+                                    for (int i = 0;
+                                         i < n &&
+                                         batch.seg_offsets_.size() < *k;
+                                         ++i) {
+                                        if (!invalid.test(i)) {
+                                            batch.seg_offsets_.push_back(i);
+                                            batch.distances_.push_back(i);
+                                        }
+                                    }
+                                } else {
+                                    batch.vector_iterators_ = std::vector<
+                                        std::shared_ptr<VectorIterator>>{
+                                        MakeSequenceVectorIterator(
+                                            candidates, invalid, true)};
+                                }
+                            });
+                        SearchInfo info;
+                        info.topk_ = topk;
+                        info.group_size_ = 3;
+                        info.strict_group_size_ = true;
+                        info.group_by_field_id_ = field;
+                        info.metric_type_ = knowhere::metric::L2;
+                        info.strict_group_strategy_ = strategy;
+                        info.strict_group_probe_candidates_ = 1;
+                        info.strict_group_debug_ = debug;
+                        const auto before =
+                            milvus::monitor::
+                                internal_core_strict_group_phase2_original_remaining_candidates
+                                    .Collect()
+                                    .histogram.sample_sum;
+                        std::vector<GroupByValueType> groups;
+                        std::vector<int64_t> offsets;
+                        std::vector<float> distances;
+                        std::vector<size_t> prefix;
+                        SearchGroupBy(nullptr,
+                                      *result.vector_iterators_,
+                                      info,
+                                      groups,
+                                      *segment,
+                                      offsets,
+                                      distances,
+                                      prefix,
+                                      &result);
+                        const size_t expected =
+                            1 + std::min(available, 2) + (topk == 3 ? 4 : 0);
+                        EXPECT_EQ(offsets.size(), expected);
+                        EXPECT_EQ(std::unordered_set<int64_t>(offsets.begin(),
+                                                              offsets.end())
+                                      .size(),
+                                  expected);
+                        EXPECT_EQ(
+                            std::count(offsets.begin(), offsets.end(), n - 6),
+                            0);
+                        std::unordered_map<int64_t, size_t> counts;
+                        for (auto offset : offsets) ++counts[labels[offset]];
+                        EXPECT_EQ(counts[10], 1 + std::min(available, 2));
+                        if (topk == 3) {
+                            EXPECT_EQ(counts[20], 3);
+                            EXPECT_EQ(counts[30], 1);
+                        }
+                        EXPECT_EQ(counts[99], 0);
+                        EXPECT_EQ(provider_calls,
+                                  strategy == StrictGroupStrategy::PerGroup
+                                      ? (available > 0) + (topk == 3)
+                                      : (available > 0 || topk == 3));
+                        EXPECT_EQ(
+                            milvus::monitor::
+                                internal_core_strict_group_phase2_original_remaining_candidates
+                                    .Collect()
+                                    .histogram.sample_sum,
+                            before);
+                        // Directly prove the original consumer stopped at lock/probe.
+                        ASSERT_TRUE(original->HasNext());
+                        EXPECT_EQ(
+                            original->Next()->first,
+                            topk + (strategy == StrictGroupStrategy::Sampling
+                                        ? 1
+                                        : 0));
+                        if (!debug) {
+                            EXPECT_TRUE(sink.records.empty());
+                        } else {
+                            ASSERT_FALSE(sink.records.empty());
+                            const auto& last = sink.records.back();
+                            EXPECT_EQ(last["stage"], "finish");
+                            EXPECT_EQ(last["original_iterator_skipped"], true);
+                            EXPECT_EQ(last["original_remaining_candidates"], 0);
+                            const auto union_available =
+                                available + (topk == 3 ? 3 : 0);
+                            const char* reason = "quota_satisfied";
+                            if (topk == 1 && available == 0)
+                                reason = "no_available_rows";
+                            else if (topk == 3 || available < 2) {
+                                reason =
+                                    strategy == StrictGroupStrategy::PerGroup ||
+                                            union_available < topk * 2
+                                        ? "insufficient_available_rows"
+                                        : "filtered_iterator_exhausted";
+                            }
+                            EXPECT_EQ(last["completion_reason"], reason);
+                            for (const auto& record : sink.records) {
+                                EXPECT_NE(record["stage"], "original_begin");
+                                if (record["stage"] == "union_filter_ready") {
+                                    EXPECT_EQ(record["available_rows"],
+                                              union_available);
+                                    EXPECT_EQ(record["remaining_locked_rows"],
+                                              topk * 2);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 TEST(StrictGroupForcedIteratorTest, AllStrategiesShareEligibilityGates) {
@@ -767,12 +973,16 @@ TEST(StrictGroupPerGroupTest, SearchProviderCapabilityAndErrors) {
     EXPECT_FALSE(result.SearchFilteredVectors(filter, 1));
 }
 
-TEST(StrictGroupPerGroupTest, IsolatedFiltersReuseStorageAndResumeOriginal) {
+TEST(StrictGroupPerGroupTest, IsolatedFiltersReuseStorageAndKeepShortResults) {
+    StrictGroupLogSink sink;
+    google::AddLogSink(&sink);
+    Defer remove_sink([&] { google::RemoveLogSink(&sink); });
     // A fills before B locks; C is never locked. B/C have rows in later chunks.
     const std::vector<int64_t> labels{10, 10, 10, 20, 99, 20, 20, 30, 30};
     for (bool disabled : {false, true}) {
         // Full results, invalid padding, duplicate result, and empty result.
         for (int response : {0, 1, 2, 3}) {
+            sink.records.clear();
             auto schema = std::make_shared<Schema>();
             auto pk = schema->AddDebugField("pk", DataType::INT64);
             auto field = schema->AddDebugField("group", DataType::INT64);
@@ -847,10 +1057,26 @@ TEST(StrictGroupPerGroupTest, IsolatedFiltersReuseStorageAndResumeOriginal) {
                           prefix,
                           &result);
             EXPECT_EQ(batches, disabled ? 0 : 1);
-            EXPECT_EQ(offsets.size(), 6);
+            const size_t expected_rows =
+                disabled || response == 0 ? 6 : (response == 3 ? 4 : 5);
+            EXPECT_EQ(offsets.size(), expected_rows);
+            auto expected_offsets = std::unordered_set<int64_t>{0, 1, 2, 3};
+            if (expected_rows >= 5)
+                expected_offsets.insert(5);
+            if (expected_rows == 6)
+                expected_offsets.insert(6);
             EXPECT_EQ(
                 std::unordered_set<int64_t>(offsets.begin(), offsets.end()),
-                (std::unordered_set<int64_t>{0, 1, 2, 3, 5, 6}));
+                expected_offsets);
+            if (info.strict_group_debug_ && !disabled) {
+                ASSERT_FALSE(sink.records.empty());
+                EXPECT_EQ(sink.records.back()["completion_reason"],
+                          "search_short_result");
+                EXPECT_EQ(sink.records.back()["original_iterator_skipped"],
+                          true);
+                EXPECT_EQ(sink.records.back()["original_remaining_candidates"],
+                          0);
+            }
             EXPECT_EQ(
                 milvus::monitor::
                     internal_core_strict_group_phase2_probe_candidates.Collect()
@@ -1131,11 +1357,12 @@ TEST(StrictGroupPhase2ExecutorTest, PreparationExceptionsPropagate) {
                  SegcoreError);
 }
 
-TEST(StrictGroupPhase2ExecutorTest, ExhaustedRecreatedIteratorResumesOriginal) {
+TEST(StrictGroupPhase2ExecutorTest,
+     ExhaustedRecreatedIteratorKeepsPartialResults) {
     std::vector<int64_t> labels(106, 99);
     labels[0] = labels[102] = labels[103] = labels[104] = labels[105] = 1;
     // The fresh iterator may return nothing, or return 103 before the original
-    // reaches 102,103,104. Duplicate 103 must not consume the final quota.
+    // would reach 102,103,104. Never resume it; duplicate 103 adds no quota.
     for (auto fresh : {std::vector<int64_t>{},
                        std::vector<int64_t>{103},
                        std::vector<int64_t>{103, 103}}) {
@@ -1144,7 +1371,7 @@ TEST(StrictGroupPhase2ExecutorTest, ExhaustedRecreatedIteratorResumesOriginal) {
                            1,
                            4,
                            1,
-                           4,
+                           fresh.empty() ? 1 : 2,
                            std::nullopt,
                            nullptr,
                            nullptr,

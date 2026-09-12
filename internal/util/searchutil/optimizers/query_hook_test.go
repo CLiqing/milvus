@@ -8,10 +8,13 @@ import (
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus/internal/mocks/util/searchutil/mock_optimizers"
 	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
@@ -243,6 +246,42 @@ func TestOptimizeSearchParam(t *testing.T) {
 	suite.Run(t, new(QueryHookSuite))
 }
 
+func (suite *QueryHookSuite) TestStrictGroupConfigSnapshotLog() {
+	paramtable.Init()
+	cfg := paramtable.Get()
+	q := &cfg.QueryNodeCfg
+	defer cfg.Reset(q.StrictGroupDebug.Key)
+	defer cfg.Reset(q.StrictGroupStrategy.Key)
+	defer cfg.Reset(q.StrictGroupProbeCandidates.Key)
+	defer cfg.Reset(q.StrictGroupAcceptanceThreshold.Key)
+	core, observed := observer.New(zap.InfoLevel)
+	ctx := context.WithValue(context.Background(), log.CtxLogKey, &log.MLogger{Logger: zap.New(core)})
+	for _, debug := range []bool{false, true, false} {
+		cfg.Save(q.StrictGroupDebug.Key, strconv.FormatBool(debug))
+		cfg.Save(q.StrictGroupStrategy.Key, "filtered_iterator")
+		cfg.Save(q.StrictGroupProbeCandidates.Key, "37")
+		cfg.Save(q.StrictGroupAcceptanceThreshold.Key, "1")
+		info := &planpb.QueryInfo{Topk: 1, GroupByFieldId: 101, GroupSize: 3, StrictGroupSize: true,
+			SearchParams: `{"private_payload":"must-not-be-logged"}`}
+		changed, err := applyStrictGroupSettings(ctx, info)
+		suite.Require().NoError(err)
+		suite.True(changed)
+		entries := observed.TakeAll()
+		if !debug {
+			suite.Empty(entries)
+			continue
+		}
+		suite.Require().Len(entries, 1)
+		suite.Equal("strict_group_config_snapshot", entries[0].Message)
+		fields := entries[0].ContextMap()
+		suite.Equal("filtered_iterator", fields["strategy"])
+		suite.Equal(float64(1), fields["acceptance_threshold"])
+		suite.Equal(int64(37), fields["probe_budget"])
+		suite.NotContains(fields, "private_payload")
+		suite.NotContains(fields, "search_params")
+	}
+}
+
 func (suite *QueryHookSuite) TestStrictGroupServerSettings() {
 	paramtable.Init()
 	cfg := paramtable.Get()
@@ -327,6 +366,20 @@ func (suite *QueryHookSuite) TestStrictGroupServerSettings() {
 	suite.Equal("100", string(readParams(defaultReq)[common.StrictGroupProbeCandidatesKey]))
 	suite.Equal(`"sampling"`, string(readParams(defaultReq)[common.StrictGroupStrategyKey]))
 	suite.Equal("false", string(readParams(defaultReq)[common.StrictGroupDebugKey]))
+	// Replay the cloud values and changes on successive requests. Each plan
+	// must contain the configured value, not a hard-coded default of 0.1.
+	for _, threshold := range []string{"1", "0.1", "0.5", "0"} {
+		cfg.Save(vKey, threshold)
+		cfg.Save(tKey, "37")
+		cfg.Save(sKey, "filtered_iterator")
+		req, err := OptimizeSearchParams(context.Background(), makeRequest(true, raw), nil, 1)
+		suite.Require().NoError(err)
+		suite.Equal(threshold, string(readParams(req)[common.StrictGroupAcceptanceThresholdKey]))
+		suite.Equal("37", string(readParams(req)[common.StrictGroupProbeCandidatesKey]))
+		suite.Equal(`"filtered_iterator"`, string(readParams(req)[common.StrictGroupStrategyKey]))
+	}
+	cfg.Reset(vKey)
+	cfg.Reset(tKey)
 	// All strategies are server controlled, including direct union filtering.
 	for _, strategy := range []string{"sampling", "filtered_iterator", "per_group"} {
 		cfg.Save(sKey, strategy)
