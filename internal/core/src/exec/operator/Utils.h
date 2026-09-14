@@ -50,6 +50,7 @@ PrepareVectorIteratorsFromIndex(const SearchInfo& search_info,
     if (UseVectorIterator(search_info)) {
         try {
             auto search_conf = index.PrepareSearchParams(search_info);
+            query::ApplyStrictGroupSkipRefine(search_info, nq, search_conf);
             knowhere::expected<std::vector<knowhere::IndexNode::IteratorPtr>>
                 iterators_val =
                     index.VectorIterators(dataset, search_conf, bitset);

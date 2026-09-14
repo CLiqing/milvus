@@ -180,6 +180,8 @@ const (
 	StrictGroupProbeCandidatesKey     = "strict_group_probe_candidates"
 	StrictGroupStrategyKey            = "strict_group_strategy"
 	StrictGroupDebugKey               = "strict_group_debug"
+	StrictGroupPhase1MaxCandidatesKey = "strict_group_phase1_max_candidates"
+	StrictGroupSkipRefineKey          = "strict_group_skip_refine"
 	SegmentNumKey                     = "segment_num"
 	WithFilterKey                     = "with_filter"
 	DataTypeKey                       = "data_type"

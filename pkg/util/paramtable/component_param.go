@@ -3446,6 +3446,8 @@ type queryNodeConfig struct {
 	StrictGroupProbeCandidates     ParamItem `refreshable:"true"`
 	StrictGroupStrategy            ParamItem `refreshable:"true"`
 	StrictGroupDebug               ParamItem `refreshable:"true"`
+	StrictGroupPhase1MaxCandidates ParamItem `refreshable:"true"`
+	StrictGroupSkipRefine          ParamItem `refreshable:"true"`
 	SoPath                         ParamItem `refreshable:"false"`
 
 	// stats
@@ -3679,6 +3681,18 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 		Doc: "Opt-in segment/stage diagnostic logs; no per-candidate logs or customer field values.",
 	}
 	p.StrictGroupDebug.Init(base.mgr)
+	p.StrictGroupPhase1MaxCandidates = ParamItem{
+		Key:     "queryNode.groupBy.strictGroupPhase1MaxCandidates",
+		Version: "2.6.23", DefaultValue: "0", Export: true,
+		Doc: "Strict group phase-one consumer Next budget; zero is unlimited. Freeze discovered groups at the budget and complete their quotas without this limit. May reduce recall.",
+	}
+	p.StrictGroupPhase1MaxCandidates.Init(base.mgr)
+	p.StrictGroupSkipRefine = ParamItem{
+		Key:     "queryNode.groupBy.strictGroupSkipRefine",
+		Version: "2.6.23", DefaultValue: "false", Export: true,
+		Doc: "Skip query-time refinement consistently in both phases of single-query strict grouping with group size greater than one. May reduce recall.",
+	}
+	p.StrictGroupSkipRefine.Init(base.mgr)
 	p.IDFPreload = ParamItem{
 		Key:          "queryNode.idfOracle.preload",
 		Version:      "2.6.8",

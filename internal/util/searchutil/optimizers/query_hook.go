@@ -139,13 +139,27 @@ func applyStrictGroupSettings(ctx context.Context, info *planpb.QueryInfo) (bool
 	_, hadProbe := params[common.StrictGroupProbeCandidatesKey]
 	_, hadStrategy := params[common.StrictGroupStrategyKey]
 	_, hadDebug := params[common.StrictGroupDebugKey]
+	_, hadPhase1 := params[common.StrictGroupPhase1MaxCandidatesKey]
+	_, hadSkipRefine := params[common.StrictGroupSkipRefineKey]
 	delete(params, common.StrictGroupAcceptanceThresholdKey)
 	delete(params, common.StrictGroupProbeCandidatesKey)
 	delete(params, common.StrictGroupStrategyKey)
 	delete(params, common.StrictGroupDebugKey)
+	delete(params, common.StrictGroupPhase1MaxCandidatesKey)
+	delete(params, common.StrictGroupSkipRefineKey)
 	eligible := info.GetStrictGroupSize() && info.GetGroupSize() > 1 && info.GetGroupByFieldId() > 0
 	if eligible {
 		cfg := &paramtable.Get().QueryNodeCfg
+		phase1, err := strconv.ParseInt(cfg.StrictGroupPhase1MaxCandidates.GetValue(), 10, 64)
+		if err != nil || phase1 < 0 {
+			return false, merr.WrapErrServiceUnavailable("invalid server config: " + cfg.StrictGroupPhase1MaxCandidates.Key)
+		}
+		skipRefine, err := strconv.ParseBool(cfg.StrictGroupSkipRefine.GetValue())
+		if err != nil {
+			return false, merr.WrapErrServiceUnavailable("invalid server config: " + cfg.StrictGroupSkipRefine.Key)
+		}
+		params[common.StrictGroupPhase1MaxCandidatesKey] = json.RawMessage(strconv.FormatInt(phase1, 10))
+		params[common.StrictGroupSkipRefineKey] = json.RawMessage(strconv.FormatBool(skipRefine))
 		debug, err := strconv.ParseBool(cfg.StrictGroupDebug.GetValue())
 		if err != nil {
 			return false, merr.WrapErrServiceUnavailable("invalid server config: " + cfg.StrictGroupDebug.Key)
@@ -174,10 +188,12 @@ func applyStrictGroupSettings(ctx context.Context, info *planpb.QueryInfo) (bool
 				zap.String("strategy", strategy),
 				zap.Float64("acceptance_threshold", threshold),
 				zap.Int64("probe_budget", probe),
+				zap.Int64("phase1_max_candidates", phase1),
+				zap.Bool("skip_refine", skipRefine),
 				zap.Bool("strict_group_debug", debug))
 		}
 	}
-	if !eligible && !hadThreshold && !hadProbe && !hadStrategy && !hadDebug {
+	if !eligible && !hadThreshold && !hadProbe && !hadStrategy && !hadDebug && !hadPhase1 && !hadSkipRefine {
 		return false, nil
 	}
 	encoded, err := json.Marshal(params)

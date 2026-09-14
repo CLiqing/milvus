@@ -26,12 +26,30 @@
 #include "common/Utils.h"
 
 namespace milvus::query {
+inline bool
+CanUseStrictGroupControls(const SearchInfo& info, int64_t nq) {
+    return info.strict_group_size_ && info.group_size_ > 1 && info.topk_ > 0 &&
+           nq == 1 && info.array_offsets_ == nullptr;
+}
+
+inline void
+ApplyStrictGroupSkipRefine(const SearchInfo& info,
+                           int64_t nq,
+                           knowhere::Json& params) {
+    if (CanUseStrictGroupControls(info, nq)) {
+        params["skip_refine"] = info.strict_group_skip_refine_;
+    }
+}
+
 // A quota requests ordinary vector Search; no quota recreates the original
 // iterator. Never mutate the phase-one search settings or its backend budget.
 inline SearchInfo
 StrictGroupSearchInfo(const SearchInfo& original,
                       std::optional<int64_t> remaining_topk) {
     auto info = original;
+    // Providers are registered only for nq=1. Set the backend parameter before
+    // converting per-group completion into an ordinary (non-grouped) Search.
+    ApplyStrictGroupSkipRefine(original, 1, info.search_params_);
     if (remaining_topk) {
         info.topk_ = *remaining_topk;
         info.group_by_field_id_.reset();
@@ -50,9 +68,7 @@ inline bool
 CanUseStrictGroupFilteredIterator(const SearchInfo& search_info,
                                   int64_t num_queries) {
     return search_info.strict_group_acceptance_threshold_ > 0 &&
-           search_info.strict_group_size_ && search_info.group_size_ > 1 &&
-           search_info.topk_ > 0 && num_queries == 1 &&
-           search_info.array_offsets_ == nullptr;
+           CanUseStrictGroupControls(search_info, num_queries);
 }
 
 inline void

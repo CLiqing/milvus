@@ -129,6 +129,7 @@ struct StrictGroupPhase2Context {
     int64_t probe_candidates;
     StrictGroupStrategy strategy;
     const SearchInfo* search_info;
+    bool controls_eligible;
 };
 
 const char*
@@ -267,11 +268,12 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
                              GroupByMap<T>& group_map,
                              GroupByResultCollector<T>& collector,
                              const StrictGroupPhase2Context* context) {
-    if (context == nullptr || context->search_result == nullptr) {
+    if (context == nullptr) {
         return false;
     }
 
     StrictGroupPhase2Stats stats;
+    bool phase1_truncated = false;
     const bool debug = context->search_info->strict_group_debug_;
     using Clock = std::chrono::steady_clock;
     Clock::time_point debug_start{}, last_log{};
@@ -308,11 +310,21 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
             {"segment_id", context->segment.get_segment_id()},
             {"strategy", StrategyName(context->strategy)},
             {"eligible", context->eligible},
+            {"controls_eligible", context->controls_eligible},
             {"probe_budget", context->probe_candidates},
+            {"phase1_max_candidates",
+             context->search_info->strict_group_phase1_max_candidates_},
+            {"phase1_truncated", phase1_truncated},
+            {"skip_refine",
+             context->controls_eligible &&
+                 context->search_info->strict_group_skip_refine_},
             {"acceptance_threshold", context->acceptance_threshold},
             {"topk", context->search_info->topk_},
             {"group_size", context->search_info->group_size_},
-            {"segment_rows", context->search_result->total_data_cnt_},
+            {"segment_rows",
+             context->search_result == nullptr
+                 ? -1
+                 : context->search_result->total_data_cnt_},
             {"locked_groups", group_map.GetGroupCount()},
             {"unfinished_groups",
              group_map.GetGroupCount() - group_map.GetEnoughGroupCount()},
@@ -350,7 +362,26 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
         last_log = now;
     };
     diagnostic(context->eligible ? "begin" : "ineligible_original");
-    if (!context->eligible) {
+    const auto phase1_budget =
+        context->search_info->strict_group_phase1_max_candidates_;
+    if (context->controls_eligible && phase1_budget > 0) {
+        // Independent of the filtered-iterator decision and provider support.
+        // Even the original-iterator fallback must honor the frozen group set.
+        stats.phase1_candidates = ConsumeGroupByIteratorUntil(
+            iterator,
+            data_getter,
+            group_map,
+            collector,
+            [&] { return group_map.IsGroupCapacityReached(); },
+            static_cast<size_t>(phase1_budget));
+        if (stats.phase1_candidates == static_cast<size_t>(phase1_budget) &&
+            !group_map.IsGroupCapacityReached()) {
+            group_map.LockCurrentGroups();
+            phase1_truncated = true;
+        }
+        diagnostic("phase1_budget_checked");
+    }
+    if (!context->eligible || context->search_result == nullptr) {
         return false;
     }
     stats.attempted = true;
@@ -375,7 +406,7 @@ TryStrictGroupFilteredPhase2(const std::shared_ptr<VectorIterator>& iterator,
         return false;
     }
 
-    stats.phase1_candidates = ConsumeGroupByIteratorUntil(
+    stats.phase1_candidates += ConsumeGroupByIteratorUntil(
         iterator, data_getter, group_map, collector, [&] {
             return group_map.IsGroupCapacityReached();
         });
@@ -737,7 +768,8 @@ SearchGroupBy(milvus::OpContext* op_ctx,
         search_info.strict_group_acceptance_threshold_,
         search_info.strict_group_probe_candidates_,
         search_info.strict_group_strategy_,
-        &search_info};
+        &search_info,
+        query::CanUseStrictGroupControls(search_info, iterators.size())};
     switch (data_type) {
         case DataType::INT8: {
             auto dataGetter =

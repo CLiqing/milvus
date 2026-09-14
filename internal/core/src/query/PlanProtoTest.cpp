@@ -114,6 +114,38 @@ TEST(PlanProto, StrictGroupSettings) {
     info->set_metric_type("L2");
     info->set_topk(10);
     info->set_round_decimal(-1);
+    for (int64_t budget :
+         {int64_t(0), int64_t(7000), std::numeric_limits<int64_t>::max()}) {
+        for (bool skip : {false, true}) {
+            info->set_search_params(knowhere::Json{
+                {kStrictGroupPhase1MaxCandidates, budget},
+                {kStrictGroupSkipRefine,
+                 skip}}.dump());
+            auto parsed = query::ProtoParser(schema).PlanNodeFromProto(node);
+            EXPECT_EQ(parsed->search_info_.strict_group_phase1_max_candidates_,
+                      budget);
+            EXPECT_EQ(parsed->search_info_.strict_group_skip_refine_, skip);
+            EXPECT_TRUE(parsed->search_info_.search_params_.empty());
+        }
+    }
+    for (const auto& value : {knowhere::Json(-1),
+                              knowhere::Json(1.0),
+                              knowhere::Json(uint64_t(1) << 63),
+                              knowhere::Json("7000"),
+                              knowhere::Json(nullptr),
+                              knowhere::Json(true)}) {
+        info->set_search_params(
+            knowhere::Json{{kStrictGroupPhase1MaxCandidates, value}}.dump());
+        EXPECT_THROW(query::ProtoParser(schema).PlanNodeFromProto(node),
+                     SegcoreError);
+    }
+    for (const auto& value :
+         {knowhere::Json("true"), knowhere::Json(1), knowhere::Json(nullptr)}) {
+        info->set_search_params(
+            knowhere::Json{{kStrictGroupSkipRefine, value}}.dump());
+        EXPECT_THROW(query::ProtoParser(schema).PlanNodeFromProto(node),
+                     SegcoreError);
+    }
     for (
         const auto& params :
         {R"({"nprobe":128})",

@@ -370,6 +370,12 @@ struct GroupByMap {
         return group_map_.size();
     }
 
+    // Freeze discovery without truncating completion of existing groups.
+    void
+    LockCurrentGroups() {
+        group_capacity_ = static_cast<int>(group_map_.size());
+    }
+
     int
     GetEnoughGroupCount() const {
         return enough_group_count_;
