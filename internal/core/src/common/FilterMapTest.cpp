@@ -145,6 +145,29 @@ TEST(FilterMapTest, SparseCopyDetachesOnMutation) {
     EXPECT_EQ(CollectUnset(original), (std::vector<int32_t>{7, 1}));
 }
 
+TEST(FilterMapTest, AllShortCircuitPreservesRepresentationAndPolarity) {
+    for (const size_t n : {size_t{0}, size_t{63}, size_t{64}, size_t{65}, size_t{129}}) {
+        for (bool dense : {false, true}) {
+            auto map = FilterMap::Adaptive(n, true, std::min(n, size_t{8}));
+            if (dense) map.EnsureDense();
+            EXPECT_TRUE(map.all());
+            EXPECT_EQ(map.none(), n == 0);
+            if (n) {
+                map.reset(n - 1);
+                EXPECT_FALSE(map.all());
+                map.set(n - 1);
+            }
+            map.flip();
+            EXPECT_EQ(map.all(), n == 0);
+            EXPECT_TRUE(map.none());
+            map.flip();
+            EXPECT_TRUE(map.all());
+            EXPECT_EQ(map.capability(), dense ? FilterMapCapability::RandomMembership
+                                             : FilterMapCapability::EnumerateOnly);
+        }
+    }
+}
+
 TEST(FilterMapTest, EnsureDenseIsIdempotentAndCopyOnWriteSafe) {
     auto original = FilterMap::Adaptive(8, true, 4);
     original.reset(4);

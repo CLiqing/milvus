@@ -180,7 +180,7 @@ PhyUnaryRangeFilterExpr::ExecRangeVisitorImplArrayForIndex<proto::plan::Array>(
 }
 
 void
-PhyUnaryRangeFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyUnaryRangeFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     WaitPrefetch();
     tracer::AutoSpan span(
         "PhyUnaryRangeFilterExpr::Eval", tracer::GetRootSpan(), true);

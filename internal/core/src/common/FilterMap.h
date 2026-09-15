@@ -64,6 +64,13 @@ class FilterMap {
     size_t
     count() const;
 
+    // Short-circuit predicates must not enumerate or materialize the map.
+    bool
+    all() const;
+
+    bool
+    none() const;
+
     bool
     test(size_t id) const;
 

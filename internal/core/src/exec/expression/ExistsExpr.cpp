@@ -54,7 +54,7 @@ PhyExistsFilterExpr::DetermineExecPath() {
 }
 
 void
-PhyExistsFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyExistsFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     WaitPrefetch();
     tracer::AutoSpan span(
         "PhyExistsFilterExpr::Eval", tracer::GetRootSpan(), true);

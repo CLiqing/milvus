@@ -25,7 +25,7 @@ namespace milvus {
 namespace exec {
 
 void
-PhyLogicalUnaryExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyLogicalUnaryExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     tracer::AutoSpan span("PhyLogicalUnaryExpr::Eval", tracer::GetRootSpan());
 
     AssertInfo(inputs_.size() == 1,

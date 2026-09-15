@@ -46,7 +46,7 @@ PhyLikeConjunctExpr::GetNextBatchSize() {
 }
 
 void
-PhyLikeConjunctExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyLikeConjunctExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     AssertInfo(context.get_offset_input() == nullptr,
                "Offset input is not supported for PhyLikeConjunctExpr");
     AssertInfo(!ngram_exprs_.empty(),

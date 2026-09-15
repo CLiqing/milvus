@@ -62,13 +62,12 @@ class PhyConjunctFilterExpr : public Expr {
     }
 
     void
-    Eval(EvalCtx& context, VectorPtr& result) override;
+    EvalImpl(EvalCtx& context, VectorPtr& result) override;
 
-    FilterMap
-    EvalFilterMap(EvalCtx& context,
-                  size_t universe,
-                  size_t cap,
-                  std::optional<FilterMap> input = std::nullopt) override;
+    bool
+    PropagatesFilterRange() const override {
+        return is_and_ && null_rejecting_ && like_indices_.empty();
+    }
 
     void
     MoveCursor() override {

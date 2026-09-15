@@ -273,7 +273,7 @@ PhyCompareFilterExpr::ExecCompareExprDispatcher(OpType op, EvalCtx& context) {
 }
 
 void
-PhyCompareFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyCompareFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     tracer::AutoSpan span(
         "PhyCompareFilterExpr::Eval", tracer::GetRootSpan(), true);
     span.GetSpan()->SetAttribute("op_type", static_cast<int>(expr_->op_type_));

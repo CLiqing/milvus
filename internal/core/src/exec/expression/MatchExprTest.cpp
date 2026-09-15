@@ -460,7 +460,7 @@ class FixedBitmapExpr : public exec::Expr {
     }
 
     void
-    Eval(exec::EvalCtx&, VectorPtr& result) override {
+    EvalImpl(exec::EvalCtx&, VectorPtr& result) override {
         result = std::make_shared<ColumnVector>(data_.clone(), valid_.clone());
     }
 

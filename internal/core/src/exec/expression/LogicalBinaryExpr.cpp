@@ -23,7 +23,7 @@ namespace milvus {
 namespace exec {
 
 void
-PhyLogicalBinaryExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyLogicalBinaryExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     tracer::AutoSpan span("PhyLogicalBinaryExpr::Eval", tracer::GetRootSpan());
 
     AssertInfo(

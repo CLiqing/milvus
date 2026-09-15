@@ -255,6 +255,20 @@ class ColumnVector final : public SimpleVector {
         filter_map_->InplaceOr(excluded);
     }
 
+    // Null-rejecting publication: truth/validity -> excluded rows. Preserve
+    // the representation instead of borrowing legacy writable bitmap bytes.
+    void
+    ConvertToFiltered() {
+        GetFilterMap();
+        filter_map_->flip();
+        if (!valid_values_.all()) {
+            auto invalid = valid_values_.clone();
+            invalid.flip();
+            filter_map_->InplaceOr(TargetBitmapView(invalid));
+            valid_values_.set();
+        }
+    }
+
     void*
     GetValidRawData() {
         return valid_values_.data();

@@ -241,7 +241,7 @@ DispatchMatchProcessing(bool use_offset_input,
 }
 
 void
-PhyMatchFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyMatchFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     tracer::AutoSpan span("PhyMatchFilterExpr::Eval", tracer::GetRootSpan());
 
     auto input = context.get_offset_input();

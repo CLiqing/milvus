@@ -125,7 +125,7 @@ SplitBlockBloomFilterView::Parse(std::string_view blob) {
 }
 
 void
-PhyBloomFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyBloomFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     WaitPrefetch();
     // Honor iterative-filter candidate offsets: when the upstream passes an
     // offset input, ExecVisitorImpl must evaluate those candidate rows via

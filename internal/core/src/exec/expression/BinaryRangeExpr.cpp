@@ -51,7 +51,7 @@ namespace milvus {
 namespace exec {
 
 void
-PhyBinaryRangeFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyBinaryRangeFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     WaitPrefetch();
     tracer::AutoSpan span(
         "PhyBinaryRangeFilterExpr::Eval", tracer::GetRootSpan(), true);

@@ -182,7 +182,7 @@ PhyTimestamptzArithCompareExpr::DetermineExecPath() {
 }
 
 void
-PhyTimestamptzArithCompareExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyTimestamptzArithCompareExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     WaitPrefetch();
     auto input = context.get_offset_input();
     SetHasOffsetInput((input != nullptr));

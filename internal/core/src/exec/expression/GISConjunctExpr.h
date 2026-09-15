@@ -140,7 +140,7 @@ class PhyGISCoarseConjunctExpr : public SegmentExpr {
     }
 
     void
-    Eval(EvalCtx& context, VectorPtr& result) override;
+    EvalImpl(EvalCtx& context, VectorPtr& result) override;
 
     std::string
     ToString() const override {
@@ -244,7 +244,7 @@ class PhyGISRefineConjunctExpr : public SegmentExpr {
     }
 
     void
-    Eval(EvalCtx& context, VectorPtr& result) override;
+    EvalImpl(EvalCtx& context, VectorPtr& result) override;
 
     std::string
     ToString() const override {

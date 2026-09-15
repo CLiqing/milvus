@@ -28,7 +28,7 @@ namespace milvus {
 namespace exec {
 
 void
-PhyCallExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyCallExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     tracer::AutoSpan span("PhyCallExpr::Eval", tracer::GetRootSpan(), true);
     span.GetSpan()->SetAttribute("function_name", expr_->fun_name());
 

@@ -47,7 +47,7 @@ class PhyMatchFilterExpr : public Expr {
     }
 
     void
-    Eval(EvalCtx& context, VectorPtr& result) override;
+    EvalImpl(EvalCtx& context, VectorPtr& result) override;
 
     void
     MoveCursor() override {

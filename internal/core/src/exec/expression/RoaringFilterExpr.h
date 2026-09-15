@@ -58,7 +58,7 @@ class PhyRoaringFilterExpr : public SegmentExpr {
         int32_t consistency_level);
 
     void
-    Eval(EvalCtx& context, VectorPtr& result) override;
+    EvalImpl(EvalCtx& context, VectorPtr& result) override;
 
     void
     DetermineExecPath() override {

@@ -734,7 +734,7 @@ class PhyBinaryArithOpEvalRangeExpr : public SegmentExpr {
     }
 
     void
-    Eval(EvalCtx& context, VectorPtr& result) override;
+    EvalImpl(EvalCtx& context, VectorPtr& result) override;
 
     void
     DetermineExecPath() override {

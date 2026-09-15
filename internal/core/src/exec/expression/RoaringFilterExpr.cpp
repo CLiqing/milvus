@@ -86,7 +86,7 @@ PhyRoaringFilterExpr::PhyRoaringFilterExpr(
 }
 
 void
-PhyRoaringFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyRoaringFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     WaitPrefetch();
     // Honor iterative-filter candidate offsets: with an offset input,
     // ExecVisitorImpl must evaluate those candidate rows via

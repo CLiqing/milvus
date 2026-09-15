@@ -318,6 +318,24 @@ FilterMap::capability() const {
         "default-zero Sparse FilterMap must be Dense for unset-ID access");
 }
 
+bool
+FilterMap::all() const {
+    const auto& storage = GetStorage();
+    if (const auto* dense = std::get_if<DenseBitmapRep>(&storage.value)) {
+        return inverted_ ? dense->bitmap->none() : dense->bitmap->all();
+    }
+    return count() == size();
+}
+
+bool
+FilterMap::none() const {
+    const auto& storage = GetStorage();
+    if (const auto* dense = std::get_if<DenseBitmapRep>(&storage.value)) {
+        return inverted_ ? dense->bitmap->all() : dense->bitmap->none();
+    }
+    return count() == 0;
+}
+
 void
 FilterMap::InplaceOr(TargetBitmapView mask) {
     if (mask.size() != size()) {

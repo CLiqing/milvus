@@ -30,7 +30,7 @@ namespace milvus {
 namespace exec {
 
 void
-PhyValueExpr::Eval(EvalCtx& context, VectorPtr& result) {
+PhyValueExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
     tracer::AutoSpan span("PhyValueExpr::Eval", tracer::GetRootSpan(), true);
     span.GetSpan()->SetAttribute("data_type", static_cast<int>(expr_->type()));
 
