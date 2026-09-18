@@ -37,7 +37,7 @@ namespace milvus {
 namespace exec {
 
 void
-PhyNullExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
+PhyNullExpr::Eval(EvalCtx& context, VectorPtr& result) {
     WaitPrefetch();
     tracer::AutoSpan span("PhyNullExpr::Eval", tracer::GetRootSpan(), true);
     span.GetSpan()->SetAttribute("data_type",

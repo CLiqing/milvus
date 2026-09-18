@@ -249,7 +249,7 @@ PhyGISFunctionFilterExpr::DetermineExecPath() {
 }
 
 void
-PhyGISFunctionFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
+PhyGISFunctionFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
     WaitPrefetch();
     AssertInfo(expr_->column_.data_type_ == DataType::GEOMETRY,
                "unsupported data type: {}",

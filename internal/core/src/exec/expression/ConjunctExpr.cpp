@@ -17,7 +17,6 @@
 #include "ConjunctExpr.h"
 
 #include <algorithm>
-#include <folly/ScopeGuard.h>
 
 #include "LikeConjunctExpr.h"
 #include "UnaryExpr.h"
@@ -47,6 +46,30 @@ PhyConjunctFilterExpr::ResolveType(const std::vector<DataType>& inputs) {
                         type));
     }
     return DataType::BOOL;
+}
+
+FilterMap
+PhyConjunctFilterExpr::EvalFilterMap(EvalCtx& context,
+                                     size_t universe,
+                                     size_t cap,
+                                     std::optional<FilterMap> input) {
+    // OR/3VL and runtime-fused LIKE retain the established evaluator. Never
+    // treat an OR successor as a refinement of its predecessor's accepted IDs.
+    if (!is_and_ || !null_rejecting_ || !like_indices_.empty()) {
+        return Expr::EvalFilterMap(context, universe, cap, std::move(input));
+    }
+    if (input_order_.empty()) {
+        for (size_t i = 0; i < inputs_.size(); ++i) {
+            input_order_.push_back(i);
+        }
+    }
+    for (const auto index : input_order_) {
+        AssertInfo(index < inputs_.size(), "Invalid AND input order");
+        input = inputs_[index]->EvalFilterMap(
+            context, universe, cap, std::move(input));
+    }
+    AssertInfo(input.has_value(), "AND requires at least one predicate");
+    return std::move(*input);
 }
 
 TargetBitmap
@@ -89,15 +112,7 @@ PhyConjunctFilterExpr::SkipFollowingExprs(int start) {
 }
 
 void
-PhyConjunctFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
-    auto incoming = context.filter_input();
-    auto restore_input = folly::makeGuard([&] {
-        if (incoming) {
-            context.set_filter_input(std::move(*incoming));
-        } else {
-            context.clear_filter_input();
-        }
-    });
+PhyConjunctFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
     tracer::AutoSpan span(
         "PhyConjunctFilterExpr::Eval", tracer::GetRootSpan(), true);
     span.GetSpan()->SetAttribute("is_and", is_and_);
@@ -182,10 +197,7 @@ PhyConjunctFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
         inputs_[idx]->Eval(context, input_result);
 
         ColumnVectorPtr all_flat_result;
-        if (!has_result || context.filter_rows()) {
-            // In a null-rejecting range, Eval already restricts this result
-            // to the predecessor's candidates. AND is refinement, not a
-            // second intersection of two independently built ID sets.
+        if (!has_result) {
             result = input_result;
             has_result = true;
             all_flat_result = GetColumnVector(result);
@@ -210,28 +222,15 @@ PhyConjunctFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
         // Build the active-row bitmap once per input: it decides the
         // batch-level early exit, and the same bitmap becomes the row-level
         // input of the next expression.
-        auto candidates = [&] {
-            if (context.filter_rows()) {
-                return all_flat_result->GetFilterMap();
-            }
-            auto active = BuildActiveBitmap(all_flat_result);
-            return FilterMap::FromDense(
-                std::make_shared<TargetBitmap>(std::move(active)));
-        }();
-        if (candidates.none()) {
-            // Batch evaluation must advance skipped sibling cursors. A
-            // completed whole-range invocation has no next batch to align.
-            if (!context.filter_rows()) {
-                SkipFollowingExprs(i + 1);
-            }
+        auto active_rows = BuildActiveBitmap(all_flat_result);
+        if (active_rows.none()) {
+            SkipFollowingExprs(i + 1);
             ClearBitmapInput(context);
-            context.clear_filter_input();
             return;
         }
-        context.set_filter_input(std::move(candidates));
+        context.set_bitmap_input(std::move(active_rows));
     }
     ClearBitmapInput(context);
-    context.clear_filter_input();
 }
 
 }  //namespace exec

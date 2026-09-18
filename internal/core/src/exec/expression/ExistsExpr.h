@@ -69,7 +69,7 @@ class PhyExistsFilterExpr : public SegmentExpr {
     }
 
     void
-    EvalImpl(EvalCtx& context, VectorPtr& result) override;
+    Eval(EvalCtx& context, VectorPtr& result) override;
 
     std::string
     ToString() const override {

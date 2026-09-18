@@ -246,7 +246,7 @@ class PhyBloomFilterExpr : public SegmentExpr {
     }
 
     void
-    EvalImpl(EvalCtx& context, VectorPtr& result) override;
+    Eval(EvalCtx& context, VectorPtr& result) override;
 
     // Prefer the raw-data probe. Only when raw field data is absent (a sealed
     // index-only field) fall back to the scalar index's reverse-lookup so the

@@ -38,7 +38,7 @@ class SkipIndex;
 namespace exec {
 
 void
-PhyBinaryArithOpEvalRangeExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
+PhyBinaryArithOpEvalRangeExpr::Eval(EvalCtx& context, VectorPtr& result) {
     WaitPrefetch();
     tracer::AutoSpan span(
         "PhyBinaryArithOpEvalRangeExpr::Eval", tracer::GetRootSpan(), true);

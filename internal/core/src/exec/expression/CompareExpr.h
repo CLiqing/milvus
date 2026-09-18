@@ -196,7 +196,7 @@ class PhyCompareFilterExpr : public Expr {
     }
 
     void
-    EvalImpl(EvalCtx& context, VectorPtr& result) override;
+    Eval(EvalCtx& context, VectorPtr& result) override;
 
     void
     MoveCursorForIndexed(int64_t& pos) {

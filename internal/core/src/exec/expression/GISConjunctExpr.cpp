@@ -175,7 +175,7 @@ PhyGISCoarseConjunctExpr::RunRTreeQuery(GISGroupState::Pred& p) {
 }
 
 void
-PhyGISCoarseConjunctExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
+PhyGISCoarseConjunctExpr::Eval(EvalCtx& context, VectorPtr& result) {
     // Self-guard like every other SegmentExpr subclass: block until the
     // prefetch-pool DetermineExecPath()/EnsurePinnedIndex() has finished before
     // RunRTreeQuery() re-pins on the query thread, closing the pinned_index_
@@ -375,7 +375,7 @@ PhyGISRefineConjunctExpr::PrefetchRawData() {
 }
 
 void
-PhyGISRefineConjunctExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
+PhyGISRefineConjunctExpr::Eval(EvalCtx& context, VectorPtr& result) {
     // Self-guard like every other SegmentExpr subclass (see the Coarse node):
     // drain the prefetch future before reading the raw column so a direct
     // caller that skipped the operator-level wait still sees a warmed column.

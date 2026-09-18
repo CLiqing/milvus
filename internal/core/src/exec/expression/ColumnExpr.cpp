@@ -38,7 +38,7 @@ PhyColumnExpr::GetNextBatchSize() {
 }
 
 void
-PhyColumnExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
+PhyColumnExpr::Eval(EvalCtx& context, VectorPtr& result) {
     tracer::AutoSpan span("PhyColumnExpr::Eval", tracer::GetRootSpan(), true);
     span.GetSpan()->SetAttribute("data_type", static_cast<int>(expr_->type()));
 

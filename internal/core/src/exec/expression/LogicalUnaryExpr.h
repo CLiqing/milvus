@@ -39,7 +39,7 @@ class PhyLogicalUnaryExpr : public Expr {
     }
 
     void
-    EvalImpl(EvalCtx& context, VectorPtr& result) override;
+    Eval(EvalCtx& context, VectorPtr& result) override;
 
     void
     MoveCursor() override {

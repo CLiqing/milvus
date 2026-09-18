@@ -57,7 +57,7 @@ class SkipIndex;
 namespace exec {
 
 void
-PhyTermFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
+PhyTermFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
     WaitPrefetch();
     tracer::AutoSpan span(
         "PhyTermFilterExpr::Eval", tracer::GetRootSpan(), true);

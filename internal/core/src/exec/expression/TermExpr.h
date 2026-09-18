@@ -77,7 +77,7 @@ class PhyTermFilterExpr : public SegmentExpr {
     }
 
     void
-    EvalImpl(EvalCtx& context, VectorPtr& result) override;
+    Eval(EvalCtx& context, VectorPtr& result) override;
 
     void
     DetermineExecPath() override;

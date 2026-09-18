@@ -191,23 +191,19 @@ class Expr : public std::enable_shared_from_this<Expr> {
         return name_;
     }
 
-    // One public entry for both batch and full-range filter evaluation. The
-    // common adapter owns candidate/bitmap conversion; kernels keep their
-    // original EvalImpl contract and never receive producer policy arguments.
-    void
-    Eval(EvalCtx& context, VectorPtr& result);
-
     virtual void
-    EvalImpl(EvalCtx& context, VectorPtr& result) {
+    Eval(EvalCtx& context, VectorPtr& result) {
         ThrowInfo(ErrorCode::NotImplemented, "not implemented");
     }
 
-    // A composite may propagate the current filter range to children only
-    // when dropping UNKNOWN rows preserves its consumer's semantics.
-    virtual bool
-    PropagatesFilterRange() const {
-        return false;
-    }
+    // Full-segment, null-rejecting filter boundary. Kernel batches remain
+    // bitmap-native; an incoming enumerable map limits evaluation to its IDs.
+    // Expressions are consumed once, in the executor's chosen order.
+    virtual FilterMap
+    EvalFilterMap(EvalCtx& context,
+                  size_t universe,
+                  size_t cap,
+                  std::optional<FilterMap> input = std::nullopt);
 
     // Only move cursor to next batch
     // but not do real eval for optimization

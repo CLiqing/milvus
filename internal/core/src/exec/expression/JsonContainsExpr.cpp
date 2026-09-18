@@ -125,7 +125,7 @@ class ContainsAllMatcher {
 };
 
 void
-PhyJsonContainsFilterExpr::EvalImpl(EvalCtx& context, VectorPtr& result) {
+PhyJsonContainsFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
     WaitPrefetch();
     tracer::AutoSpan span(
         "PhyJsonContainsFilterExpr::Eval", tracer::GetRootSpan(), true);

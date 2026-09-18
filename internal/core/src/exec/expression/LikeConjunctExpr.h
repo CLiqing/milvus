@@ -38,7 +38,7 @@ class PhyLikeConjunctExpr : public Expr {
         int64_t batch_size);
 
     void
-    EvalImpl(EvalCtx& context, VectorPtr& result) override;
+    Eval(EvalCtx& context, VectorPtr& result) override;
 
     void
     MoveCursor() override {

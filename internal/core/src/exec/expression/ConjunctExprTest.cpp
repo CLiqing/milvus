@@ -40,7 +40,7 @@ class FixedBitmapExpr : public Expr {
     }
 
     void
-    EvalImpl(EvalCtx&, VectorPtr& result) override {
+    Eval(EvalCtx&, VectorPtr& result) override {
         ++eval_count_;
         result = std::make_shared<ColumnVector>(data_.clone(), valid_.clone());
     }
@@ -97,7 +97,7 @@ class PassThroughExpr : public Expr {
     }
 
     void
-    EvalImpl(EvalCtx& context, VectorPtr& result) override {
+    Eval(EvalCtx& context, VectorPtr& result) override {
         inputs_[0]->Eval(context, result);
     }
 
