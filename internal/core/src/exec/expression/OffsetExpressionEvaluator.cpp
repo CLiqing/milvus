@@ -20,6 +20,20 @@ LaneMask(uint32_t count) {
                : (count == 0 ? uint64_t{0} : (uint64_t{1} << count) - 1);
 }
 
+// TargetBitmap stores bits least-significant-first in uint8_t elements. Read
+// only the allocated bytes (including a possible partial final byte), without
+// alignment or host-endianness assumptions. This is result transport, not a
+// second implementation of any predicate.
+uint64_t
+ReadPackedLanes(const void* data, uint32_t count) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    uint64_t mask = 0;
+    for (uint32_t i = 0; i < (count + 7) / 8; ++i) {
+        mask |= uint64_t{bytes[i]} << (i * 8);
+    }
+    return mask & LaneMask(count);
+}
+
 std::vector<expr::TypedExprPtr>
 CheckedRoot(expr::TypedExprPtr expression, ExecContext* exec_context) {
     AssertInfo(expression != nullptr,
@@ -118,6 +132,15 @@ OffsetExpressionWorkspace::EvalBatchImpl(const int32_t* row_ids,
     }
 
     auto output = EvalOffsets(compact_offsets_);
+
+    if (all_active) {
+        // Candidate order already matches expression-result order. Keep the
+        // packed representation instead of unpacking and repacking each bit.
+        truth.known_mask = ReadPackedLanes(output->GetValidRawData(), count);
+        truth.true_mask =
+            ReadPackedLanes(output->GetRawData(), count) & truth.known_mask;
+        return truth;
+    }
 
     TargetBitmapView data(output->GetRawData(), output->size());
     TargetBitmapView valid(output->GetValidRawData(), output->size());
