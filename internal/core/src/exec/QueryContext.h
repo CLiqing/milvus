@@ -388,7 +388,9 @@ class QueryContext : public Context {
     milvus::SearchInfo search_info_;
     std::shared_ptr<OffsetExpressionCallback> ann_fusing_callback_;
     std::optional<double> ann_fusing_residual_rejection_;
-    const query::PlaceholderGroup* placeholder_group_;
+    // Retrieve/filter-only contexts have no vector placeholders. In particular,
+    // AUTO eligibility must never inspect an indeterminate pointer on that path.
+    const query::PlaceholderGroup* placeholder_group_{nullptr};
 
     // used for store segment search result
     milvus::SearchResult search_result_;

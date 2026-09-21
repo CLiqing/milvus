@@ -95,13 +95,18 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
 
-    const auto request = query_context_->get_search_info().ann_filter_fusing_request;
+    const auto* placeholders = query_context_->get_placeholder_group();
+    // This operator also serves scalar retrieve/get and filter-only plans.
+    // Their default SearchInfo is not an ANN request and has no field binding.
+    const auto request = placeholders == nullptr
+                             ? AnnFilterFusingRequest::Baseline
+                             : query_context_->get_search_info()
+                                   .ann_filter_fusing_request;
     if (request != AnnFilterFusingRequest::Baseline) {
         // Demo eligibility only, not another evaluator/operator implementation.
         // Unsupported shapes keep baseline before any bitmap is skipped.
         const auto info = query_context_->get_search_info();
         const auto* segment = query_context_->get_segment();
-        const auto* placeholders = query_context_->get_placeholder_group();
         const auto schema = segment->get_schema_snapshot();
         if (segment->type() == SegmentType::Sealed && placeholders != nullptr &&
             placeholders->size() == 1 && !placeholders->at(0).element_level_ &&
