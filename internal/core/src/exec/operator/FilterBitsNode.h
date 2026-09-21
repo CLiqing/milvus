@@ -82,11 +82,9 @@ class PhyFilterBitsNode : public Operator {
     void
     PrefetchAsync(const std::shared_ptr<folly::CPUThreadPoolExecutor>
                       prefetch_pool) override {
-        // Do not prefetch the skipped predicate's entire scalar column.
-        // Sampling/candidate workspaces load only the chunks they touch.
-        if (!query_context_->get_ann_fusing_callback()) {
-            exprs_->PrefetchAsync(prefetch_pool);
-        }
+        // This ExprSet contains baseline terms only (possibly none). Keep A's
+        // normal prefetch while residual B loads only sampled/candidate chunks.
+        exprs_->PrefetchAsync(prefetch_pool);
     }
 
     void
@@ -99,6 +97,7 @@ class PhyFilterBitsNode : public Operator {
     QueryContext* query_context_;
     int64_t num_processed_rows_;
     int64_t need_process_rows_;
+    bool skip_user_bitmap_{false};
     // Expression filter cache for two-stage search.
     // Cache backend is the process-level ExprResCacheManager.
     bool enable_expr_cache_ = false;

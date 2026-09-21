@@ -43,4 +43,14 @@ SampleAnnFusingRejection(const expr::TypedExprPtr& expression,
                          FieldId field_id,
                          ExecContext* exec_context);
 
+struct AnnFusingExecutionPlan {
+    expr::TypedExprPtr baseline;  // null means no user predicate before search
+    expr::TypedExprPtr residual;  // null means entirely baseline
+};
+
+AnnFusingExecutionPlan
+PlanAnnFusingExpression(const expr::TypedExprPtr& expression,
+                        ExecContext* exec_context,
+                        AnnFilterFusingRequest request);
+
 }  // namespace milvus::exec

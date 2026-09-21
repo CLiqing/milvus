@@ -91,44 +91,17 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                "PhyFilterBitsNode") {
     ExecContext* exec_context = operator_context_->get_exec_context();
     query_context_ = exec_context->get_query_context();
-    std::vector<expr::TypedExprPtr> filters;
-    filters.emplace_back(filter->filter());
-    // This operator folds UNKNOWN predicate rows into the excluded set
-    // (ConvertPredicateToFilteredBitset), i.e. it is a null-rejecting
-    // consumer: let conjunctions in the predicate tree drop UNKNOWN rows
-    // from their active sets early.
-    exprs_ = std::make_unique<ExprSet>(
-        filters, exec_context, /*null_rejecting=*/true);
+    auto baseline = filter->filter();
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
 
     const auto request = query_context_->get_search_info().ann_filter_fusing_request;
-    bool consider_fusing = request == AnnFilterFusingRequest::ExplicitFusing;
-    if (request == AnnFilterFusingRequest::Auto) {
-        const auto& policy = AnnFusingPolicy::Instance();
-        if (policy.available()) {
-            const auto facts = DescribeAnnFusingLeaf(
-                filter->filter(), *query_context_->get_segment(),
-                query_context_->get_op_context());
-            if (facts) {
-                consider_fusing = policy.Consider(facts->view());
-                LOG_DEBUG("ann_fusing auto rule type={} op={} index={} consider={} "
-                          "reason={}",
-                          facts->data_type, facts->operation, facts->index_type,
-                          consider_fusing, consider_fusing ? "consider_sample" : "baseline_rule");
-            }
-        }
-    }
-
-    if (consider_fusing) {
+    if (request != AnnFilterFusingRequest::Baseline) {
         // Demo eligibility only, not another evaluator/operator implementation.
         // Unsupported shapes keep baseline before any bitmap is skipped.
         const auto info = query_context_->get_search_info();
         const auto* segment = query_context_->get_segment();
         const auto* placeholders = query_context_->get_placeholder_group();
-        const auto mod =
-            std::dynamic_pointer_cast<const expr::BinaryArithOpEvalRangeExpr>(
-                filter->filter());
         const auto schema = segment->get_schema_snapshot();
         if (segment->type() == SegmentType::Sealed && placeholders != nullptr &&
             placeholders->size() == 1 && !placeholders->at(0).element_level_ &&
@@ -141,37 +114,29 @@ PhyFilterBitsNode::PhyFilterBitsNode(
             info.group_by_field_ids_.empty() &&
             !info.materialized_view_involved &&
             !info.search_params_.contains("radius") &&
-            !info.global_refine_enable_ && mod != nullptr &&
-            mod->column_.data_type_ == DataType::INT64 &&
-            !mod->column_.nullable_ &&
-            mod->arith_op_type_ == proto::plan::ArithOpType::Mod &&
-            mod->right_operand_.has_int64_val() &&
-            mod->right_operand_.int64_val() > 0 &&
-            segment->SupportsAnnFusingDemo(query_context_->get_op_context(),
-                                           info.field_id_)) {
-            bool choose_fusing = true;
-            if (request == AnnFilterFusingRequest::Auto) {
-                const auto ratio = SampleAnnFusingRejection(
-                    filter->filter(), mod->column_.field_id_, exec_context);
-                choose_fusing = ratio && AnnFusingPolicy::Instance().Choose(
-                    {sizeof(MilvusAnnFusingSampleV1), ratio.value_or(1.0), -1});
-                LOG_DEBUG("ann_fusing auto sample decision={} rejection_ratio={}",
-                          choose_fusing ? "fusing" : "baseline", ratio.value_or(-1));
-            }
-            if (choose_fusing) {
-                // No construct/destroy probe. Actual workers validate their
-                // offset capability and report failures through the callback.
+            !info.global_refine_enable_) {
+            const auto execution = PlanAnnFusingExpression(filter->filter(), exec_context, request);
+            baseline = execution.baseline;
+            if (execution.residual) {
                 query_context_->set_ann_fusing_callback(
                     std::make_shared<OffsetExpressionCallback>(
-                        filter->filter(), exec_context, need_process_rows_));
+                        execution.residual, exec_context, need_process_rows_));
             }
         }
         LOG_DEBUG(
             "ann_fusing reached FilterBitsNode request={}; decision={} "
-            "reason=graph_only_mod_demo",
+            "reason=shared_expression_plan",
             request == AnnFilterFusingRequest::Auto ? "auto" : "force",
             query_context_->get_ann_fusing_callback() ? "fusing" : "baseline");
     }
+
+    // Only the necessary baseline terms remain here. Already computed index
+    // results are read-only leaves; residual predicates are not compiled into
+    // this ExprSet and cannot trigger its full-column prefetch.
+    skip_user_bitmap_ = !baseline;
+    std::vector<expr::TypedExprPtr> filters;
+    if (baseline) filters.push_back(std::move(baseline));
+    exprs_ = std::make_unique<ExprSet>(filters, exec_context, /*null_rejecting=*/true);
 
     enable_expr_cache_ = query_context_->get_enable_expr_cache() &&
                          !query_context_->get_ann_fusing_callback();
@@ -220,7 +185,7 @@ PhyFilterBitsNode::GetOutput() {
         return nullptr;
     }
 
-    if (query_context_->get_ann_fusing_callback()) {
+    if (skip_user_bitmap_) {
         // Only mandatory visibility bitmap storage remains; MvccNode applies
         // timestamps/deletions as usual. Do not Eval() the user predicate here.
         num_processed_rows_ = need_process_rows_;

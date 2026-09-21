@@ -41,6 +41,7 @@
 #include "exec/expression/MatchExpr.h"
 #include "exec/expression/MembershipFilterExpr.h"
 #include "exec/expression/NullExpr.h"
+#include "exec/expression/PreparedBitmapExpr.h"
 #include "exec/expression/TermExpr.h"
 #include "exec/expression/TimestamptzArithCompareExpr.h"
 #include "exec/expression/UnaryExpr.h"
@@ -270,7 +271,10 @@ CompileExpression(const expr::TypedExprPtr& expr,
     auto op_ctx = context->get_op_context();
     const auto& plan_options = context->get_plan_options();
 
-    if (auto call = std::dynamic_pointer_cast<const expr::CallExpr>(expr)) {
+    if (auto prepared = std::dynamic_pointer_cast<const PreparedBitmapExpr>(expr)) {
+        result = std::make_shared<PhyPreparedBitmapExpr>(
+            std::move(prepared), op_ctx, context->query_config()->get_expr_batch_size());
+    } else if (auto call = std::dynamic_pointer_cast<const expr::CallExpr>(expr)) {
         result = std::make_shared<PhyCallExpr>(
             compiled_inputs,
             call,
@@ -718,6 +722,7 @@ ReorderConjunctExpr(std::shared_ptr<milvus::exec::PhyConjunctFilterExpr>& expr,
     auto schema = segment->get_schema_snapshot();
     auto namespace_field_id = schema->get_namespace_field_id();
     std::vector<size_t> reorder;
+    std::vector<size_t> prepared_expr;
     std::vector<size_t> numeric_expr;
     std::vector<size_t> indexed_expr;
     std::vector<size_t> string_expr;
@@ -740,6 +745,13 @@ ReorderConjunctExpr(std::shared_ptr<milvus::exec::PhyConjunctFilterExpr>& expr,
     std::optional<size_t> namespace_expr_idx;
     for (int i = 0; i < inputs.size(); i++) {
         const auto& input = inputs[i];
+
+        // Query-owned bitmap results are already computed. Schedule their
+        // cheap gathers before value predicates, preserving original OR/AND.
+        if (dynamic_cast<const PhyPreparedBitmapExpr*>(input.get())) {
+            prepared_expr.push_back(i);
+            continue;
+        }
 
         // GIS split-fusion nodes: coarse runs early (indexed bucket) so its
         // R-Tree bitmap prunes others; refine runs last (heavy bucket) so it
@@ -887,6 +899,8 @@ ReorderConjunctExpr(std::shared_ptr<milvus::exec::PhyConjunctFilterExpr>& expr,
     // 13. Heavy conjunct expressions (conjunctions with heavy operations)
     // 14. Compare filter expressions (most expensive, comparing two columns)
     reorder.insert(reorder.end(), numeric_expr.begin(), numeric_expr.end());
+    reorder.insert(reorder.begin() + (namespace_expr_idx.has_value() ? 1 : 0),
+                   prepared_expr.begin(), prepared_expr.end());
     reorder.insert(reorder.end(), indexed_expr.begin(), indexed_expr.end());
     reorder.insert(reorder.end(), string_expr.begin(), string_expr.end());
     reorder.insert(
