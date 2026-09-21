@@ -100,17 +100,23 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
     search_info.materialized_view_involved =
         query_info_proto.materialized_view_involved();
 
-    // A top-level hint takes precedence over the copy in search_params.  In
-    // Phase 1 the absence of a hint deliberately remains baseline; parsing the
-    // explicit request here only carries intent to the later decision point.
-    if (query_info_proto.hints() == ANN_FUSING) {
+    // Top-level intent wins over the nested copy. Existing iterative/disable
+    // modes must never fall through to AUTO, including range-search requests.
+    std::string hint = query_info_proto.hints();
+    if (hint.empty() && search_info.search_params_.contains(HINTS)) {
+        AssertInfo(search_info.search_params_[HINTS].is_string(),
+                   "search hints must be a string");
+        hint = search_info.search_params_[HINTS].get<std::string>();
+    }
+    if (hint == ANN_FUSING) {
         search_info.ann_filter_fusing_request =
             AnnFilterFusingRequest::ExplicitFusing;
-    } else if (query_info_proto.hints().empty() &&
-               search_info.search_params_.contains(HINTS) &&
-               search_info.search_params_[HINTS] == ANN_FUSING) {
+    } else if (hint.empty() || hint == ANN_FUSING_AUTO) {
         search_info.ann_filter_fusing_request =
-            AnnFilterFusingRequest::ExplicitFusing;
+            AnnFilterFusingRequest::Auto;
+    } else {
+        search_info.ann_filter_fusing_request =
+            AnnFilterFusingRequest::Baseline;
     }
 
     // currently, iterative filter does not support range search
@@ -120,7 +126,9 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
                 search_info.iterative_filter_execution = false;
             } else if (query_info_proto.hints() == ITERATIVE_FILTER) {
                 search_info.iterative_filter_execution = true;
-            } else if (query_info_proto.hints() == ANN_FUSING) {
+            } else if (query_info_proto.hints() == ANN_FUSING ||
+                       query_info_proto.hints() == ANN_FUSING_AUTO ||
+                       query_info_proto.hints() == ANN_FUSING_BASELINE) {
                 // Parsed above.  Fusing and iterative filtering are separate
                 // request modes.
             } else {
@@ -132,7 +140,10 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
         } else if (search_info.search_params_.contains(HINTS)) {
             if (search_info.search_params_[HINTS] == ITERATIVE_FILTER) {
                 search_info.iterative_filter_execution = true;
-            } else if (search_info.search_params_[HINTS] == ANN_FUSING) {
+            } else if (search_info.search_params_[HINTS] == ANN_FUSING ||
+                       search_info.search_params_[HINTS] == ANN_FUSING_AUTO ||
+                       search_info.search_params_[HINTS] == ANN_FUSING_BASELINE ||
+                       search_info.search_params_[HINTS] == "disable") {
                 // Parsed above.
             } else {
                 // check if hints is valid

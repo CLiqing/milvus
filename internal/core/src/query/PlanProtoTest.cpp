@@ -333,8 +333,16 @@ TEST(PlanProto, ParsesAnnFilterFusingRequestIndependentlyFromIterative) {
     auto no_hint = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
     auto parsed = parser.PlanNodeFromProto(no_hint)->search_info_;
     EXPECT_EQ(parsed.ann_filter_fusing_request,
-              AnnFilterFusingRequest::Baseline);
+              AnnFilterFusingRequest::Auto);
     EXPECT_FALSE(parsed.iterative_filter_execution);
+
+    for (const auto hint : {ANN_FUSING_AUTO, ANN_FUSING_BASELINE}) {
+        auto node = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
+        node.mutable_vector_anns()->mutable_query_info()->set_hints(hint);
+        EXPECT_EQ(parser.PlanNodeFromProto(node)->search_info_.ann_filter_fusing_request,
+                  hint == ANN_FUSING_AUTO ? AnnFilterFusingRequest::Auto
+                                         : AnnFilterFusingRequest::Baseline);
+    }
 
     auto top_level = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
     top_level.mutable_vector_anns()->mutable_query_info()->set_hints(

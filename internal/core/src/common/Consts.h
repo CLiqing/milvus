@@ -60,6 +60,8 @@ const char PAGE_RETAIN_ORDER[] = "page_retain_order";
 const char TEXT_LOG_ROOT_PATH[] = "text_log";
 const char ITERATIVE_FILTER[] = "iterative_filter";
 const char ANN_FUSING[] = "ann_fusing";
+const char ANN_FUSING_AUTO[] = "auto";
+const char ANN_FUSING_BASELINE[] = "baseline";
 const char HINTS[] = "hints";
 // json stats related
 const char NGRAM_LOG_ROOT_PATH[] = "ngram_log";

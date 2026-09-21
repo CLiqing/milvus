@@ -44,8 +44,7 @@ struct BruteForceIndexParams {
 };
 
 // This is the caller's ANN-filter request, not the per-segment execution
-// decision.  Phase 1 keeps Baseline as the no-hint default; Auto is reserved
-// for the later loaded-index planner integration.
+// decision. Auto consults the native policy; a missing policy keeps baseline.
 enum class AnnFilterFusingRequest : uint8_t {
     Baseline = 0,
     ExplicitFusing = 1,
@@ -67,7 +66,7 @@ struct SearchInfo {
     bool materialized_view_involved = false;
     bool iterative_filter_execution = false;
     AnnFilterFusingRequest ann_filter_fusing_request =
-        AnnFilterFusingRequest::Baseline;
+        AnnFilterFusingRequest::Auto;
     std::optional<SearchIteratorV2Info> iterator_v2_info_ = std::nullopt;
     std::optional<std::string> json_path_;
     std::optional<milvus::DataType> json_type_;

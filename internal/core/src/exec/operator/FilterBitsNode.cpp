@@ -26,6 +26,8 @@
 #include "common/Tracer.h"
 #include "common/Types.h"
 #include "exec/QueryContext.h"
+#include "exec/AnnFusingPolicy.h"
+#include "exec/AnnFusingPlan.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/ExprCache.h"
 #include "exec/expression/OffsetExpressionCallback.h"
@@ -99,6 +101,23 @@ PhyFilterBitsNode::PhyFilterBitsNode(
         filters, exec_context, /*null_rejecting=*/true);
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
+
+    if (query_context_->get_search_info().ann_filter_fusing_request ==
+        AnnFilterFusingRequest::Auto) {
+        const auto& policy = AnnFusingPolicy::Instance();
+        if (policy.available()) {
+            const auto facts = DescribeAnnFusingLeaf(
+                filter->filter(), *query_context_->get_segment(),
+                query_context_->get_op_context());
+            if (facts) {
+                const bool consider = policy.Consider(facts->view());
+                LOG_DEBUG("ann_fusing auto rule type={} op={} index={} consider={} "
+                          "decision=baseline reason={}",
+                          facts->data_type, facts->operation, facts->index_type,
+                          consider, consider ? "sampler_pending" : "baseline_rule");
+            }
+        }
+    }
 
     if (query_context_->get_search_info().ann_filter_fusing_request ==
         AnnFilterFusingRequest::ExplicitFusing) {
