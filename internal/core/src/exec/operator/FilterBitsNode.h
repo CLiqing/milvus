@@ -82,7 +82,11 @@ class PhyFilterBitsNode : public Operator {
     void
     PrefetchAsync(const std::shared_ptr<folly::CPUThreadPoolExecutor>
                       prefetch_pool) override {
-        exprs_->PrefetchAsync(prefetch_pool);
+        // Do not prefetch the skipped predicate's entire scalar column.
+        // Sampling/candidate workspaces load only the chunks they touch.
+        if (!query_context_->get_ann_fusing_callback()) {
+            exprs_->PrefetchAsync(prefetch_pool);
+        }
     }
 
     void

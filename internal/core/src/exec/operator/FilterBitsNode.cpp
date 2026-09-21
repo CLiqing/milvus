@@ -102,25 +102,25 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
 
-    if (query_context_->get_search_info().ann_filter_fusing_request ==
-        AnnFilterFusingRequest::Auto) {
+    const auto request = query_context_->get_search_info().ann_filter_fusing_request;
+    bool consider_fusing = request == AnnFilterFusingRequest::ExplicitFusing;
+    if (request == AnnFilterFusingRequest::Auto) {
         const auto& policy = AnnFusingPolicy::Instance();
         if (policy.available()) {
             const auto facts = DescribeAnnFusingLeaf(
                 filter->filter(), *query_context_->get_segment(),
                 query_context_->get_op_context());
             if (facts) {
-                const bool consider = policy.Consider(facts->view());
+                consider_fusing = policy.Consider(facts->view());
                 LOG_DEBUG("ann_fusing auto rule type={} op={} index={} consider={} "
-                          "decision=baseline reason={}",
+                          "reason={}",
                           facts->data_type, facts->operation, facts->index_type,
-                          consider, consider ? "sampler_pending" : "baseline_rule");
+                          consider_fusing, consider_fusing ? "consider_sample" : "baseline_rule");
             }
         }
     }
 
-    if (query_context_->get_search_info().ann_filter_fusing_request ==
-        AnnFilterFusingRequest::ExplicitFusing) {
+    if (consider_fusing) {
         // Demo eligibility only, not another evaluator/operator implementation.
         // Unsupported shapes keep baseline before any bitmap is skipped.
         const auto info = query_context_->get_search_info();
@@ -149,19 +149,27 @@ PhyFilterBitsNode::PhyFilterBitsNode(
             mod->right_operand_.int64_val() > 0 &&
             segment->SupportsAnnFusingDemo(query_context_->get_op_context(),
                                            info.field_id_)) {
-            auto factory = std::make_shared<OffsetExpressionCallback>(
-                filter->filter(), exec_context, need_process_rows_);
-            auto view = factory->view();
-            void* probe = nullptr;
-            if (view.create_worker(view.context, &probe) ==
-                knowhere::CandidateEvalStatus::Success) {
-                view.destroy_worker(probe);
-                query_context_->set_ann_fusing_callback(std::move(factory));
+            bool choose_fusing = true;
+            if (request == AnnFilterFusingRequest::Auto) {
+                const auto ratio = SampleAnnFusingRejection(
+                    filter->filter(), mod->column_.field_id_, exec_context);
+                choose_fusing = ratio && AnnFusingPolicy::Instance().Choose(
+                    {sizeof(MilvusAnnFusingSampleV1), ratio.value_or(1.0), -1});
+                LOG_DEBUG("ann_fusing auto sample decision={} rejection_ratio={}",
+                          choose_fusing ? "fusing" : "baseline", ratio.value_or(-1));
+            }
+            if (choose_fusing) {
+                // No construct/destroy probe. Actual workers validate their
+                // offset capability and report failures through the callback.
+                query_context_->set_ann_fusing_callback(
+                    std::make_shared<OffsetExpressionCallback>(
+                        filter->filter(), exec_context, need_process_rows_));
             }
         }
         LOG_DEBUG(
-            "hint=ann_fusing reached FilterBitsNode; decision={} "
+            "ann_fusing reached FilterBitsNode request={}; decision={} "
             "reason=graph_only_mod_demo",
+            request == AnnFilterFusingRequest::Auto ? "auto" : "force",
             query_context_->get_ann_fusing_callback() ? "fusing" : "baseline");
     }
 
