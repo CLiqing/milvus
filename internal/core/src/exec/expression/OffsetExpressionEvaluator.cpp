@@ -104,10 +104,16 @@ OffsetExpressionWorkspace::EvalBatchImpl(const int32_t* row_ids,
 
     compact_offsets_.clear();
     compact_to_lane_.clear();
-    for (uint32_t lane = 0; lane < count; ++lane) {
-        if ((active_mask & (uint64_t{1} << lane)) != 0) {
-            compact_offsets_.push_back(row_ids[lane]);
-            compact_to_lane_.push_back(lane);
+    const bool all_active = active_mask == lane_mask;
+    if (all_active) {
+        // EvalCtx borrows a mutable vector: copy IDs, but no lane map is needed.
+        compact_offsets_.assign(row_ids, row_ids + count);
+    } else {
+        for (uint32_t lane = 0; lane < count; ++lane) {
+            if ((active_mask & (uint64_t{1} << lane)) != 0) {
+                compact_offsets_.push_back(row_ids[lane]);
+                compact_to_lane_.push_back(lane);
+            }
         }
     }
 
@@ -115,9 +121,9 @@ OffsetExpressionWorkspace::EvalBatchImpl(const int32_t* row_ids,
 
     TargetBitmapView data(output->GetRawData(), output->size());
     TargetBitmapView valid(output->GetValidRawData(), output->size());
-    for (size_t compact_lane = 0; compact_lane < compact_to_lane_.size();
+    for (size_t compact_lane = 0; compact_lane < compact_offsets_.size();
          ++compact_lane) {
-        const auto original_lane = compact_to_lane_[compact_lane];
+        const auto original_lane = all_active ? compact_lane : compact_to_lane_[compact_lane];
         if (valid[compact_lane]) {
             truth.known_mask |= uint64_t{1} << original_lane;
             if (data[compact_lane]) {
