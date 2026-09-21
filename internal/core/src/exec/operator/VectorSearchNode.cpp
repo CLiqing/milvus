@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <ratio>
 #include <utility>
@@ -192,6 +193,33 @@ PhyVectorSearchNode::GetOutput() {
     if (const auto& callback = query_context_->get_ann_fusing_callback()) {
         callback_view = callback->view();
         search_view.set_candidate_evaluator(&callback_view);
+        auto& params = search_info_.search_params_;
+        if (params.contains("ann_fusing_rejection_ratio")) {
+            // Development override is the COMPLETE query rejection ratio.
+            // It drives both the policy and DiskANN alpha, without pretending
+            // it is the exact mandatory bitmap count.
+            const double ratio = params.at("ann_fusing_rejection_ratio").get<double>();
+            AssertInfo(std::isfinite(ratio) && ratio >= 0 && ratio <= 1,
+                       "ann_fusing_rejection_ratio must be in [0,1]");
+            params["ann_fusing_filter_ratio"] = ratio;
+        } else {
+            if (const auto residual = query_context_->get_ann_fusing_residual_rejection()) {
+                if (!search_view.has_known_count()) {
+                    // This is the already materialized mandatory bitmap only.
+                    // A freshly constructed BitsetView has no cached count.
+                    search_view.count_filtered_bits(0, search_view.num_bits());
+                }
+                const double mandatory = search_view.size() == 0 ? 0.0 :
+                    static_cast<double>(search_view.count()) / search_view.size();
+                // Independence approximation, NOT an exact union count.
+                // CAP acceptance injects the known full-query rate until
+                // estimator precision/correlation is separately qualified.
+                // DiskANN consumes this advisory. Do not set filter_level:
+                // memory graph uses that name for a different connectivity
+                // policy which must remain unchanged by scalar sampling.
+                params["ann_fusing_filter_ratio"] = mandatory + (1.0 - mandatory) * *residual;
+            }
+        }
     }
     milvus::SearchResult search_result;
     auto op_context = query_context_->get_op_context();

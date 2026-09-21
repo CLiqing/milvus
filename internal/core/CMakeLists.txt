@@ -450,6 +450,10 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/common/
         DESTINATION include/common
         FILES_MATCHING PATTERN "*_c.h"
 )
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/common/AnnFusingPlugin.h
+        DESTINATION include/common
+        COMPONENT AnnFusingSDK
+)
 
 # Install rescores
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/rescores/

@@ -229,13 +229,20 @@ class QueryContext : public Context {
 
     void
     set_ann_fusing_callback(
-        std::shared_ptr<OffsetExpressionCallback> callback) {
+        std::shared_ptr<OffsetExpressionCallback> callback,
+        std::optional<double> residual_rejection = std::nullopt) {
         ann_fusing_callback_ = std::move(callback);
+        ann_fusing_residual_rejection_ = residual_rejection;
     }
 
     const std::shared_ptr<OffsetExpressionCallback>&
     get_ann_fusing_callback() const {
         return ann_fusing_callback_;
+    }
+
+    std::optional<double>
+    get_ann_fusing_residual_rejection() const {
+        return ann_fusing_residual_rejection_;
     }
 
     knowhere::MetricType
@@ -380,6 +387,7 @@ class QueryContext : public Context {
     // used for vector search
     milvus::SearchInfo search_info_;
     std::shared_ptr<OffsetExpressionCallback> ann_fusing_callback_;
+    std::optional<double> ann_fusing_residual_rejection_;
     const query::PlaceholderGroup* placeholder_group_;
 
     // used for store segment search result

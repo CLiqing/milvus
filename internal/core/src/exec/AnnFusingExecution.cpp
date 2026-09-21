@@ -177,6 +177,8 @@ PlanAnnFusingExpression(const expr::TypedExprPtr& expression,
                         known_mandatory->size()
             : -1;
 
+    size_t residual_count = 0;
+    FieldId sample_field(0);
     for (const auto& candidate : candidates) {
         expr::TypedExprPtr complete = candidate.predicate;
         if (candidate.indexed_or_operand) {
@@ -192,9 +194,10 @@ PlanAnnFusingExpression(const expr::TypedExprPtr& expression,
                 Logical::OpType::Or, cached, candidate.predicate);
         }
         bool fusing = true;
+        std::optional<double> ratio;
         if (policy) {
             const auto* mod = SupportedMod(candidate.predicate);
-            const auto ratio = SampleAnnFusingRejection(
+            ratio = SampleAnnFusingRejection(
                 candidate.predicate, mod->column_.field_id_, context);
             fusing = ratio && policy->Choose({sizeof(MilvusAnnFusingSampleV1),
                                               ratio.value_or(1),
@@ -206,10 +209,22 @@ PlanAnnFusingExpression(const expr::TypedExprPtr& expression,
                 ratio.value_or(-1),
                 mandatory_ratio);
         }
-        if (fusing)
+        if (fusing) {
             plan.residual = And(plan.residual, complete);
-        else
+            sample_field = SupportedMod(candidate.predicate)->column_.field_id_;
+            ++residual_count;
+            // The existing sample is reusable only for this exact residual.
+            // Do not interpret the B-only sample as the rate of A OR B.
+            plan.residual_rejection =
+                residual_count == 1 && !candidate.indexed_or_operand
+                    ? ratio : std::nullopt;
+        } else {
             plan.baseline = And(plan.baseline, complete);
+        }
+    }
+    if (policy && plan.residual && !plan.residual_rejection) {
+        plan.residual_rejection =
+            SampleAnnFusingRejection(plan.residual, sample_field, context);
     }
     return plan;
 }

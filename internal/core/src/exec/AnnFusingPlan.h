@@ -46,6 +46,8 @@ SampleAnnFusingRejection(const expr::TypedExprPtr& expression,
 struct AnnFusingExecutionPlan {
     expr::TypedExprPtr baseline;  // null means no user predicate before search
     expr::TypedExprPtr residual;  // null means entirely baseline
+    // Advisory residual rejection only, never a bitmap count/result capacity.
+    std::optional<double> residual_rejection;
 };
 
 AnnFusingExecutionPlan
