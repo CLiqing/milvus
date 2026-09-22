@@ -169,6 +169,32 @@ ApplyValidMask(ValidityView validity,
     }
 }
 
+class PreparedBitmapExpr;
+
+// Scheduling facts, not a second operator representation. Each physical leaf
+// supplies its operation and actual access path from its own module.
+struct FilterSourceInfo {
+    FieldId field_id;
+    std::string data_type;
+    std::string operation;
+    std::string index_type;
+};
+
+// A missing side denotes an execution phase, never a Boolean TRUE/NULL value.
+// Only a necessary AND condition may move to baseline; Boolean subtrees below
+// OR/NOT must remain complete in whichever phase evaluates them.
+struct FilterSchedule {
+    expr::TypedExprPtr baseline;
+    expr::TypedExprPtr residual;
+    std::optional<double> residual_filter_ratio;
+};
+
+struct FilterScheduleContext {
+    ExecContext* exec_context;
+    AnnFilterFusingRequest request;
+    double mandatory_filter_ratio = -1;
+};
+
 class Expr : public std::enable_shared_from_this<Expr> {
  public:
     Expr(DataType type,
@@ -182,6 +208,47 @@ class Expr : public std::enable_shared_from_this<Expr> {
     }
 
     virtual ~Expr() = default;
+
+    void
+    SetLogicalSource(expr::TypedExprPtr source) {
+        logical_source_ = std::move(source);
+    }
+
+    const expr::TypedExprPtr&
+    logical_source() const {
+        return logical_source_;
+    }
+
+    virtual std::optional<std::string>
+    FilterOperation() const {
+        return std::nullopt;
+    }
+
+    // A module may require stronger semantic parity than merely accepting
+    // offset input (e.g. legacy arithmetic overflow/conversion behavior).
+    virtual bool
+    SupportsDeferredEvaluation() {
+        return SupportOffsetInput();
+    }
+
+    virtual std::optional<FilterSourceInfo>
+    DescribeFilterSource() const {
+        return std::nullopt;
+    }
+
+    virtual std::optional<FieldId>
+    OffsetSamplingField() const;
+
+    virtual bool
+    MayDeferFiltering(const FilterScheduleContext& context);
+
+    virtual FilterSchedule
+    ScheduleFiltering(const FilterScheduleContext& context, bool allow_split);
+
+    // Execute the original Expr, retaining truth + validity for later offset
+    // evaluation. The existing PreparedBitmap ownership remains unchanged.
+    std::shared_ptr<const PreparedBitmapExpr>
+    PrepareBitmapForOffsets(ExecContext* context, bool require_all_at_once);
 
     const DataType&
     type() const {
@@ -299,6 +366,7 @@ class Expr : public std::enable_shared_from_this<Expr> {
     }
 
  protected:
+    expr::TypedExprPtr logical_source_;
     DataType type_;
     std::vector<std::shared_ptr<Expr>> inputs_;
     std::string name_;
@@ -316,6 +384,12 @@ using ExprPtr = std::shared_ptr<milvus::exec::Expr>;
  */
 class SegmentExpr : public Expr {
  public:
+    std::optional<FilterSourceInfo>
+    DescribeFilterSource() const override;
+
+    std::optional<FieldId>
+    OffsetSamplingField() const override;
+
     SegmentExpr(const std::vector<ExprPtr>&& input,
                 const std::string& name,
                 milvus::OpContext* op_ctx,
@@ -3178,6 +3252,11 @@ CompileExpression(const expr::TypedExprPtr& expr,
 
 class ExprSet {
  public:
+    static FilterSchedule
+    ScheduleFilter(const expr::TypedExprPtr& source,
+                   ExecContext* context,
+                   AnnFilterFusingRequest request);
+
     // null_rejecting: the consumer of these expressions' output treats
     // UNKNOWN rows exactly like FALSE (e.g. a filter that folds UNKNOWN into
     // the excluded set); lets conjunctions drop UNKNOWN rows from their

@@ -736,6 +736,42 @@ class PhyBinaryArithOpEvalRangeExpr : public SegmentExpr {
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
+    std::optional<std::string>
+    FilterOperation() const override {
+        return proto::plan::ArithOpType_Name(expr_->arith_op_type_);
+    }
+
+    bool
+    SupportsDeferredEvaluation() override {
+        const auto type = expr_->column_.data_type_;
+        if (type != DataType::INT8 && type != DataType::INT16 &&
+            type != DataType::INT32 && type != DataType::INT64) {
+            // The legacy random floating MOD path casts to long, whereas
+            // sequential evaluation uses floating remainder. Do not equate
+            // offset support with identical arithmetic semantics.
+            return false;
+        }
+        if (!expr_->right_operand_.has_int64_val()) {
+            return false;
+        }
+        const auto rhs = expr_->right_operand_.int64_val();
+        switch (expr_->arith_op_type_) {
+            case proto::plan::Mod:
+            case proto::plan::Div:
+                // Exclude divide-by-zero and INT64_MIN / -1 overflow.
+                return rhs != 0 && rhs != -1;
+            case proto::plan::BitAnd:
+            case proto::plan::BitOr:
+            case proto::plan::BitXor:
+                return true;
+            default:
+                // Signed overflow and shift semantics must first be unified
+                // across existing SIMD and offset kernels. This is an
+                // operator-owned semantic boundary, not a planner shape list.
+                return false;
+        }
+    }
+
     void
     DetermineExecPath() override {
         SegmentExpr::DetermineExecPath();

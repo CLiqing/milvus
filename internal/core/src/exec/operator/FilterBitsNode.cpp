@@ -27,7 +27,6 @@
 #include "common/Types.h"
 #include "exec/QueryContext.h"
 #include "exec/AnnFusingPolicy.h"
-#include "exec/AnnFusingPlan.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/ExprCache.h"
 #include "exec/expression/OffsetExpressionCallback.h"
@@ -120,7 +119,8 @@ PhyFilterBitsNode::PhyFilterBitsNode(
             !info.materialized_view_involved &&
             !info.search_params_.contains("radius") &&
             !info.global_refine_enable_) {
-            const auto execution = PlanAnnFusingExpression(filter->filter(), exec_context, request);
+            const auto execution = ExprSet::ScheduleFilter(
+                filter->filter(), exec_context, request);
             baseline = execution.baseline;
             if (execution.residual) {
                 query_context_->set_ann_fusing_callback(

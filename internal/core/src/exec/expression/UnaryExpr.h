@@ -1026,6 +1026,19 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
         return true;
     }
 
+    std::optional<std::string>
+    FilterOperation() const override {
+        switch (expr_->op_type_) {
+            case proto::plan::GreaterThan:
+            case proto::plan::GreaterEqual:
+            case proto::plan::LessThan:
+            case proto::plan::LessEqual:
+                return "range";
+            default:
+                return proto::plan::OpType_Name(expr_->op_type_);
+        }
+    }
+
     std::string
     ToString() const override {
         return fmt::format("{}", expr_->ToString());

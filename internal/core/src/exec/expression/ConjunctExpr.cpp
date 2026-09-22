@@ -25,6 +25,7 @@
 #include "common/ValueOp.h"
 #include "exec/QueryContext.h"
 #include "exec/expression/Utils.h"
+#include "exec/expression/PreparedBitmapExpr.h"
 #include "fmt/core.h"
 #include "opentelemetry/trace/span.h"
 
@@ -207,6 +208,119 @@ PhyConjunctFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
         context.set_bitmap_input(std::move(active_rows));
     }
     ClearBitmapInput(context);
+}
+
+namespace {
+expr::TypedExprPtr
+JoinFilterRecipes(bool is_and,
+                  const expr::TypedExprPtr& left,
+                  const expr::TypedExprPtr& right) {
+    if (!left)
+        return right;
+    if (!right)
+        return left;
+    using Logical = expr::LogicalBinaryExpr;
+    return std::make_shared<Logical>(
+        is_and ? Logical::OpType::And : Logical::OpType::Or, left, right);
+}
+}  // namespace
+
+bool
+PhyConjunctFilterExpr::MayDeferFiltering(const FilterScheduleContext& context) {
+    return std::any_of(inputs_.begin(), inputs_.end(), [&](const auto& input) {
+        return input->MayDeferFiltering(context);
+    });
+}
+
+FilterSchedule
+PhyConjunctFilterExpr::ScheduleFiltering(const FilterScheduleContext& context,
+                                         bool allow_split) {
+    AssertInfo(logical_source_ != nullptr,
+               "conjunction scheduling requires a logical source");
+    if (!MayDeferFiltering(context)) {
+        return {logical_source_, nullptr};
+    }
+    if (is_and_ && allow_split) {
+        // Only globally necessary AND operands can become mandatory. Existing
+        // all-at-once results are prepared first, regardless of source order.
+        // Raw-data baseline operands keep their original sequential execution.
+        std::vector<ExprPtr> deferred_candidates;
+        FilterSchedule result;
+        std::optional<TargetBitmap> known_mandatory;
+        for (const auto& input : inputs_) {
+            if (input->MayDeferFiltering(context)) {
+                deferred_candidates.push_back(input);
+                continue;
+            }
+            const auto prepared =
+                input->PrepareBitmapForOffsets(context.exec_context, true);
+            result.baseline = JoinFilterRecipes(
+                true,
+                result.baseline,
+                prepared ? prepared : input->logical_source());
+            if (prepared) {
+                auto accepted = prepared->truth().clone();
+                accepted.inplace_and(prepared->valid(), accepted.size());
+                if (known_mandatory) {
+                    known_mandatory->inplace_and(accepted, accepted.size());
+                } else {
+                    known_mandatory = std::move(accepted);
+                }
+            }
+        }
+        auto child_context = context;
+        if (known_mandatory && !known_mandatory->empty()) {
+            const double known =
+                1.0 - static_cast<double>(known_mandatory->count()) /
+                          known_mandatory->size();
+            // The maximum of known necessary-condition rates is conservative;
+            // never claim an exact joint count for independently known inputs.
+            child_context.mandatory_filter_ratio =
+                std::max(context.mandatory_filter_ratio, known);
+        }
+        size_t residual_count = 0;
+        for (const auto& input : deferred_candidates) {
+            auto child = input->ScheduleFiltering(child_context, true);
+            result.baseline =
+                JoinFilterRecipes(true, result.baseline, child.baseline);
+            if (child.residual) {
+                result.residual =
+                    JoinFilterRecipes(true, result.residual, child.residual);
+                result.residual_filter_ratio = ++residual_count == 1
+                                                   ? child.residual_filter_ratio
+                                                   : std::nullopt;
+            }
+        }
+        return result;
+    }
+
+    // OR, and any AND below OR/NOT, is an indivisible Boolean subtree. Plan
+    // children without promoting a branch to mandatory. Only when some child
+    // is deferred do retained baseline children need an offset-readable result.
+    std::vector<FilterSchedule> children;
+    bool has_residual = false;
+    for (const auto& input : inputs_) {
+        children.push_back(input->ScheduleFiltering(context, false));
+        has_residual |= children.back().residual != nullptr;
+    }
+    if (!has_residual) {
+        return {logical_source_, nullptr};
+    }
+    expr::TypedExprPtr residual;
+    for (size_t i = 0; i < children.size(); ++i) {
+        const auto& child = children[i];
+        AssertInfo(!(child.baseline && child.residual),
+                   "Boolean boundary incorrectly split a child");
+        expr::TypedExprPtr recipe = child.residual;
+        if (!recipe) {
+            // Preserve both truth and validity. No fake TRUE/NULL leaf is used
+            // to represent a deferred condition; original Expr still combines.
+            recipe = inputs_[i]->PrepareBitmapForOffsets(context.exec_context,
+                                                         false);
+        }
+        residual = JoinFilterRecipes(is_and_, residual, recipe);
+    }
+    return {nullptr, residual};
 }
 
 }  //namespace exec

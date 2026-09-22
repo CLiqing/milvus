@@ -42,6 +42,8 @@
 #include "exec/expression/MembershipFilterExpr.h"
 #include "exec/expression/NullExpr.h"
 #include "exec/expression/PreparedBitmapExpr.h"
+#include "exec/expression/OffsetExpressionEvaluator.h"
+#include "exec/AnnFusingPolicy.h"
 #include "exec/expression/TermExpr.h"
 #include "exec/expression/TimestamptzArithCompareExpr.h"
 #include "exec/expression/UnaryExpr.h"
@@ -490,6 +492,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
     } else {
         ThrowInfo(UnexpectedError, "unsupport expr: {}", expr->ToString());
     }
+    result->SetLogicalSource(expr);
     return result;
 }
 
@@ -998,6 +1001,175 @@ EvalExprSetOverAllBatches(ExprSet& expr_set,
     // relying on the convention that UNKNOWN rows carry data=0.
     bitset.inplace_and(valid_bitset, bitset.size());
     return bitset;
+}
+
+std::optional<FilterSourceInfo>
+SegmentExpr::DescribeFilterSource() const {
+    const auto operation = FilterOperation();
+    if (!operation || IsElementLevelExpression() || !nested_path_.empty()) {
+        return std::nullopt;
+    }
+    EnsureExecPathDetermined();
+    std::string index_type = "NONE";
+    if (exec_path_ == ExprExecPath::ScalarIndex && !pinned_index_.empty()) {
+        index_type = pinned_index_.front().get()->Type();
+    } else if (exec_path_ == ExprExecPath::PkIndex) {
+        index_type = "PK";
+    } else if (exec_path_ == ExprExecPath::TextIndex) {
+        index_type = "TEXT";
+    } else if (exec_path_ == ExprExecPath::JsonStats) {
+        index_type = "JSON_STATS";
+    }
+    return FilterSourceInfo{
+        field_id_,
+        proto::schema::DataType_Name(
+            static_cast<proto::schema::DataType>(field_type_)),
+        *operation,
+        std::move(index_type)};
+}
+
+std::optional<FieldId>
+Expr::OffsetSamplingField() const {
+    for (const auto& input : inputs_) {
+        if (const auto field = input->OffsetSamplingField()) {
+            return field;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<FieldId>
+SegmentExpr::OffsetSamplingField() const {
+    return segment_->HasFieldData(field_id_) ? std::optional<FieldId>(field_id_)
+                                             : std::nullopt;
+}
+
+bool
+Expr::MayDeferFiltering(const FilterScheduleContext& context) {
+    if (context.request == AnnFilterFusingRequest::Baseline ||
+        !logical_source_) {
+        return false;
+    }
+    const auto facts = DescribeFilterSource();
+    if (!facts || !SupportsDeferredEvaluation()) {
+        return false;
+    }
+    if (context.request != AnnFilterFusingRequest::Auto) {
+        return true;
+    }
+    const auto& policy = AnnFusingPolicy::Instance();
+    const MilvusAnnFusingRuleV1 request{sizeof(MilvusAnnFusingRuleV1),
+                                        facts->data_type.c_str(),
+                                        facts->operation.c_str(),
+                                        facts->index_type.c_str()};
+    const bool result = policy.available() && policy.Consider(request);
+    LOG_DEBUG(
+        "ann_fusing auto rule type={} op={} index={} consider={} reason={}",
+        facts->data_type,
+        facts->operation,
+        facts->index_type,
+        result,
+        result ? "consider_sample" : "baseline_rule");
+    return result;
+}
+
+FilterSchedule
+Expr::ScheduleFiltering(const FilterScheduleContext& context, bool) {
+    AssertInfo(logical_source_ != nullptr,
+               "filter scheduling requires a compiled logical source");
+    if (!MayDeferFiltering(context)) {
+        return {logical_source_, nullptr};
+    }
+    std::optional<double> ratio;
+    if (context.request == AnnFilterFusingRequest::Auto) {
+        if (const auto field = OffsetSamplingField()) {
+            ratio = SampleOffsetFilterRatio(
+                logical_source_, *field, context.exec_context);
+        }
+        const bool chosen = ratio && AnnFusingPolicy::Instance().Choose(
+                                         {sizeof(MilvusAnnFusingSampleV1),
+                                          ratio.value_or(1),
+                                          context.mandatory_filter_ratio});
+        LOG_DEBUG(
+            "ann_fusing auto sample decision={} filter_ratio={} "
+            "mandatory_filter_ratio={}",
+            chosen ? "fusing" : "baseline",
+            ratio.value_or(-1),
+            context.mandatory_filter_ratio);
+        if (!chosen) {
+            return {logical_source_, nullptr};
+        }
+    }
+    return {nullptr, logical_source_, ratio};
+}
+
+std::shared_ptr<const PreparedBitmapExpr>
+Expr::PrepareBitmapForOffsets(ExecContext* context, bool require_all_at_once) {
+    AssertInfo(logical_source_ != nullptr,
+               "bitmap preparation requires a compiled source");
+    const bool all_at_once = CanExecuteAllAtOnce();
+    if (require_all_at_once && !all_at_once) {
+        return nullptr;
+    }
+    // A separate normal ExprSet preserves the planning node's cursor. Its
+    // truth and validity are kept separately, including below OR and NOT.
+    ExprSet source({logical_source_}, context, /*null_rejecting=*/false);
+    if (source.CanExecuteAllAtOnce()) {
+        source.SetExecuteAllAtOnce();
+    }
+    EvalCtx evaluation(context);
+    const auto total = context->get_query_context()->get_active_count();
+    TargetBitmap truth, valid;
+    std::vector<VectorPtr> results;
+    while (truth.size() < total) {
+        source.Eval(evaluation, results);
+        AssertInfo(results.size() == 1 && results[0],
+                   "prepared filter result missing");
+        const auto column = std::dynamic_pointer_cast<ColumnVector>(results[0]);
+        AssertInfo(column && column->IsBitmap() && column->size() > 0,
+                   "prepared filter must make progress with bitmap batches");
+        AssertInfo(column->size() <= total - truth.size(),
+                   "prepared filter exceeded active row domain");
+        if (truth.empty() && column->size() == total) {
+            // Keep the existing all-at-once index path's copy count unchanged.
+            return std::make_shared<PreparedBitmapExpr>(logical_source_,
+                                                        column);
+        }
+        truth.append(TargetBitmapView(column->GetRawData(), column->size()));
+        valid.append(
+            TargetBitmapView(column->GetValidRawData(), column->size()));
+    }
+    auto result =
+        std::make_shared<ColumnVector>(std::move(truth), std::move(valid));
+    return std::make_shared<PreparedBitmapExpr>(logical_source_, result);
+}
+
+FilterSchedule
+ExprSet::ScheduleFilter(const expr::TypedExprPtr& source,
+                        ExecContext* context,
+                        AnnFilterFusingRequest request) {
+    if (request == AnnFilterFusingRequest::Baseline ||
+        (request == AnnFilterFusingRequest::Auto &&
+         !AnnFusingPolicy::Instance().available())) {
+        return {source, nullptr};
+    }
+    // Use the existing compiler and physical-node methods, without a second
+    // AST shape recognizer. Preparation is not a disposable capability probe:
+    // these nodes provide access-path facts, scheduling and prepared results.
+    auto root =
+        CompileExpression(source, context->get_query_context(), {}, false);
+    FilterScheduleContext scheduling{context, request, -1};
+    auto result = root->ScheduleFiltering(scheduling, /*allow_split=*/true);
+    if (request == AnnFilterFusingRequest::Auto && result.residual &&
+        !result.residual_filter_ratio) {
+        auto residual = CompileExpression(
+            result.residual, context->get_query_context(), {}, false);
+        if (const auto field = residual->OffsetSamplingField()) {
+            result.residual_filter_ratio =
+                SampleOffsetFilterRatio(result.residual, *field, context);
+        }
+    }
+    return result;
 }
 
 }  // namespace exec

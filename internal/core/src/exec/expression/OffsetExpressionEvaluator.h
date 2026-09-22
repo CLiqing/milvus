@@ -13,6 +13,14 @@
 
 namespace milvus::exec {
 
+// Evaluate 10/20 distinct original offsets from one real scalar chunk through
+// the same Expr offset evaluator used by candidate filtering. Only the ratio
+// escapes; no dense bitmap or sampled-row cache is created.
+std::optional<double>
+SampleOffsetFilterRatio(const expr::TypedExprPtr& expression,
+                        FieldId field_id,
+                        ExecContext* exec_context);
+
 // SQL predicate truth for at most 64 input offsets.  A lane is accepted only
 // when it is present in both true_mask and known_mask; UNKNOWN/NULL therefore
 // remains distinguishable inside Milvus and can be folded to false only at the
@@ -39,7 +47,7 @@ class OffsetExpressionWorkspace final {
     bool
     SupportsOffsetInput() const;
 
-    // Native Milvus entry used by iterative filtering.  It preserves the
+    // Native Milvus offset evaluation entry. It preserves the
     // existing OffsetVector -> ColumnVector path without repacking or a
     // 64-lane limit. Under null rejection only data & validity is guaranteed;
     // FALSE and UNKNOWN need not remain distinguishable.

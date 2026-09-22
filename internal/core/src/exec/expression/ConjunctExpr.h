@@ -64,6 +64,13 @@ class PhyConjunctFilterExpr : public Expr {
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
+    bool
+    MayDeferFiltering(const FilterScheduleContext& context) override;
+
+    FilterSchedule
+    ScheduleFiltering(const FilterScheduleContext& context,
+                      bool allow_split) override;
+
     void
     MoveCursor() override {
         if (!has_offset_input_) {
