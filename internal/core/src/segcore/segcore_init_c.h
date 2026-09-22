@@ -23,6 +23,11 @@ extern "C" {
 void
 SegcoreInit(const char*);
 
+// Startup-only native policy registration. False is diagnosed by initcore and
+// leaves AUTO on baseline. No plugin (empty library path) is not an error.
+bool
+SegcoreInitAnnFusingPolicy(const char* library_path, const char* config_path);
+
 void
 SegcoreSetChunkRows(const int64_t);
 

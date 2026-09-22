@@ -194,16 +194,18 @@ PhyVectorSearchNode::GetOutput() {
         callback_view = callback->view();
         search_view.set_candidate_evaluator(&callback_view);
         auto& params = search_info_.search_params_;
-        if (params.contains("ann_fusing_rejection_ratio")) {
-            // Development override is the COMPLETE query rejection ratio.
-            // It drives both the policy and DiskANN alpha, without pretending
-            // it is the exact mandatory bitmap count.
-            const double ratio = params.at("ann_fusing_rejection_ratio").get<double>();
+        // Backend transport field is derived here, not a public strategy knob.
+        params.erase("ann_fusing_filter_ratio");
+        if (params.contains("debug_ann_fusing_filter_ratio")) {
+            // Development override is the COMPLETE query filter ratio.
+            // Only DiskANN expansion consumes it, never leaf policy sampling
+            // or the exact mandatory bitmap count.
+            const double ratio = params.at("debug_ann_fusing_filter_ratio").get<double>();
             AssertInfo(std::isfinite(ratio) && ratio >= 0 && ratio <= 1,
-                       "ann_fusing_rejection_ratio must be in [0,1]");
+                       "debug_ann_fusing_filter_ratio must be in [0,1]");
             params["ann_fusing_filter_ratio"] = ratio;
         } else {
-            if (const auto residual = query_context_->get_ann_fusing_residual_rejection()) {
+            if (const auto residual = query_context_->get_ann_fusing_residual_filter_ratio()) {
                 if (!search_view.has_known_count()) {
                     // This is the already materialized mandatory bitmap only.
                     // A freshly constructed BitsetView has no cached count.

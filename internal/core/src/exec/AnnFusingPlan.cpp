@@ -62,22 +62,12 @@ DescribeAnnFusingLeaf(const expr::TypedExprPtr& expression,
 }
 
 std::optional<double>
-SampleAnnFusingRejection(const expr::TypedExprPtr& expression,
+SampleAnnFusingFilterRatio(const expr::TypedExprPtr& expression,
                          FieldId field_id,
                          ExecContext* exec_context) {
     auto* query = exec_context->get_query_context();
     const auto params = query->get_search_info().search_params_;
-    // Development-only input for isolating CAP scalar costs from estimator
-    // error. It is a ratio, never the bitmap's exact count.
-    if (params.contains("ann_fusing_rejection_ratio")) {
-        const double ratio =
-            params.at("ann_fusing_rejection_ratio").get<double>();
-        AssertInfo(std::isfinite(ratio) && ratio >= 0 && ratio <= 1,
-                   "ann_fusing_rejection_ratio must be in [0,1]");
-        LOG_DEBUG("ann_fusing sample source=injected rejection_ratio={}",
-                  ratio);
-        return ratio;
-    }
+    // A whole-query debug ratio must never replace this expression's sample.
     const int requested = params.value("ann_fusing_sample_rows", 20);
     AssertInfo(requested == 10 || requested == 20,
                "ann_fusing_sample_rows must be 10 or 20");
@@ -129,7 +119,7 @@ SampleAnnFusingRejection(const expr::TypedExprPtr& expression,
     const double ratio = 1.0 - static_cast<double>(accepted) / count;
     LOG_DEBUG(
         "ann_fusing sample source=chunk field={} chunk={} rows={} "
-        "chunk_first={} chunk_rows={} rejection_ratio={}",
+        "chunk_first={} chunk_rows={} filter_ratio={}",
         field_id.get(),
         chunk,
         count,

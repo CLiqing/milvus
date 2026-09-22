@@ -78,6 +78,7 @@ func doInitQueryNodeOnce(ctx context.Context) error {
 
 	// update log level based on current setup
 	UpdateLogLevel(paramtable.Get().LogCfg.Level.GetValue())
+	InitAnnFusingPolicy(ctx, paramtable.Get())
 
 	// override segcore chunk size
 	cChunkRows := C.int64_t(paramtable.Get().QueryNodeCfg.ChunkRows.GetAsInt64())
@@ -248,6 +249,23 @@ func doInitQueryNodeOnce(ctx context.Context) error {
 	// init paramtable change callback for core related config
 	SetupCoreConfigChangelCallback()
 	return InitPluginLoader()
+}
+
+// InitAnnFusingPolicy registers the native policy once, before query execution.
+// A configured but invalid plugin is diagnosed and safely retains baseline.
+func InitAnnFusingPolicy(ctx context.Context, params *paramtable.ComponentParam) bool {
+	libraryPath := params.QueryNodeCfg.AnnFusingPluginPath.GetValue()
+	configPath := params.QueryNodeCfg.AnnFusingConfigPath.GetValue()
+	library := C.CString(libraryPath)
+	config := C.CString(configPath)
+	defer C.free(unsafe.Pointer(library))
+	defer C.free(unsafe.Pointer(config))
+	ok := bool(C.SegcoreInitAnnFusingPolicy(library, config))
+	if !ok {
+		mlog.Warn(ctx, "ANN fusing policy configuration rejected; AUTO remains baseline until restart",
+			mlog.String("libraryPath", libraryPath), mlog.String("configPath", configPath))
+	}
+	return ok
 }
 
 // SyncPreferFieldDataWhenIndexHasRawData pushes the current paramtable value

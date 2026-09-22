@@ -20,6 +20,7 @@
 #include "common/EasyAssert.h"
 #include "common/FastMem.h"
 #include "config/ConfigKnowhere.h"
+#include "exec/AnnFusingPolicy.h"
 #include "glog/logging.h"
 #include "log/Log.h"
 #include "pthread.h"
@@ -28,6 +29,19 @@
 #include "storage/PrefetchThreadPool.h"
 
 namespace milvus::segcore {
+
+extern "C" bool
+SegcoreInitAnnFusingPolicy(const char* library_path, const char* config_path) {
+    try {
+        return exec::AnnFusingPolicy::Initialize(library_path, config_path);
+    } catch (const std::exception& e) {
+        LOG_WARN("ann_fusing policy initialization failed: {}; AUTO keeps baseline", e.what());
+        return false;
+    } catch (...) {
+        LOG_WARN("ann_fusing policy initialization failed; AUTO keeps baseline");
+        return false;
+    }
+}
 
 std::once_flag close_glog_once;
 

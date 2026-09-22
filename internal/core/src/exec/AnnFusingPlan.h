@@ -39,15 +39,15 @@ DescribeAnnFusingLeaf(const expr::TypedExprPtr& expression,
 // separate workspace, so sampling never consumes the baseline ExprSet cursor.
 // Only the estimate escapes; sampled offsets remain local to this call.
 std::optional<double>
-SampleAnnFusingRejection(const expr::TypedExprPtr& expression,
+SampleAnnFusingFilterRatio(const expr::TypedExprPtr& expression,
                          FieldId field_id,
                          ExecContext* exec_context);
 
 struct AnnFusingExecutionPlan {
     expr::TypedExprPtr baseline;  // null means no user predicate before search
     expr::TypedExprPtr residual;  // null means entirely baseline
-    // Advisory residual rejection only, never a bitmap count/result capacity.
-    std::optional<double> residual_rejection;
+    // Advisory residual filter ratio, never a bitmap count/result capacity.
+    std::optional<double> residual_filter_ratio;
 };
 
 AnnFusingExecutionPlan

@@ -126,7 +126,7 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                 query_context_->set_ann_fusing_callback(
                     std::make_shared<OffsetExpressionCallback>(
                         execution.residual, exec_context, need_process_rows_),
-                    execution.residual_rejection);
+                    execution.residual_filter_ratio);
             }
         }
         LOG_DEBUG(

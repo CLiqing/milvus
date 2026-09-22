@@ -355,7 +355,7 @@ TEST(PlanProto, ParsesAnnFilterFusingRequestIndependentlyFromIterative) {
     auto search_params = BuildSearchPlanNode(0.0f, 0.0f, vector_field_id);
     search_params.mutable_vector_anns()
         ->mutable_query_info()
-        ->set_search_params(R"({"hints":"ann_fusing"})");
+        ->set_search_params(R"({"hints":"debug_ann_fusing"})");
     parsed = parser.PlanNodeFromProto(search_params)->search_info_;
     EXPECT_EQ(parsed.ann_filter_fusing_request,
               AnnFilterFusingRequest::ExplicitFusing);
@@ -393,7 +393,7 @@ TEST(PlanProto, AnnFusingHintPrecedenceAndLegacySpelling) {
     predicate->set_op(milvus::proto::plan::GreaterThan);
     predicate->mutable_value()->set_int64_val(0);
     auto* info = node.mutable_vector_anns()->mutable_query_info();
-    info->set_search_params(R"({"hints":"ann_fusing"})");
+    info->set_search_params(R"({"hints":"debug_ann_fusing"})");
     info->set_hints("disable");
     auto parsed = parser.PlanNodeFromProto(node)->search_info_;
     EXPECT_EQ(parsed.ann_filter_fusing_request, AnnFilterFusingRequest::Baseline);
@@ -416,7 +416,7 @@ TEST(PlanProto, AnnFusingHintPrecedenceAndLegacySpelling) {
     info->set_search_params(R"({"hints":"downpush"})");
     EXPECT_ANY_THROW(parser.PlanNodeFromProto(node));
     // Range search still carries intent but must not become iterative.
-    info->set_search_params(R"({"hints":"ann_fusing","radius":10})");
+    info->set_search_params(R"({"hints":"debug_ann_fusing","radius":10})");
     parsed = parser.PlanNodeFromProto(node)->search_info_;
     EXPECT_EQ(parsed.ann_filter_fusing_request,
               AnnFilterFusingRequest::ExplicitFusing);

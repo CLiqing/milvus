@@ -4068,6 +4068,10 @@ type queryNodeConfig struct {
 	// delete snapshot optimization
 	EnableLatestDeleteSnapshotOptimization ParamItem `refreshable:"true"`
 
+	// Native ANN strategy configuration, immutable after QueryNode startup.
+	AnnFusingPluginPath ParamItem `refreshable:"false"`
+	AnnFusingConfigPath ParamItem `refreshable:"false"`
+
 	// expr cache
 	ExprResCacheEnabled               ParamItem `refreshable:"true"`
 	ExprResCacheMode                  ParamItem `refreshable:"true"`
@@ -4133,6 +4137,21 @@ func formatDurationWithMillisecondFallback(v string) string {
 }
 
 func (p *queryNodeConfig) init(base *BaseTable) {
+	p.AnnFusingPluginPath = ParamItem{
+		Key:          "queryNode.annFusing.pluginPath",
+		DefaultValue: "",
+		Export:       true,
+		Doc:          "Startup-only native ANN fusing policy library. Empty means no plugin; AUTO uses baseline.",
+	}
+	p.AnnFusingPluginPath.Init(base.mgr)
+	p.AnnFusingConfigPath = ParamItem{
+		Key:          "queryNode.annFusing.configPath",
+		DefaultValue: "",
+		Export:       true,
+		Doc:          "Startup-only policy YAML passed to the native ANN fusing plugin. Requires process restart to change.",
+	}
+	p.AnnFusingConfigPath.Init(base.mgr)
+
 	p.IDFPreload = ParamItem{
 		Key:          "queryNode.idfOracle.preload",
 		Version:      "2.6.8",

@@ -17,8 +17,8 @@ typedef struct MilvusAnnFusingRuleV1 {
 
 typedef struct MilvusAnnFusingSampleV1 {
     uint32_t struct_size;
-    double rejection_ratio;            // estimate, never an exact row count
-    double mandatory_rejection_ratio;  // -1 if not known; only necessary terms
+    double filter_ratio;            // estimate, never an exact row count
+    double mandatory_filter_ratio;  // -1 if not known; only necessary terms
 } MilvusAnnFusingSampleV1;
 
 typedef struct MilvusAnnFusingPluginV1 {

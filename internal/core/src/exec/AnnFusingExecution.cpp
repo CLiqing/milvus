@@ -197,14 +197,14 @@ PlanAnnFusingExpression(const expr::TypedExprPtr& expression,
         std::optional<double> ratio;
         if (policy) {
             const auto* mod = SupportedMod(candidate.predicate);
-            ratio = SampleAnnFusingRejection(
+            ratio = SampleAnnFusingFilterRatio(
                 candidate.predicate, mod->column_.field_id_, context);
             fusing = ratio && policy->Choose({sizeof(MilvusAnnFusingSampleV1),
                                               ratio.value_or(1),
                                               mandatory_ratio});
             LOG_DEBUG(
-                "ann_fusing auto sample decision={} rejection_ratio={} "
-                "mandatory_rejection_ratio={}",
+                "ann_fusing auto sample decision={} filter_ratio={} "
+                "mandatory_filter_ratio={}",
                 fusing ? "fusing" : "baseline",
                 ratio.value_or(-1),
                 mandatory_ratio);
@@ -215,16 +215,16 @@ PlanAnnFusingExpression(const expr::TypedExprPtr& expression,
             ++residual_count;
             // The existing sample is reusable only for this exact residual.
             // Do not interpret the B-only sample as the rate of A OR B.
-            plan.residual_rejection =
+            plan.residual_filter_ratio =
                 residual_count == 1 && !candidate.indexed_or_operand
                     ? ratio : std::nullopt;
         } else {
             plan.baseline = And(plan.baseline, complete);
         }
     }
-    if (policy && plan.residual && !plan.residual_rejection) {
-        plan.residual_rejection =
-            SampleAnnFusingRejection(plan.residual, sample_field, context);
+    if (policy && plan.residual && !plan.residual_filter_ratio) {
+        plan.residual_filter_ratio =
+            SampleAnnFusingFilterRatio(plan.residual, sample_field, context);
     }
     return plan;
 }
