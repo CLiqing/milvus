@@ -151,9 +151,7 @@ PlanAnnFusingExpression(const expr::TypedExprPtr& expression,
         if (!planned_or)
             baseline_terms.push_back(term);
     }
-    if (candidates.empty() ||
-        !segment->SupportsAnnFusingDemo(query->get_op_context(),
-                                        query->get_search_info().field_id_)) {
+    if (candidates.empty()) {
         return {expression, nullptr};
     }
 

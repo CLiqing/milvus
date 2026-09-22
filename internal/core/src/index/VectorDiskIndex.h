@@ -88,9 +88,6 @@ class VectorDiskAnnIndex : public VectorIndex {
     bool
     IsIndexRefineEnabled() const override;
 
-    bool
-    SupportsAnnFusingDemo() const override;
-
     std::vector<uint8_t>
     GetVector(const DatasetPtr dataset) const override;
 

@@ -6399,22 +6399,6 @@ ChunkedSegmentSealedImpl::CalcDistByIDs(
 }
 
 bool
-ChunkedSegmentSealedImpl::SupportsAnnFusingDemo(milvus::OpContext* op_ctx,
-                                                FieldId field_id) const {
-    std::shared_lock vector_state_lck(mutex_);
-    auto runtime = CaptureRuntimeResourceState();
-    auto vector_entry = GetVectorIndexing(runtime, field_id);
-    if (vector_entry == nullptr) {
-        return false;
-    }
-    auto accessor = cachinglayer::SemiInlineGet(
-        vector_entry->indexing_->PinCells(op_ctx, {0}));
-    auto vec_index =
-        dynamic_cast<index::VectorIndex*>(accessor->get_cell_of(0));
-    return vec_index != nullptr && vec_index->SupportsAnnFusingDemo();
-}
-
-bool
 ChunkedSegmentSealedImpl::IsIndexRefineEnabledLocked(
     milvus::OpContext* op_ctx,
     FieldId field_id,

@@ -354,9 +354,6 @@ TEST(AnnFusingGraphDemoTest, SharedModCallbackAndUnsupportedFallback) {
                              {"index_algo", "GRAPH"}};
     ASSERT_EQ(index.Build(dataset, config), knowhere::Status::success);
     ASSERT_EQ(index.Node()->FinalizeIdMap(), knowhere::Status::success);
-    if (!index.Node()->SupportsAnnFusingDemo()) {
-        GTEST_SKIP() << "requires Cardinal-enabled build with the graph demo";
-    }
     OffsetExpressionCallback factory(
         fixture.ModLessThan(5, 3), fixture.exec_context.get(), fixture.kRows);
     auto view = factory.view();
@@ -407,17 +404,17 @@ TEST(AnnFusingGraphDemoTest, SharedModCallbackAndUnsupportedFallback) {
     }
 
     // Every nonnegative fixture value has remainder >= 0; threshold below -4
-    // rejects even the negative rows. Underfill must error before IVF/BF.
+    // rejects even the negative rows. Fallback must preserve the callback.
     OffsetExpressionCallback reject(
         fixture.ModLessThan(5, -5), fixture.exec_context.get(), fixture.kRows);
     auto reject_view = reject.view();
     filter.set_candidate_evaluator(&reject_view);
-    EXPECT_FALSE(index.Search(queries, search, filter).has_value());
+    auto empty_result = index.Search(queries, search, filter);
+    ASSERT_TRUE(empty_result.has_value()) << empty_result.what();
+    for (int i = 0; i < 25; ++i) {
+        EXPECT_EQ(empty_result.value()->GetIds()[i], -1);
+    }
 
-    auto old_backend = knowhere::IndexFactory::Instance()
-                           .Create<knowhere::fp32>("HNSW", 0)
-                           .value();
-    EXPECT_FALSE(old_backend.Node()->SupportsAnnFusingDemo());
 }
 
 TEST(OffsetExpressionEvaluatorTest, ReusesExprSetForModUnaryAndLogicalTree) {

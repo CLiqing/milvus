@@ -242,10 +242,6 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     IsIndexRefineEnabled(milvus::OpContext* op_ctx,
                          FieldId field_id) const override;
 
-    bool
-    SupportsAnnFusingDemo(milvus::OpContext* op_ctx,
-                          FieldId field_id) const override;
-
     DataType
     GetFieldDataType(FieldId fieldId) const override;
 

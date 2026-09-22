@@ -106,12 +106,6 @@ class VectorMemIndex : public VectorIndex {
     bool
     IsIndexRefineEnabled() const override;
 
-    bool
-    SupportsAnnFusingDemo() const override {
-        return index_.Node() != nullptr &&
-               index_.Node()->SupportsAnnFusingDemo();
-    }
-
     std::vector<uint8_t>
     GetVector(const DatasetPtr dataset) const override;
 
