@@ -54,6 +54,7 @@ OffsetExpressionCallback::CreateWorker(const void* context,
             return Status::Failed;
         }
         *output = new Worker{std::move(workspace), factory.row_count_};
+        LOG_DEBUG("ann_fusing task workspace created");
         return Status::Success;
     } catch (...) {
         return Status::Failed;

@@ -37,3 +37,90 @@ typedef struct MilvusAnnFusingPluginV1 {
 typedef bool (*MilvusCreateAnnFusingPluginV1Fn)(const char* yaml_path,
                                                 uint32_t output_size,
                                                 MilvusAnnFusingPluginV1* out);
+
+// V2 uses compact metadata codes. V1 above remains frozen for old producers;
+// consumers MUST resolve the versioned V2 symbol before passing a V2 buffer.
+// Fixed-width storage in requests is independent of C compiler enum sizing.
+// These are policy facts, not an executable expression/IR.
+#ifdef __cplusplus
+#define MILVUS_AF_ENUM(name) enum name : uint32_t
+#else
+#define MILVUS_AF_ENUM(name) enum name
+#endif
+MILVUS_AF_ENUM(MilvusAnnFusingDataType){
+    kAnnFusingDataTypeUnknown = 0,
+    kAnnFusingDataTypeBool = 1,
+    kAnnFusingDataTypeInt8 = 2,
+    kAnnFusingDataTypeInt16 = 3,
+    kAnnFusingDataTypeInt32 = 4,
+    kAnnFusingDataTypeInt64 = 5,
+    kAnnFusingDataTypeFloat = 10,
+    kAnnFusingDataTypeDouble = 11,
+    kAnnFusingDataTypeString = 20,
+    kAnnFusingDataTypeVarChar = 21,
+    kAnnFusingDataTypeArray = 22,
+    kAnnFusingDataTypeJSON = 23,
+    kAnnFusingDataTypeGeometry = 24,
+    kAnnFusingDataTypeText = 25,
+    kAnnFusingDataTypeTimestamptz = 26,
+};
+MILVUS_AF_ENUM(MilvusAnnFusingOperation){
+    kAnnFusingOperationUnknown = 0,      kAnnFusingOperationRange = 1,
+    kAnnFusingOperationEqual = 2,        kAnnFusingOperationNotEqual = 3,
+    kAnnFusingOperationPrefixMatch = 4,  kAnnFusingOperationPostfixMatch = 5,
+    kAnnFusingOperationMatch = 6,        kAnnFusingOperationInnerMatch = 7,
+    kAnnFusingOperationRegexMatch = 8,   kAnnFusingOperationAdd = 16,
+    kAnnFusingOperationSub = 17,         kAnnFusingOperationMul = 18,
+    kAnnFusingOperationDiv = 19,         kAnnFusingOperationMod = 20,
+    kAnnFusingOperationArrayLength = 21, kAnnFusingOperationBitAnd = 22,
+    kAnnFusingOperationBitOr = 23,       kAnnFusingOperationBitXor = 24,
+    kAnnFusingOperationShl = 25,         kAnnFusingOperationShr = 26,
+};
+MILVUS_AF_ENUM(MilvusAnnFusingAccessPath){
+    kAnnFusingAccessPathUnknown = 0,
+    kAnnFusingAccessPathRawData = 1,
+    kAnnFusingAccessPathScalarIndex = 2,
+    kAnnFusingAccessPathPkIndex = 3,
+    kAnnFusingAccessPathTextIndex = 4,
+    kAnnFusingAccessPathJsonStats = 5,
+};
+MILVUS_AF_ENUM(MilvusAnnFusingIndexType){
+    kAnnFusingIndexTypeUnknown = 0,
+    kAnnFusingIndexTypeNone = 1,
+    kAnnFusingIndexTypeStlSort = 2,
+    kAnnFusingIndexTypeBitmap = 3,
+    kAnnFusingIndexTypeInverted = 4,
+    kAnnFusingIndexTypeTrie = 5,
+    kAnnFusingIndexTypeHybrid = 6,
+};
+#undef MILVUS_AF_ENUM
+
+typedef struct MilvusAnnFusingRuleV2 {
+    uint32_t struct_size;
+    uint32_t data_type;  // MilvusAnnFusingDataType
+    uint32_t operation;  // MilvusAnnFusingOperation
+    uint32_t
+        access_path;  // MilvusAnnFusingAccessPath, separate from index kind
+    uint32_t
+        index_type;  // MilvusAnnFusingIndexType; None when not a scalar index
+} MilvusAnnFusingRuleV2;
+
+typedef struct MilvusAnnFusingSampleV2 {
+    uint32_t struct_size;
+    double filter_ratio;            // whole user predicate estimate, not count
+    double mandatory_filter_ratio;  // system visibility only; -1 if unknown
+} MilvusAnnFusingSampleV2;
+
+typedef struct MilvusAnnFusingPluginV2 {
+    uint32_t struct_size;
+    uint32_t abi_major;
+    void* context;  // immutable, thread-safe callbacks; same lifetime as V1
+    bool (*consider)(const void*, const MilvusAnnFusingRuleV2*);
+    bool (*choose)(const void*, const MilvusAnnFusingSampleV2*);
+    void (*destroy)(void*);
+} MilvusAnnFusingPluginV2;
+
+// No in-place V1 upgrade. Invalid ABI/config leaves the caller's out untouched.
+typedef bool (*MilvusCreateAnnFusingPluginV2Fn)(const char* yaml_path,
+                                                uint32_t output_size,
+                                                MilvusAnnFusingPluginV2* out);

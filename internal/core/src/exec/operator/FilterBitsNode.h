@@ -82,8 +82,7 @@ class PhyFilterBitsNode : public Operator {
     void
     PrefetchAsync(const std::shared_ptr<folly::CPUThreadPoolExecutor>
                       prefetch_pool) override {
-        // This ExprSet contains baseline terms only (possibly none). Keep A's
-        // normal prefetch while residual B loads only sampled/candidate chunks.
+        // Fusing clears the user ExprSet: only baseline prefetches whole columns.
         exprs_->PrefetchAsync(prefetch_pool);
     }
 

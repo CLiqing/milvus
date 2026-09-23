@@ -298,9 +298,9 @@ class PhyBinaryRangeFilterExpr : public SegmentExpr {
     void
     DetermineExecPath() override;
 
-    std::optional<std::string>
+    std::optional<MilvusAnnFusingOperation>
     FilterOperation() const override {
-        return "range";
+        return kAnnFusingOperationRange;
     }
 
     std::string

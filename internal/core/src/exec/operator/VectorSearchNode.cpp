@@ -198,14 +198,15 @@ PhyVectorSearchNode::GetOutput() {
         params.erase("ann_fusing_filter_ratio");
         if (params.contains("debug_ann_fusing_filter_ratio")) {
             // Development override is the COMPLETE query filter ratio.
-            // Only DiskANN expansion consumes it, never leaf policy sampling
+            // Only DiskANN expansion consumes it, never user-predicate sampling
             // or the exact mandatory bitmap count.
             const double ratio = params.at("debug_ann_fusing_filter_ratio").get<double>();
             AssertInfo(std::isfinite(ratio) && ratio >= 0 && ratio <= 1,
                        "debug_ann_fusing_filter_ratio must be in [0,1]");
             params["ann_fusing_filter_ratio"] = ratio;
         } else {
-            if (const auto residual = query_context_->get_ann_fusing_residual_filter_ratio()) {
+            if (const auto user_ratio =
+                    query_context_->get_ann_fusing_user_filter_ratio()) {
                 if (!search_view.has_known_count()) {
                     // This is the already materialized mandatory bitmap only.
                     // A freshly constructed BitsetView has no cached count.
@@ -219,7 +220,8 @@ PhyVectorSearchNode::GetOutput() {
                 // DiskANN consumes this advisory. Do not set filter_level:
                 // memory graph uses that name for a different connectivity
                 // policy which must remain unchanged by scalar sampling.
-                params["ann_fusing_filter_ratio"] = mandatory + (1.0 - mandatory) * *residual;
+                params["ann_fusing_filter_ratio"] =
+                    mandatory + (1.0 - mandatory) * *user_ratio;
             }
         }
     }

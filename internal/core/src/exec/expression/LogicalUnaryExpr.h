@@ -42,11 +42,7 @@ class PhyLogicalUnaryExpr : public Expr {
     Eval(EvalCtx& context, VectorPtr& result) override;
 
     bool
-    MayDeferFiltering(const FilterScheduleContext& context) override;
-
-    FilterSchedule
-    ScheduleFiltering(const FilterScheduleContext& context,
-                      bool allow_split) override;
+    ConsiderAnnFusing(AnnFilterFusingRequest request) override;
 
     void
     MoveCursor() override {

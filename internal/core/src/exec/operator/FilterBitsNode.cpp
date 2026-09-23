@@ -30,6 +30,7 @@
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/ExprCache.h"
 #include "exec/expression/OffsetExpressionCallback.h"
+#include "exec/expression/OffsetExpressionEvaluator.h"
 #include "query/PlanImpl.h"
 #include "expr/ITypeExpr.h"
 #include "fmt/core.h"
@@ -88,9 +89,12 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                operator_id,
                filter->id(),
                "PhyFilterBitsNode") {
+    const auto preparation_started = std::chrono::steady_clock::now();
     ExecContext* exec_context = operator_context_->get_exec_context();
     query_context_ = exec_context->get_query_context();
-    auto baseline = filter->filter();
+    // Compile the normal Expr once; this same tree is retained for baseline.
+    exprs_ = std::make_unique<ExprSet>(
+        std::vector<expr::TypedExprPtr>{filter->filter()}, exec_context, true);
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
 
@@ -119,30 +123,47 @@ PhyFilterBitsNode::PhyFilterBitsNode(
             !info.materialized_view_involved &&
             !info.search_params_.contains("radius") &&
             !info.global_refine_enable_) {
-            const auto execution = ExprSet::ScheduleFilter(
-                filter->filter(), exec_context, request);
-            baseline = execution.baseline;
-            if (execution.residual) {
+            auto& root = exprs_->exprs().front();
+            const bool considered = (request != AnnFilterFusingRequest::Auto ||
+                                     AnnFusingPolicy::Instance().available()) &&
+                                    root->ConsiderAnnFusing(request);
+            bool chosen = considered;
+            std::optional<double> ratio;
+            if (considered && request == AnnFilterFusingRequest::Auto) {
+                if (const auto field = root->OffsetSamplingField()) {
+                    // Actual whole-expression evaluation, not a disposable
+                    // capability probe. Baseline's scan cursor stays untouched.
+                    ratio = SampleOffsetFilterRatio(
+                        filter->filter(), *field, exec_context);
+                }
+                chosen = ratio && AnnFusingPolicy::Instance().Choose(
+                                      {sizeof(MilvusAnnFusingSampleV2),
+                                       ratio.value_or(1),
+                                       -1});
+                LOG_DEBUG("ann_fusing auto sample decision={} filter_ratio={}",
+                          chosen ? "fusing" : "baseline",
+                          ratio.value_or(-1));
+            }
+            if (chosen) {
                 query_context_->set_ann_fusing_callback(
                     std::make_shared<OffsetExpressionCallback>(
-                        execution.residual, exec_context, need_process_rows_),
-                    execution.residual_filter_ratio);
+                        filter->filter(), exec_context, need_process_rows_),
+                    ratio);
+                skip_user_bitmap_ = true;
+                // Do not prefetch whole columns for a deferred user predicate.
+                // Each actual search task owns its mutable offset workspace.
+                exprs_->Clear();
             }
         }
         LOG_DEBUG(
             "ann_fusing reached FilterBitsNode request={}; decision={} "
-            "reason=shared_expression_plan",
+            "reason=whole_expression compiled_roots=1 prepare_us={}",
             request == AnnFilterFusingRequest::Auto ? "auto" : "force",
-            query_context_->get_ann_fusing_callback() ? "fusing" : "baseline");
+            query_context_->get_ann_fusing_callback() ? "fusing" : "baseline",
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - preparation_started)
+                .count());
     }
-
-    // Only the necessary baseline terms remain here. Already computed index
-    // results are read-only leaves; residual predicates are not compiled into
-    // this ExprSet and cannot trigger its full-column prefetch.
-    skip_user_bitmap_ = !baseline;
-    std::vector<expr::TypedExprPtr> filters;
-    if (baseline) filters.push_back(std::move(baseline));
-    exprs_ = std::make_unique<ExprSet>(filters, exec_context, /*null_rejecting=*/true);
 
     enable_expr_cache_ = query_context_->get_enable_expr_cache() &&
                          !query_context_->get_ann_fusing_callback();

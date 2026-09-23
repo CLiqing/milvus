@@ -1026,16 +1026,30 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
         return true;
     }
 
-    std::optional<std::string>
+    std::optional<MilvusAnnFusingOperation>
     FilterOperation() const override {
         switch (expr_->op_type_) {
             case proto::plan::GreaterThan:
             case proto::plan::GreaterEqual:
             case proto::plan::LessThan:
             case proto::plan::LessEqual:
-                return "range";
+                return kAnnFusingOperationRange;
+            case proto::plan::Equal:
+                return kAnnFusingOperationEqual;
+            case proto::plan::NotEqual:
+                return kAnnFusingOperationNotEqual;
+            case proto::plan::PrefixMatch:
+                return kAnnFusingOperationPrefixMatch;
+            case proto::plan::PostfixMatch:
+                return kAnnFusingOperationPostfixMatch;
+            case proto::plan::Match:
+                return kAnnFusingOperationMatch;
+            case proto::plan::InnerMatch:
+                return kAnnFusingOperationInnerMatch;
+            case proto::plan::RegexMatch:
+                return kAnnFusingOperationRegexMatch;
             default:
-                return proto::plan::OpType_Name(expr_->op_type_);
+                return std::nullopt;
         }
     }
 

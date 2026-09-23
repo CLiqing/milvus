@@ -27,6 +27,7 @@
 #include <string>
 #include <type_traits>
 
+#include "common/AnnFusingPlugin.h"
 #include "common/Array.h"
 #include "common/ArrayOffsets.h"
 #include "common/FieldDataInterface.h"
@@ -169,30 +170,13 @@ ApplyValidMask(ValidityView validity,
     }
 }
 
-class PreparedBitmapExpr;
-
 // Scheduling facts, not a second operator representation. Each physical leaf
 // supplies its operation and actual access path from its own module.
 struct FilterSourceInfo {
-    FieldId field_id;
-    std::string data_type;
-    std::string operation;
-    std::string index_type;
-};
-
-// A missing side denotes an execution phase, never a Boolean TRUE/NULL value.
-// Only a necessary AND condition may move to baseline; Boolean subtrees below
-// OR/NOT must remain complete in whichever phase evaluates them.
-struct FilterSchedule {
-    expr::TypedExprPtr baseline;
-    expr::TypedExprPtr residual;
-    std::optional<double> residual_filter_ratio;
-};
-
-struct FilterScheduleContext {
-    ExecContext* exec_context;
-    AnnFilterFusingRequest request;
-    double mandatory_filter_ratio = -1;
+    MilvusAnnFusingDataType data_type;
+    MilvusAnnFusingOperation operation;
+    MilvusAnnFusingAccessPath access_path;
+    MilvusAnnFusingIndexType index_type;
 };
 
 class Expr : public std::enable_shared_from_this<Expr> {
@@ -209,25 +193,16 @@ class Expr : public std::enable_shared_from_this<Expr> {
 
     virtual ~Expr() = default;
 
-    void
-    SetLogicalSource(expr::TypedExprPtr source) {
-        logical_source_ = std::move(source);
-    }
-
-    const expr::TypedExprPtr&
-    logical_source() const {
-        return logical_source_;
-    }
-
-    virtual std::optional<std::string>
+    virtual std::optional<MilvusAnnFusingOperation>
     FilterOperation() const {
         return std::nullopt;
     }
 
-    // A module may require stronger semantic parity than merely accepting
-    // offset input (e.g. legacy arithmetic overflow/conversion behavior).
+    // DEBUG_ONLY demo safety guard, not a Milvus cost policy. Remove after
+    // sequential/offset semantic parity is qualified for all operators. This
+    // must remain active in Release and cannot be bypassed by force hints.
     virtual bool
-    SupportsDeferredEvaluation() {
+    DebugOnlySupportsDeferredEvaluation() {
         return SupportOffsetInput();
     }
 
@@ -240,15 +215,7 @@ class Expr : public std::enable_shared_from_this<Expr> {
     OffsetSamplingField() const;
 
     virtual bool
-    MayDeferFiltering(const FilterScheduleContext& context);
-
-    virtual FilterSchedule
-    ScheduleFiltering(const FilterScheduleContext& context, bool allow_split);
-
-    // Execute the original Expr, retaining truth + validity for later offset
-    // evaluation. The existing PreparedBitmap ownership remains unchanged.
-    std::shared_ptr<const PreparedBitmapExpr>
-    PrepareBitmapForOffsets(ExecContext* context, bool require_all_at_once);
+    ConsiderAnnFusing(AnnFilterFusingRequest request);
 
     const DataType&
     type() const {
@@ -366,7 +333,6 @@ class Expr : public std::enable_shared_from_this<Expr> {
     }
 
  protected:
-    expr::TypedExprPtr logical_source_;
     DataType type_;
     std::vector<std::shared_ptr<Expr>> inputs_;
     std::string name_;
@@ -3252,11 +3218,6 @@ CompileExpression(const expr::TypedExprPtr& expr,
 
 class ExprSet {
  public:
-    static FilterSchedule
-    ScheduleFilter(const expr::TypedExprPtr& source,
-                   ExecContext* context,
-                   AnnFilterFusingRequest request);
-
     // null_rejecting: the consumer of these expressions' output treats
     // UNKNOWN rows exactly like FALSE (e.g. a filter that folds UNKNOWN into
     // the excluded set); lets conjunctions drop UNKNOWN rows from their

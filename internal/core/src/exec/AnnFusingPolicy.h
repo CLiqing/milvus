@@ -28,10 +28,10 @@ class AnnFusingPolicy final {
     }
 
     bool
-    Consider(const MilvusAnnFusingRuleV1& request) const;
+    Consider(const MilvusAnnFusingRuleV2& request) const;
 
     bool
-    Choose(const MilvusAnnFusingSampleV1& request) const;
+    Choose(const MilvusAnnFusingSampleV2& request) const;
 
  private:
     AnnFusingPolicy() = default;
@@ -44,7 +44,7 @@ class AnnFusingPolicy final {
     AnnFusingPolicy&
     operator=(const AnnFusingPolicy&) = delete;
     void* library_{nullptr};
-    MilvusAnnFusingPluginV1 api_{};
+    MilvusAnnFusingPluginV2 api_{};
     std::once_flag init_once_;
     std::atomic<bool> ready_{false};
     std::string library_path_;

@@ -736,13 +736,38 @@ class PhyBinaryArithOpEvalRangeExpr : public SegmentExpr {
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
-    std::optional<std::string>
+    std::optional<MilvusAnnFusingOperation>
     FilterOperation() const override {
-        return proto::plan::ArithOpType_Name(expr_->arith_op_type_);
+        switch (expr_->arith_op_type_) {
+            case proto::plan::Add:
+                return kAnnFusingOperationAdd;
+            case proto::plan::Sub:
+                return kAnnFusingOperationSub;
+            case proto::plan::Mul:
+                return kAnnFusingOperationMul;
+            case proto::plan::Div:
+                return kAnnFusingOperationDiv;
+            case proto::plan::Mod:
+                return kAnnFusingOperationMod;
+            case proto::plan::ArrayLength:
+                return kAnnFusingOperationArrayLength;
+            case proto::plan::BitAnd:
+                return kAnnFusingOperationBitAnd;
+            case proto::plan::BitOr:
+                return kAnnFusingOperationBitOr;
+            case proto::plan::BitXor:
+                return kAnnFusingOperationBitXor;
+            case proto::plan::Shl:
+                return kAnnFusingOperationShl;
+            case proto::plan::Shr:
+                return kAnnFusingOperationShr;
+            default:
+                return std::nullopt;
+        }
     }
 
     bool
-    SupportsDeferredEvaluation() override {
+    DebugOnlySupportsDeferredEvaluation() override {
         const auto type = expr_->column_.data_type_;
         if (type != DataType::INT8 && type != DataType::INT16 &&
             type != DataType::INT32 && type != DataType::INT64) {

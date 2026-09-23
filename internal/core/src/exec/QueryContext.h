@@ -230,9 +230,9 @@ class QueryContext : public Context {
     void
     set_ann_fusing_callback(
         std::shared_ptr<OffsetExpressionCallback> callback,
-        std::optional<double> residual_filter_ratio = std::nullopt) {
+        std::optional<double> user_filter_ratio = std::nullopt) {
         ann_fusing_callback_ = std::move(callback);
-        ann_fusing_residual_filter_ratio_ = residual_filter_ratio;
+        ann_fusing_user_filter_ratio_ = user_filter_ratio;
     }
 
     const std::shared_ptr<OffsetExpressionCallback>&
@@ -241,8 +241,8 @@ class QueryContext : public Context {
     }
 
     std::optional<double>
-    get_ann_fusing_residual_filter_ratio() const {
-        return ann_fusing_residual_filter_ratio_;
+    get_ann_fusing_user_filter_ratio() const {
+        return ann_fusing_user_filter_ratio_;
     }
 
     knowhere::MetricType
@@ -387,7 +387,7 @@ class QueryContext : public Context {
     // used for vector search
     milvus::SearchInfo search_info_;
     std::shared_ptr<OffsetExpressionCallback> ann_fusing_callback_;
-    std::optional<double> ann_fusing_residual_filter_ratio_;
+    std::optional<double> ann_fusing_user_filter_ratio_;
     // Retrieve/filter-only contexts have no vector placeholders. In particular,
     // AUTO eligibility must never inspect an indeterminate pointer on that path.
     const query::PlaceholderGroup* placeholder_group_{nullptr};

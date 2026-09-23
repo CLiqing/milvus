@@ -39,24 +39,12 @@ PhyLogicalUnaryExpr::Eval(EvalCtx& context, VectorPtr& result) {
 }
 
 bool
-PhyLogicalUnaryExpr::MayDeferFiltering(const FilterScheduleContext& context) {
-    return inputs_[0]->MayDeferFiltering(context);
-}
-
-FilterSchedule
-PhyLogicalUnaryExpr::ScheduleFiltering(const FilterScheduleContext& context,
-                                       bool) {
-    // NOT is a hard boundary for lifting mandatory conditions. The child must
-    // retain three-valued truth until the original NOT evaluator consumes it.
-    auto child = inputs_[0]->ScheduleFiltering(context, false);
-    AssertInfo(!(child.baseline && child.residual),
-               "NOT child was incorrectly split");
-    if (!child.residual) {
-        return {logical_source_, nullptr};
-    }
-    return {nullptr,
-            std::make_shared<expr::LogicalUnaryExpr>(expr_->op_type_,
-                                                     child.residual)};
+PhyLogicalUnaryExpr::ConsiderAnnFusing(AnnFilterFusingRequest request) {
+    // Keep the original Boolean tree. Any rejected leaf rejects the whole tree.
+    return !inputs_.empty() &&
+           std::all_of(inputs_.begin(), inputs_.end(), [&](const auto& input) {
+               return input->ConsiderAnnFusing(request);
+           });
 }
 
 }  //namespace exec
