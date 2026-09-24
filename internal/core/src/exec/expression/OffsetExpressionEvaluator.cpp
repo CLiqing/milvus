@@ -190,23 +190,31 @@ SampleOffsetFilterRatio(const expr::TypedExprPtr& expression,
                "ann_fusing_sample_rows must be 10 or 20");
     const auto* segment = query->get_segment();
     const auto active = query->get_active_count();
-    if (active <= 0 || active > std::numeric_limits<int32_t>::max() ||
-        !segment->HasFieldData(field_id)) {
-        return std::nullopt;
-    }
-    const auto chunks = segment->num_chunk_data(field_id);
-    if (chunks <= 0) {
+    if (active <= 0 || active > std::numeric_limits<int32_t>::max()) {
         return std::nullopt;
     }
     // Select offsets, never generate data values. Sampling uses the server's
     // scalar chunk boundaries, not client parquet row groups.
     std::mt19937_64 random(static_cast<uint64_t>(segment->get_segment_id()) ^
                            query->get_query_timestamp());
-    const auto chunk =
-        std::uniform_int_distribution<int64_t>(0, chunks - 1)(random);
-    const auto first = segment->num_rows_until_chunk(field_id, chunk);
-    const auto rows =
-        std::min<int64_t>(segment->chunk_size(field_id, chunk), active - first);
+    int64_t chunk = 0, first = 0, rows = active;
+    const bool index_only = !segment->HasFieldData(field_id);
+    if (index_only) {
+        // Do not pretend a missing raw column has chunk metadata. A single
+        // sealed scalar index covers the segment's original entity offsets,
+        // including NULL positions; index Count() may exclude NULLs.
+        if (segment->type() != SegmentType::Sealed || !segment->HasIndex(field_id)) {
+            return std::nullopt;
+        }
+        const auto pinned = segment->PinIndex(query->get_op_context(), field_id);
+        if (pinned.size() != 1) return std::nullopt;
+    } else {
+        const auto chunks = segment->num_chunk_data(field_id);
+        if (chunks <= 0) return std::nullopt;
+        chunk = std::uniform_int_distribution<int64_t>(0, chunks - 1)(random);
+        first = segment->num_rows_until_chunk(field_id, chunk);
+        rows = std::min<int64_t>(segment->chunk_size(field_id, chunk), active - first);
+    }
     if (first < 0 || rows <= 0) {
         return std::nullopt;
     }
@@ -236,13 +244,14 @@ SampleOffsetFilterRatio(const expr::TypedExprPtr& expression,
     const double ratio = 1.0 - static_cast<double>(accepted) / count;
     LOG_DEBUG(
         "ann_fusing sample source=chunk field={} chunk={} rows={} "
-        "chunk_first={} chunk_rows={} filter_ratio={}",
+        "chunk_first={} chunk_rows={} filter_ratio={} index_only={}",
         field_id.get(),
         chunk,
         count,
         first,
         rows,
-        ratio);
+        ratio,
+        index_only);
     return ratio;
 }
 

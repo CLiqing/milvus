@@ -174,7 +174,9 @@ ApplyValidMask(ValidityView validity,
 // supplies its operation and actual access path from its own module.
 struct FilterSourceInfo {
     MilvusAnnFusingDataType data_type;
-    MilvusAnnFusingOperation operation;
+    proto::plan::Expr::ExprCase expr_type;
+    proto::plan::OpType operation;
+    proto::plan::ArithOpType arith_operation;
     MilvusAnnFusingAccessPath access_path;
     MilvusAnnFusingIndexType index_type;
 };
@@ -192,19 +194,6 @@ class Expr : public std::enable_shared_from_this<Expr> {
     }
 
     virtual ~Expr() = default;
-
-    virtual std::optional<MilvusAnnFusingOperation>
-    FilterOperation() const {
-        return std::nullopt;
-    }
-
-    // DEBUG_ONLY demo safety guard, not a Milvus cost policy. Remove after
-    // sequential/offset semantic parity is qualified for all operators. This
-    // must remain active in Release and cannot be bypassed by force hints.
-    virtual bool
-    DebugOnlySupportsDeferredEvaluation() {
-        return SupportOffsetInput();
-    }
 
     virtual std::optional<FilterSourceInfo>
     DescribeFilterSource() const {
@@ -351,7 +340,10 @@ using ExprPtr = std::shared_ptr<milvus::exec::Expr>;
 class SegmentExpr : public Expr {
  public:
     std::optional<FilterSourceInfo>
-    DescribeFilterSource() const override;
+    DescribeColumnFilterSource(
+        proto::plan::Expr::ExprCase expr_type,
+        proto::plan::OpType operation = proto::plan::Invalid,
+        proto::plan::ArithOpType arith_operation = proto::plan::Unknown) const;
 
     std::optional<FieldId>
     OffsetSamplingField() const override;
@@ -521,11 +513,14 @@ class SegmentExpr : public Expr {
                 if (segment_->HasFieldData(field_id_)) {
                     MoveCursorForData();
                 }
-            } else if (exec_path_ == ExprExecPath::JsonStats) {
+            } else if (exec_path_ == ExprExecPath::JsonStats ||
+                       exec_path_ == ExprExecPath::TextIndex) {
+                // Text-index-only fields may have no loaded raw column.
+                // Their cached bitmap is addressed by global row position.
                 current_data_global_pos_ += std::min(
                     batch_size_, active_count_ - current_data_global_pos_);
             } else {
-                // RawData, PkIndex, and TextIndex use the data cursor.
+                // RawData and PkIndex use the data cursor.
                 MoveCursorForData();
             }
         }
@@ -615,7 +610,8 @@ class SegmentExpr : public Expr {
     int64_t
     GetNextBatchSize() {
         EnsureExecPathDetermined();
-        if (exec_path_ == ExprExecPath::JsonStats) {
+        if (exec_path_ == ExprExecPath::JsonStats ||
+            exec_path_ == ExprExecPath::TextIndex) {
             const auto remaining = active_count_ - current_data_global_pos_;
             return remaining <= 0 ? 0 : std::min(batch_size_, remaining);
         }
@@ -2847,7 +2843,8 @@ class SegmentExpr : public Expr {
 
     // Returns true if the expression uses the ScalarIndex cursor.
     // Only ScalarIndex maintains a separate index cursor; PkIndex, TextIndex,
-    // and JsonStats cache full results and slice via data cursor.
+    // and JsonStats cache full results; TextIndex/JsonStats use global row
+    // positions even when no raw column is loaded.
     bool
     UseIndexCursor() const {
         EnsureExecPathDetermined();

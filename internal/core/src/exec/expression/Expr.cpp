@@ -988,9 +988,11 @@ EvalExprSetOverAllBatches(ExprSet& expr_set,
 }
 
 std::optional<FilterSourceInfo>
-SegmentExpr::DescribeFilterSource() const {
-    const auto operation = FilterOperation();
-    if (!operation || IsElementLevelExpression() || !nested_path_.empty()) {
+SegmentExpr::DescribeColumnFilterSource(
+    proto::plan::Expr::ExprCase expr_type,
+    proto::plan::OpType operation,
+    proto::plan::ArithOpType arith_operation) const {
+    if (IsElementLevelExpression() || !nested_path_.empty()) {
         return std::nullopt;
     }
     EnsureExecPathDetermined();
@@ -1079,7 +1081,8 @@ SegmentExpr::DescribeFilterSource() const {
               static_cast<uint32_t>(access_path),
               static_cast<uint32_t>(index_type),
               pinned_index_.size());
-    return FilterSourceInfo{data_type, *operation, access_path, index_type};
+    return FilterSourceInfo{data_type, expr_type, operation, arith_operation,
+                            access_path, index_type};
 }
 
 std::optional<FieldId>
@@ -1094,14 +1097,23 @@ Expr::OffsetSamplingField() const {
 
 std::optional<FieldId>
 SegmentExpr::OffsetSamplingField() const {
-    return segment_->HasFieldData(field_id_) ? std::optional<FieldId>(field_id_)
-                                             : std::nullopt;
+    if (segment_->HasFieldData(field_id_)) {
+        return field_id_;
+    }
+    EnsureExecPathDetermined();
+    // A sealed scalar index can be the only loaded representation of a
+    // column. One index chunk still supplies the entity-offset sampling span.
+    if (segment_->type() == SegmentType::Sealed &&
+        exec_path_ == ExprExecPath::ScalarIndex && pinned_index_.size() == 1) {
+        return field_id_;
+    }
+    return std::nullopt;
 }
 
 bool
 Expr::ConsiderAnnFusing(AnnFilterFusingRequest request) {
     if (request == AnnFilterFusingRequest::Baseline ||
-        !DebugOnlySupportsDeferredEvaluation()) {
+        !SupportOffsetInput()) {
         return false;
     }
     const auto started = std::chrono::steady_clock::now();
@@ -1114,17 +1126,21 @@ Expr::ConsiderAnnFusing(AnnFilterFusingRequest request) {
         return true;
     }
     const auto& policy = AnnFusingPolicy::Instance();
-    const MilvusAnnFusingRuleV2 rule{sizeof(MilvusAnnFusingRuleV2),
+    const MilvusAnnFusingRuleV3 rule{sizeof(MilvusAnnFusingRuleV3),
                                      facts->data_type,
+                                     facts->expr_type,
                                      facts->operation,
+                                     facts->arith_operation,
                                      facts->access_path,
                                      facts->index_type};
     const bool result = policy.available() && policy.Consider(rule);
     LOG_DEBUG(
-        "ann_fusing auto rule type={} op={} access={} index={} consider={} "
+        "ann_fusing auto rule type={} expr={} op={} arith={} access={} index={} consider={} "
         "prepare_us={}",
         rule.data_type,
+        rule.expr_type,
         rule.operation,
+        rule.arith_operation,
         rule.access_path,
         rule.index_type,
         result,

@@ -19,6 +19,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <type_traits>
 
 namespace milvus {
@@ -150,6 +152,31 @@ struct ArithCompareOperator {
     compare(const T& left,
             const ArithHighPrecisionType<T>& right,
             const ArithHighPrecisionType<T>& value) {
+        // Integer SIMD computes modulo 2^64. Use the same defined behavior
+        // in the scalar/tail kernel instead of C++ signed-overflow UB.
+        // This kernel is shared by sequential bitsets and offset evaluation.
+        if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+            if constexpr (AOp == ArithOpType::Add || AOp == ArithOpType::Sub ||
+                          AOp == ArithOpType::Mul || AOp == ArithOpType::Shl) {
+                uint64_t bits;
+                const auto lhs = static_cast<uint64_t>(left);
+                const auto rhs = static_cast<uint64_t>(right);
+                if constexpr (AOp == ArithOpType::Add) bits = lhs + rhs;
+                if constexpr (AOp == ArithOpType::Sub) bits = lhs - rhs;
+                if constexpr (AOp == ArithOpType::Mul) bits = lhs * rhs;
+                // Shift amount is validated at plan time.
+                if constexpr (AOp == ArithOpType::Shl) bits = lhs << rhs;
+                int64_t result;
+                std::memcpy(&result, &bits, sizeof(result));
+                return CompareOperator<CmpOp>::compare(result, value);
+            } else if constexpr (AOp == ArithOpType::Div || AOp == ArithOpType::Mod) {
+                if (left == std::numeric_limits<int64_t>::min() && right == -1) {
+                    constexpr int64_t result = AOp == ArithOpType::Div
+                        ? std::numeric_limits<int64_t>::min() : 0;
+                    return CompareOperator<CmpOp>::compare(result, value);
+                }
+            }
+        }
         if constexpr (AOp == ArithOpType::Add) {
             return CompareOperator<CmpOp>::compare(left + right, value);
         } else if constexpr (AOp == ArithOpType::Sub) {
