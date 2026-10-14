@@ -208,7 +208,8 @@ PhyFilterBitsNode::~PhyFilterBitsNode() {
             LOG_INFO(
                 "ann_fusing profile phase=filter segment={} timestamp={} "
                 "skipped={} cache_hit={} completed={} errors={} rows={} "
-                "prepare_us={} output_us={} prefetch_wait_us={} filter_us={}",
+                "prepare_us={} output_us={} prefetch_wait_us={} filter_us={} "
+                "string_row_values={} string_index_values={}",
                 profile_segment_id_,
                 profile_timestamp_,
                 skip_user_bitmap_,
@@ -219,7 +220,9 @@ PhyFilterBitsNode::~PhyFilterBitsNode() {
                 p.prepare_ns / 1000.0,
                 p.execute_ns / 1000.0,
                 p.wait_ns / 1000.0,
-                p.filter_ns / 1000.0);
+                p.filter_ns / 1000.0,
+                p.string_row_values,
+                p.string_index_values);
         } catch (...) {
             // Logging must not change destruction/cancellation semantics.
         }
@@ -301,6 +304,12 @@ PhyFilterBitsNode::GetOutput() {
     tracer::AddEvent(fmt::format("input_rows: {}", need_process_rows_));
 
     WaitPrefetch();
+    // Collect shared Expr/index work only during actual baseline evaluation.
+    // Bitmap cache hits and the fusing skip return above without evaluating.
+    std::optional<FilterDiagnosticScope> profile_scope;
+    if (profile_) {
+        profile_scope.emplace(profile_.get());
+    }
     FilterDiagnosticTimer profile_filter(profile_ ? &profile_->filter_ns
                                                   : nullptr);
 

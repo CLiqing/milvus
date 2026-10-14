@@ -25,6 +25,11 @@ struct FilterDiagnostics {
     // belongs to *_path_ns/callback time, not necessarily *_read_ns.
     uint64_t raw_read_ns{0}, index_read_ns{0};
     uint64_t raw_read_rows{0}, index_read_rows{0};
+    // Values presented to the instrumented shared string predicates, counted
+    // once per batch/range, not distinct IDs or regex-engine invocations.
+    // Row kernels keep their existing bitmap/validity order; index kernels
+    // count unique dictionary values, not expanded posting-list rows.
+    uint64_t string_row_values{0}, string_index_values{0};
     std::array<uint64_t, 65> batch_sizes{};
 };
 

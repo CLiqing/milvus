@@ -255,7 +255,8 @@ SampleOffsetFilterRatio(const expr::TypedExprPtr& expression,
             "ann_fusing profile phase=sample segment={} timestamp={} "
             "rows={} chunk={} chunk_rows={} filter_ratio={} prepare_us={} "
             "eval_us={} raw_path_rows={} index_path_rows={} raw_read_us={} "
-            "index_read_us={} storage_accounted_cold_bytes={} "
+            "index_read_us={} string_row_values={} string_index_values={} "
+            "storage_accounted_cold_bytes={} "
             "storage_accounted_total_bytes={}",
             segment->get_segment_id(),
             query->get_query_timestamp(),
@@ -272,6 +273,8 @@ SampleOffsetFilterRatio(const expr::TypedExprPtr& expression,
             sample_profile.index_path_rows,
             sample_profile.raw_read_ns / 1000.0,
             sample_profile.index_read_ns / 1000.0,
+            sample_profile.string_row_values,
+            sample_profile.string_index_values,
             op ? op->storage_usage.scanned_cold_bytes.load() - cold_before : 0,
             op ? op->storage_usage.scanned_total_bytes.load() - total_before
                : 0);

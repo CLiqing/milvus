@@ -110,6 +110,13 @@ class ChunkedColumnInterface {
         return {Span(op_ctx, chunk_id), DataByteSize()};
     }
 
+    // Borrow a variable-width chunk with its owner and retention charge.
+    // Group-backed implementations must charge sibling fields as well.
+    virtual std::pair<PinWrapper<Chunk*>, size_t>
+    PinOffsetChunk(milvus::OpContext* op_ctx, int64_t chunk_id) const {
+        return {GetChunk(op_ctx, chunk_id), DataByteSize()};
+    }
+
     virtual void
     PrefetchChunks(milvus::OpContext* op_ctx,
                    const std::vector<int64_t>& chunk_ids) const = 0;

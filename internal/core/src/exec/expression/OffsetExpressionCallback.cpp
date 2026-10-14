@@ -124,7 +124,8 @@ OffsetExpressionCallback::DestroyWorker(void* worker) noexcept {
                 "errors={} prepare_us={} callback_us={} raw_path_rows={} "
                 "index_path_rows={} raw_path_us={} index_path_us={} "
                 "raw_read_rows={} index_read_rows={} raw_read_us={} "
-                "index_read_us={} batch_sizes=[{}]",
+                "index_read_us={} string_row_values={} "
+                "string_index_values={} batch_sizes=[{}]",
                 state->segment_id,
                 state->query_timestamp,
                 worker,
@@ -143,6 +144,8 @@ OffsetExpressionCallback::DestroyWorker(void* worker) noexcept {
                 p.index_read_rows,
                 p.raw_read_ns / 1000.0,
                 p.index_read_ns / 1000.0,
+                p.string_row_values,
+                p.string_index_values,
                 sizes.str());
         } catch (...) {
             // Telemetry must not turn worker destruction into a query failure.

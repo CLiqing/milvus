@@ -43,6 +43,21 @@
 namespace milvus {
 namespace exec {
 
+// Optional batch-level accounting. No extra work is added to predicate loops;
+// without diagnostics even bitmap population is not computed. This counts
+// values presented to the wrapper, including regex prechecks, not engine calls.
+inline void
+RecordStringRowValues(size_t count,
+                      const TargetBitmap* bitmap = nullptr,
+                      size_t start = 0) {
+    if (auto* profile = active_filter_diagnostics) {
+        profile->string_row_values +=
+            bitmap != nullptr && !bitmap->empty()
+                ? bitmap->view(start, count).count()
+                : count;
+    }
+}
+
 // Optional context for UnaryCompare to hold pre-built objects that are
 // expensive to construct per-row (e.g. LikePatternMatcher for Match ops).
 // Callers on hot paths should pre-construct and reuse across rows.
@@ -134,6 +149,7 @@ struct UnaryElementFuncForMatch {
 
         if constexpr (std::is_same_v<T, std::string> ||
                       std::is_same_v<T, std::string_view>) {
+            RecordStringRowValues(size);
             std::unique_ptr<LikePatternMatcher> local_matcher;
             const LikePatternMatcher* m = matcher;
             if (m == nullptr) {
@@ -159,6 +175,7 @@ struct UnaryElementFuncForMatch {
                const int32_t* offsets = nullptr) {
         if constexpr (std::is_same_v<T, std::string> ||
                       std::is_same_v<T, std::string_view>) {
+            RecordStringRowValues(size, &bitmap_input, start_cursor);
             std::unique_ptr<LikePatternMatcher> local_matcher;
             const LikePatternMatcher* m = matcher;
             if (m == nullptr) {
@@ -206,6 +223,7 @@ struct UnaryElementFuncForRegexMatch {
 
         if constexpr (std::is_same_v<T, std::string> ||
                       std::is_same_v<T, std::string_view>) {
+            RecordStringRowValues(size);
             // Fallback: construct locally if no pre-built objects
             std::unique_ptr<PartialRegexMatcher> local_matcher;
             const PartialRegexMatcher* m = matcher;
@@ -239,6 +257,7 @@ struct UnaryElementFuncForRegexMatch {
                const int32_t* offsets = nullptr) {
         if constexpr (std::is_same_v<T, std::string> ||
                       std::is_same_v<T, std::string_view>) {
+            RecordStringRowValues(size, &bitmap_input, start_cursor);
             std::unique_ptr<PartialRegexMatcher> local_matcher;
             const PartialRegexMatcher* m = matcher;
             if (!m) {
@@ -302,6 +321,7 @@ struct UnaryElementFunc {
 
         if constexpr (std::is_same_v<T, std::string_view> ||
                       std::is_same_v<T, std::string>) {
+            RecordStringRowValues(size);
             for (int i = 0; i < size; ++i) {
                 if constexpr (op == proto::plan::OpType::Equal) {
                     res[i] = src[i] == val;
@@ -372,6 +392,17 @@ struct UnaryElementFunc {
             UnaryElementFuncForRegexMatch<T, filter_type> func;
             func(src, size, val, res, bitmap_input, start_cursor, offsets);
             return;
+        }
+
+        if constexpr (std::is_same_v<T, std::string_view> ||
+                      std::is_same_v<T, std::string>) {
+            // The legacy random kernel does not consume bitmap_input for
+            // these ops. Account for its actual work without changing it.
+            if constexpr (filter_type == FilterType::random) {
+                RecordStringRowValues(size);
+            } else {
+                RecordStringRowValues(size, &bitmap_input, start_cursor);
+            }
         }
 
         // This is the original code, which is kept for the documentation purposes

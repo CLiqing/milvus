@@ -9,6 +9,7 @@
 #include <fstream>
 #include <future>
 #include <numeric>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "exec/expression/Expr.h"
 #include "exec/AnnFusingPolicy.h"
 #include "exec/expression/ConjunctExpr.h"
+#include "exec/expression/UnaryExpr.h"
 #include "segcore/ChunkedSegmentSealedImpl.h"
 #include "storage/LocalChunkManagerSingleton.h"
 
@@ -40,7 +42,21 @@ class ScalarIndexLookupViewsTest : public testing::Test {
         for (std::string line; std::getline(input, line);) {
             auto row = nlohmann::json::parse(line);
             ids_.push_back(row.at(0).get<int64_t>());
-            strings_.push_back(row.at(1).get<std::string>());
+            if (row.size() > 1) {
+                strings_.push_back(row.at(1).get<std::string>());
+            }
+        }
+        // Independent native index fixtures, not a joined benchmark dataset:
+        // numeric values are original Cohere IDs; strings are original NQ.
+        if (strings_.empty()) {
+            const char* text_path = std::getenv("MILVUS_NQ_OFFSET_FIXTURE");
+            ASSERT_NE(text_path, nullptr);
+            std::ifstream text_input(text_path);
+            ASSERT_TRUE(text_input.good());
+            for (std::string line; std::getline(text_input, line);) {
+                strings_.push_back(
+                    nlohmann::json::parse(line).at("text").get<std::string>());
+            }
         }
         ASSERT_EQ(ids_.size(), 65536);
         ASSERT_EQ(strings_.size(), ids_.size());
@@ -159,6 +175,105 @@ TEST_F(ScalarIndexLookupViewsTest, MmapStringViews) {
     StringIndexSort mapped;
     mapped.Load(serialized, config);
     CheckBatch<std::string>(mapped, strings_);
+}
+
+TEST_F(ScalarIndexLookupViewsTest, SharedStringPredicateDiagnostics) {
+    using namespace milvus::exec;
+    std::vector<std::string_view> values(strings_.begin(),
+                                         strings_.begin() + 64);
+    const std::string pattern = "%cedar%oak%";
+    const std::string regex = "(cedar|oak)[a-z]*";
+    for (size_t count : {0, 1, 2, 31, 32, 63, 64}) {
+        for (bool masked : {false, true}) {
+            TargetBitmap mask(masked ? count + 3 : 0, false);
+            size_t expected = 0;
+            for (size_t i = 0; i < count; ++i) {
+                const bool active = !masked || i % 3 != 1;
+                if (masked)
+                    mask[i + 3] = active;
+                expected += active;
+            }
+            const auto check = [&](auto predicate, const std::string& arg) {
+                TargetBitmap plain(count, false), measured(count, false);
+                predicate(values.data(), count, arg, plain.view(), mask, 3);
+                FilterDiagnostics profile;
+                {
+                    FilterDiagnosticScope scope(&profile);
+                    predicate(
+                        values.data(), count, arg, measured.view(), mask, 3);
+                }
+                EXPECT_EQ(profile.string_row_values, expected);
+                EXPECT_EQ(profile.string_index_values, 0);
+                for (size_t i = 0; i < count; ++i)
+                    EXPECT_EQ(bool(plain[i]), bool(measured[i]));
+                EXPECT_EQ(active_filter_diagnostics, nullptr);
+            };
+            check(UnaryElementFuncForMatch<std::string_view>{}, pattern);
+            check(UnaryElementFuncForRegexMatch<std::string_view>{}, regex);
+            check(UnaryElementFunc<std::string_view, proto::plan::InnerMatch>{},
+                  "cedar");
+        }
+    }
+    // Candidate repetition is an execution occurrence, not another source row.
+    const int32_t offsets[] = {17, 2, 17, 9};
+    TargetBitmap mask(4, true), output(4, false);
+    FilterDiagnostics outer, inner;
+    {
+        FilterDiagnosticScope first(&outer);
+        UnaryElementFuncForMatch<std::string_view, FilterType::random>{}(
+            values.data(), 4, pattern, output.view(), mask, 0, offsets);
+        try {
+            FilterDiagnosticScope nested(&inner);
+            RecordStringRowValues(3);
+            throw std::runtime_error("diagnostic scope restoration");
+        } catch (const std::runtime_error&) {
+        }
+        EXPECT_EQ(active_filter_diagnostics, &outer);
+    }
+    EXPECT_EQ(outer.string_row_values, 4);
+    EXPECT_EQ(inner.string_row_values, 3);
+    EXPECT_EQ(active_filter_diagnostics, nullptr);
+}
+
+TEST_F(ScalarIndexLookupViewsTest, SortedStringPredicateDiagnostics) {
+    StringIndexSort memory;
+    memory.Build(strings_.size(), strings_.data());
+    auto serialized = memory.Serialize({});
+    char directory[] = "/tmp/milvus-string-diagnostics-XXXXXX";
+    ASSERT_NE(mkdtemp(directory), nullptr);
+    Config config;
+    config[MMAP_FILE_PATH] = std::string(directory) + "/index";
+    StringIndexSort mapped;
+    mapped.Load(serialized, config);
+    std::set<std::string> unique(strings_.begin(), strings_.end());
+    const auto prefix = strings_.front().substr(0, 5);
+    const auto prefix_values =
+        std::count_if(unique.begin(), unique.end(), [&](const auto& value) {
+            return value.starts_with(prefix);
+        });
+    for (auto* index : {&memory, &mapped}) {
+        const auto check = [&](const std::string& pattern,
+                               proto::plan::OpType op,
+                               size_t expected) {
+            auto plain = index->PatternMatch(pattern, op);
+            exec::FilterDiagnostics profile;
+            auto measured = [&] {
+                exec::FilterDiagnosticScope scope(&profile);
+                return index->PatternMatch(pattern, op);
+            }();
+            EXPECT_EQ(profile.string_index_values, expected);
+            EXPECT_EQ(profile.string_row_values, 0);
+            ASSERT_EQ(plain.size(), measured.size());
+            for (size_t i = 0; i < plain.size(); ++i)
+                EXPECT_EQ(bool(plain[i]), bool(measured[i]));
+        };
+        check("%cedar%oak%", proto::plan::Match, unique.size());
+        check(prefix + "%oak%", proto::plan::Match, prefix_values);
+        check("cedar", proto::plan::InnerMatch, unique.size());
+        check("(cedar|oak)[a-z]*", proto::plan::RegexMatch, unique.size());
+        // Prefix lookup expands a sorted range without a string matcher scan.
+        check(prefix, proto::plan::PrefixMatch, 0);
+    }
 }
 
 TEST_F(ScalarIndexLookupViewsTest, MarisaCompatibilityOwnsDecodedValues) {

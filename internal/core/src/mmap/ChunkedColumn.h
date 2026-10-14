@@ -389,6 +389,13 @@ class ChunkedColumnBase : public ChunkedColumnInterface {
         return PinWrapper<Chunk*>(std::move(ca), chunk);
     }
 
+    std::pair<PinWrapper<Chunk*>, size_t>
+    PinOffsetChunk(milvus::OpContext* op_ctx, int64_t chunk_id) const override {
+        auto owner = GetChunk(op_ctx, chunk_id);
+        const auto bytes = owner.get()->Size();
+        return {std::move(owner), bytes};
+    }
+
     std::vector<PinWrapper<Chunk*>>
     GetAllChunks(milvus::OpContext* op_ctx) const override {
         auto ca = SemiInlineGet(slot_->PinAllCells(op_ctx));

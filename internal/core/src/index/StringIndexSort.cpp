@@ -39,6 +39,7 @@
 #include "common/Slice.h"
 #include "common/Tracer.h"
 #include "common/Types.h"
+#include "exec/FilterDiagnostics.h"
 #include "fmt/core.h"
 #include "folly/small_vector.h"
 #include "glog/logging.h"
@@ -1282,6 +1283,8 @@ StringIndexSortMemoryImpl::PatternMatch(const std::string& pattern,
 
     // For RegexMatch, use PartialRegexMatcher over all unique values
     if (op == proto::plan::OpType::RegexMatch) {
+        if (auto* profile = exec::active_filter_diagnostics)
+            profile->string_index_values += unique_values_.size();
         PartialRegexMatcher matcher(pattern);
         for (size_t idx = 0; idx < unique_values_.size(); ++idx) {
             if (matcher(unique_values_[idx])) {
@@ -1298,6 +1301,8 @@ StringIndexSortMemoryImpl::PatternMatch(const std::string& pattern,
     // Still benefits from unique value deduplication
     if (op == proto::plan::OpType::PostfixMatch ||
         op == proto::plan::OpType::InnerMatch) {
+        if (auto* profile = exec::active_filter_diagnostics)
+            profile->string_index_values += unique_values_.size();
         // Iterate over all unique values
         for (size_t idx = 0; idx < unique_values_.size(); ++idx) {
             if (MatchValue(unique_values_[idx], pattern, op)) {
@@ -1317,6 +1322,8 @@ StringIndexSortMemoryImpl::PatternMatch(const std::string& pattern,
     auto [start_idx, end_idx] = FindPrefixRange(prefix);
 
     // Build matcher for LIKE pattern
+    if (auto* profile = exec::active_filter_diagnostics)
+        profile->string_index_values += end_idx - start_idx;
     LikePatternMatcher matcher(pattern);
 
     // Iterate over unique values in range (each value checked only once)
@@ -1821,6 +1828,8 @@ StringIndexSortMmapImpl::PatternMatch(const std::string& pattern,
 
     // For RegexMatch, use PartialRegexMatcher over all unique values
     if (op == proto::plan::OpType::RegexMatch) {
+        if (auto* profile = exec::active_filter_diagnostics)
+            profile->string_index_values += unique_count_;
         PartialRegexMatcher matcher(pattern);
         for (size_t idx = 0; idx < unique_count_; ++idx) {
             MmapEntry entry = GetEntry(idx);
@@ -1838,6 +1847,8 @@ StringIndexSortMmapImpl::PatternMatch(const std::string& pattern,
     // Still benefits from unique value deduplication
     if (op == proto::plan::OpType::PostfixMatch ||
         op == proto::plan::OpType::InnerMatch) {
+        if (auto* profile = exec::active_filter_diagnostics)
+            profile->string_index_values += unique_count_;
         for (size_t idx = 0; idx < unique_count_; ++idx) {
             MmapEntry entry = GetEntry(idx);
             std::string_view sv = entry.get_string_view();
@@ -1857,6 +1868,8 @@ StringIndexSortMmapImpl::PatternMatch(const std::string& pattern,
     auto [start_idx, end_idx] = FindPrefixRange(prefix);
 
     // Build matcher for LIKE pattern
+    if (auto* profile = exec::active_filter_diagnostics)
+        profile->string_index_values += end_idx - start_idx;
     LikePatternMatcher matcher(pattern);
 
     // Iterate over unique values in range (each value checked only once)

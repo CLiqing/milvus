@@ -1002,19 +1002,36 @@ class SegmentExpr : public Expr {
         // Prepare by physical source layout, not by predicate or search hint.
         // Numeric elements of ARRAY/JSON are not scalar spans even when T is
         // arithmetic; their existing view/element readers remain responsible.
-        if constexpr (std::is_arithmetic_v<T>) {
+        if constexpr (std::is_arithmetic_v<T> ||
+                      std::is_same_v<T, std::string_view>) {
             if (segment_->type() == SegmentType::Sealed &&
                 (IsNumericDataType(field_type_) ||
-                 field_type_ == DataType::TIMESTAMPTZ)) {
+                 field_type_ == DataType::TIMESTAMPTZ ||
+                 (std::is_same_v<T, std::string_view> &&
+                  IsStringDataType(field_type_)))) {
                 if (!offset_reader_attempted_) {
                     offset_reader_attempted_ = true;
                     auto column = segment_->CaptureOffsetColumn(field_id_);
                     if (column && column->NumRows() >= active_count_) {
-                        offset_reader_ = std::make_unique<OffsetColumnReader>(
-                            std::move(column));
+                        if constexpr (std::is_same_v<T, std::string_view>) {
+                            offset_view_reader_ =
+                                std::make_unique<OffsetChunkReader>(
+                                    std::move(column));
+                        } else {
+                            offset_reader_ =
+                                std::make_unique<OffsetColumnReader>(
+                                    std::move(column));
+                        }
                     }
                 }
-                if (offset_reader_) {
+                const bool prepared = [&] {
+                    if constexpr (std::is_same_v<T, std::string_view>) {
+                        return bool(offset_view_reader_);
+                    } else {
+                        return bool(offset_reader_);
+                    }
+                }();
+                if (prepared) {
                     if (skip_func && !offset_reader_skip_index_) {
                         offset_reader_skip_index_ = segment_->GetSkipIndex();
                     }
@@ -1023,22 +1040,12 @@ class SegmentExpr : public Expr {
                     // expression kernel; do not switch to SIMD semantics.
                     constexpr size_t kGatherRows =
                         OffsetColumnReader::kBatchRows;
-                    std::array<T, kGatherRows> gathered;
-                    std::array<bool, kGatherRows> validity;
-                    std::array<size_t, kGatherRows> chunks;
-                    for (size_t i = 0; i < input->size(); i += kGatherRows) {
-                        const auto count =
-                            std::min(kGatherRows, input->size() - i);
-                        FilterDiagnosticTimer read_timer(
-                            profile ? &profile->raw_read_ns : nullptr);
-                        const bool all_valid = offset_reader_->Gather<T>(
-                            op_ctx_,
-                            input->data() + i,
-                            count,
-                            gathered.data(),
-                            validity.data(),
-                            skip_func ? chunks.data() : nullptr);
-                        read_timer.Stop();
+                    auto evaluate_gathered = [&](const T* gathered,
+                                                 const bool* validity,
+                                                 const size_t* chunks,
+                                                 size_t count,
+                                                 size_t i,
+                                                 bool all_valid) {
                         if (profile)
                             profile->raw_read_rows += count;
                         uint64_t skipped = 0;
@@ -1058,9 +1065,8 @@ class SegmentExpr : public Expr {
                             }
                         }
                         const auto valid =
-                            all_valid
-                                ? ValidityView{}
-                                : ValidityView::FromExpanded(validity.data());
+                            all_valid ? ValidityView{}
+                                      : ValidityView::FromExpanded(validity);
                         // Usually no chunk is skipped: one original batch call.
                         // On skips, preserve logical positions and still drive
                         // null-data callbacks so bitmap-input cursors advance.
@@ -1084,7 +1090,7 @@ class SegmentExpr : public Expr {
                             }
                             evaluate_batch
                                 .template operator()<FilterType::random>(
-                                    skip ? nullptr : gathered.data() + first,
+                                    skip ? nullptr : gathered + first,
                                     run_valid,
                                     nullptr,
                                     end - first,
@@ -1093,8 +1099,67 @@ class SegmentExpr : public Expr {
                                     values...);
                             first = end;
                         }
+                    };
+                    if constexpr (std::is_same_v<T, std::string_view>) {
+                        // No per-row snapshot/pin and no owning strings. The
+                        // reader flushes views before an eviction can release
+                        // their backing; only Expr evaluates the predicate.
+                        std::optional<FilterDiagnosticTimer> read_timer;
+                        read_timer.emplace(profile ? &profile->raw_read_ns
+                                                   : nullptr);
+                        offset_view_reader_->VisitViews(
+                            op_ctx_,
+                            input->data(),
+                            input->size(),
+                            [](Chunk* chunk, size_t offset) {
+                                return (
+                                    *static_cast<StringChunk*>(chunk))[offset];
+                            },
+                            [&](const T* views,
+                                const bool* validity,
+                                const size_t* chunks,
+                                size_t count,
+                                size_t first,
+                                bool all_valid) {
+                                read_timer->Stop();
+                                evaluate_gathered(views,
+                                                  validity,
+                                                  chunks,
+                                                  count,
+                                                  first,
+                                                  all_valid);
+                                read_timer.emplace(
+                                    profile ? &profile->raw_read_ns : nullptr);
+                            });
+                    } else {
+                        // Numeric values are copied into bounded scratch;
+                        // their established gather/prefetch path is unchanged.
+                        std::array<T, kGatherRows> gathered;
+                        std::array<bool, kGatherRows> validity;
+                        std::array<size_t, kGatherRows> chunks;
+                        for (size_t i = 0; i < input->size();
+                             i += kGatherRows) {
+                            const auto count =
+                                std::min(kGatherRows, input->size() - i);
+                            FilterDiagnosticTimer read_timer(
+                                profile ? &profile->raw_read_ns : nullptr);
+                            const bool all_valid = offset_reader_->Gather<T>(
+                                op_ctx_,
+                                input->data() + i,
+                                count,
+                                gathered.data(),
+                                validity.data(),
+                                skip_func ? chunks.data() : nullptr);
+                            read_timer.Stop();
+                            evaluate_gathered(gathered.data(),
+                                              validity.data(),
+                                              chunks.data(),
+                                              count,
+                                              i,
+                                              all_valid);
+                        }
+                        offset_reader_->EndBatch();
                     }
-                    offset_reader_->EndBatch();
                     return input->size();
                 }
             }
@@ -3241,6 +3306,7 @@ class SegmentExpr : public Expr {
     // Search strategy stays in the plugin; no fusing/type+operator enable flag.
     bool offset_reader_attempted_{false};
     std::unique_ptr<OffsetColumnReader> offset_reader_;
+    std::unique_ptr<OffsetChunkReader> offset_view_reader_;
     std::shared_ptr<const SkipIndex> offset_reader_skip_index_;
     size_t offset_reader_skip_chunk_{std::numeric_limits<size_t>::max()};
     bool offset_reader_skip_{false};
