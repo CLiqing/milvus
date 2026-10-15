@@ -1032,8 +1032,24 @@ class SegmentExpr : public Expr {
                     }
                 }();
                 if (prepared) {
+                    if (profile)
+                        profile->prepared_raw_rows += input->size();
                     if (skip_func && !offset_reader_skip_index_) {
                         offset_reader_skip_index_ = segment_->GetSkipIndex();
+                        const auto chunks = [&] {
+                            if constexpr (std::is_same_v<T, std::string_view>) {
+                                return offset_view_reader_->source_chunks();
+                            } else {
+                                return offset_reader_->source_chunks();
+                            }
+                        }();
+                        // This Expr and its retained sealed column have one
+                        // immutable chunk layout and constant predicate args.
+                        // Remember its existing skip decision, not row truth.
+                        // Bound metadata independently of pin/cache bytes.
+                        if (chunks <= 65536) {
+                            offset_reader_skip_decisions_.assign(chunks, -1);
+                        }
                     }
                     // Bound scratch space even for large iterative input.
                     // Gather in input order, then reuse the SAME random
@@ -1046,6 +1062,10 @@ class SegmentExpr : public Expr {
                                                  size_t count,
                                                  size_t i,
                                                  bool all_valid) {
+                        FilterDiagnosticTimer kernel_timer(
+                            profile && profile->attribution ? &profile->offset_kernel_ns : nullptr);
+                        if (profile)
+                            ++profile->reader_sub_batches;
                         if (profile)
                             profile->raw_read_rows += count;
                         uint64_t skipped = 0;
@@ -1054,12 +1074,27 @@ class SegmentExpr : public Expr {
                             // Retain its snapshot and last chunk decision across
                             // batches, without acquiring segment state per row.
                             for (size_t j = 0; j < count; ++j) {
+                                if (chunks[j] < offset_reader_skip_decisions_.size()) {
+                                    auto& decision = offset_reader_skip_decisions_[chunks[j]];
+                                    if (decision < 0) {
+                                        decision = skip_func(*offset_reader_skip_index_,
+                                                             field_id_, chunks[j]);
+                                        if (profile) ++profile->skip_checks;
+                                    } else if (profile) {
+                                        ++profile->skip_cache_hits;
+                                    }
+                                    skipped |= uint64_t(decision != 0) << j;
+                                    continue;
+                                }
                                 if (offset_reader_skip_chunk_ != chunks[j]) {
                                     offset_reader_skip_chunk_ = chunks[j];
                                     offset_reader_skip_ =
                                         skip_func(*offset_reader_skip_index_,
                                                   field_id_,
                                                   chunks[j]);
+                                    if (profile) ++profile->skip_checks;
+                                } else if (profile) {
+                                    ++profile->skip_cache_hits;
                                 }
                                 skipped |= uint64_t(offset_reader_skip_) << j;
                             }
@@ -1101,6 +1136,11 @@ class SegmentExpr : public Expr {
                         }
                     };
                     if constexpr (std::is_same_v<T, std::string_view>) {
+                        const auto prior_reads = offset_view_reader_->reads();
+                        const auto prior_pins = offset_view_reader_->misses();
+                        const auto prior_evictions = offset_view_reader_->evictions();
+                        const auto prior_oversized = offset_view_reader_->oversized_pins();
+                        const auto prior_bulk_pins = offset_view_reader_->bulk_pin_calls();
                         // No per-row snapshot/pin and no owning strings. The
                         // reader flushes views before an eviction can release
                         // their backing; only Expr evaluates the predicate.
@@ -1131,6 +1171,18 @@ class SegmentExpr : public Expr {
                                 read_timer.emplace(
                                     profile ? &profile->raw_read_ns : nullptr);
                             });
+                        if (profile) {
+                            const auto pins = offset_view_reader_->misses() - prior_pins;
+                            profile->reader_pins += pins;
+                            profile->reader_hits += offset_view_reader_->reads() - prior_reads - pins;
+                            profile->reader_evictions += offset_view_reader_->evictions() - prior_evictions;
+                            profile->reader_oversized_pins += offset_view_reader_->oversized_pins() - prior_oversized;
+                            profile->reader_max_cell_bytes = std::max<uint64_t>(profile->reader_max_cell_bytes, offset_view_reader_->max_cell_bytes());
+                            profile->reader_peak_retained_bytes = std::max<uint64_t>(profile->reader_peak_retained_bytes, offset_view_reader_->peak_bytes());
+                            profile->reader_source_chunks = offset_view_reader_->source_chunks();
+                            profile->reader_bulk_pin_calls += offset_view_reader_->bulk_pin_calls() - prior_bulk_pins;
+                            profile->reader_peak_batch_bytes = offset_view_reader_->peak_batch_bytes();
+                        }
                     } else {
                         // Numeric values are copied into bounded scratch;
                         // their established gather/prefetch path is unchanged.
@@ -1165,6 +1217,8 @@ class SegmentExpr : public Expr {
             }
         }
 
+        if (profile)
+            profile->fallback_raw_rows += input->size();
         auto skip_index = segment_->GetSkipIndex();
 
         // Read arbitrary offsets from non-owning view columns. Input order is
@@ -2070,8 +2124,13 @@ class SegmentExpr : public Expr {
                     segment_offsets_array[j] = static_cast<int32_t>(offset);
                 }
             }
+            auto* attribution = active_filter_diagnostics;
+            if (attribution && !attribution->attribution) attribution = nullptr;
+            FilterDiagnosticTimer skip_timer(attribution ? &attribution->sequential_skip_ns : nullptr);
             auto skip_index = segment_->GetSkipIndex();
-            if (!skip_func || !skip_func(*skip_index, field_id_, i)) {
+            const bool skipped = skip_func && skip_func(*skip_index, field_id_, i);
+            skip_timer.Stop();
+            if (!skipped) {
                 if constexpr (std::is_same_v<T, std::string_view> ||
                               std::is_same_v<T, Json> ||
                               std::is_same_v<T, ArrayView> ||
@@ -2079,9 +2138,16 @@ class SegmentExpr : public Expr {
                               std::is_same_v<T, VectorArrayView>) {
                     // Chunked segments expose non-owning types through view
                     // APIs; chunk_data<T> is only valid for owning types.
+                    FilterDiagnosticTimer views_timer(attribution ? &attribution->sequential_views_ns : nullptr);
                     auto pw = segment_->get_batch_views<T>(
                         op_ctx_, field_id_, i, data_pos, size);
                     const auto& [data_vec, valid_data] = pw.get();
+                    views_timer.Stop();
+                    FilterDiagnosticTimer kernel_timer(attribution ? &attribution->sequential_kernel_ns : nullptr);
+                    if (attribution) {
+                        ++attribution->sequential_batches;
+                        attribution->sequential_rows += size;
+                    }
 
                     if constexpr (NeedSegmentOffsets) {
                         func(data_vec.data(),
@@ -2101,6 +2167,9 @@ class SegmentExpr : public Expr {
                              valid_res + processed_size,
                              values...);
                     }
+                    kernel_timer.Stop();
+                    FilterDiagnosticTimer owners_timer(attribution ? &attribution->sequential_owners_ns : nullptr);
+                    pw = decltype(pw){};
                 } else {
                     auto pw = segment_->chunk_data<T>(op_ctx_, field_id_, i);
                     auto chunk = pw.get();
@@ -3310,6 +3379,7 @@ class SegmentExpr : public Expr {
     std::shared_ptr<const SkipIndex> offset_reader_skip_index_;
     size_t offset_reader_skip_chunk_{std::numeric_limits<size_t>::max()};
     bool offset_reader_skip_{false};
+    std::vector<int8_t> offset_reader_skip_decisions_;
     mutable std::once_flag determine_exec_path_once_;
     // Flag set by SetExecuteAllAtOnce() to enable move-based fast paths,
     // avoiding bitmap copies in ProcessIndexChunks/SliceCachedResult.

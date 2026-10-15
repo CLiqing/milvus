@@ -27,6 +27,9 @@ namespace milvus::segcore::storagev1translator {
 
 struct CTMeta : public milvus::cachinglayer::Meta {
     std::vector<int64_t> num_rows_until_chunk_;
+    // Immutable backing estimates; do not inspect concurrently changing
+    // cache-cell usage to plan a bounded offset pin batch.
+    std::vector<int64_t> offset_backing_sizes_;
     // virtual chunk is used to speed up the offset->cid translation
     // all virtual chunks have the same number of rows
     std::vector<int64_t>

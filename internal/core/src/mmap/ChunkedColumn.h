@@ -396,6 +396,32 @@ class ChunkedColumnBase : public ChunkedColumnInterface {
         return {std::move(owner), bytes};
     }
 
+    size_t
+    OffsetChunkByteSize(int64_t chunk_id) const override {
+        const auto* meta = static_cast<segcore::storagev1translator::CTMeta*>(slot_->meta());
+        if (chunk_id >= 0 && static_cast<size_t>(chunk_id) < meta->offset_backing_sizes_.size() &&
+            meta->offset_backing_sizes_[chunk_id] > 0) {
+            return meta->offset_backing_sizes_[chunk_id];
+        }
+        return std::numeric_limits<size_t>::max();
+    }
+
+    std::pair<PinWrapper<std::vector<Chunk*>>, size_t>
+    PinOffsetChunks(milvus::OpContext* op_ctx,
+                    const std::vector<int64_t>& chunk_ids) const override {
+        // This API is synchronous already; use the existing synchronous pin
+        // entry instead of allocating and immediately waiting on a future.
+        auto owner = slot_->PinCellsDirect(op_ctx, chunk_ids);
+        std::vector<Chunk*> chunks;
+        size_t bytes = 0;
+        for (auto id : chunk_ids) {
+            auto* chunk = owner->get_cell_of(id);
+            chunks.push_back(chunk);
+            bytes += chunk->Size();
+        }
+        return {PinWrapper<std::vector<Chunk*>>(std::move(owner), std::move(chunks)), bytes};
+    }
+
     std::vector<PinWrapper<Chunk*>>
     GetAllChunks(milvus::OpContext* op_ctx) const override {
         auto ca = SemiInlineGet(slot_->PinAllCells(op_ctx));

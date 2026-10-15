@@ -38,6 +38,8 @@ OffsetExpressionCallback::OffsetExpressionCallback(
         params.value("debug_ann_fusing_trace_offsets", false);
     debug_profile_ = params.contains("debug_ann_fusing_profile") &&
                      params.value("debug_ann_fusing_profile", false);
+    debug_attribution_ = params.contains("debug_ann_fusing_attribution") &&
+                         params.value("debug_ann_fusing_attribution", false);
     if (debug_profile_) {
         auto* query = exec_context->get_query_context();
         segment_id_ = query->get_segment()->get_segment_id();
@@ -83,6 +85,7 @@ OffsetExpressionCallback::CreateWorker(const void* context,
         auto profile = factory.debug_profile_
                            ? std::make_unique<FilterDiagnostics>()
                            : nullptr;
+        if (profile) profile->attribution = factory.debug_attribution_;
         FilterDiagnosticTimer prepare(profile ? &profile->prepare_ns : nullptr);
         auto workspace = factory.prepared_.CreateWorkspace();
         if (!workspace->SupportsOffsetInput()) {
@@ -112,6 +115,10 @@ OffsetExpressionCallback::DestroyWorker(void* worker) noexcept {
         // is deliberately INFO so it needs no process-wide debug log change.
         try {
             const auto& p = *state->profile;
+            if (p.attribution) {
+                LOG_INFO("ann_fusing profile phase=attribution role=callback segment={} timestamp={} {}",
+                         state->segment_id, state->query_timestamp, p.AttributionString());
+            }
             std::ostringstream sizes;
             for (size_t i = 0; i < p.batch_sizes.size(); ++i) {
                 if (p.batch_sizes[i])
@@ -125,7 +132,13 @@ OffsetExpressionCallback::DestroyWorker(void* worker) noexcept {
                 "index_path_rows={} raw_path_us={} index_path_us={} "
                 "raw_read_rows={} index_read_rows={} raw_read_us={} "
                 "index_read_us={} string_row_values={} "
-                "string_index_values={} batch_sizes=[{}]",
+                "string_index_values={} prepared_raw_rows={} fallback_raw_rows={} "
+                "reader_hits={} reader_pins={} reader_evictions={} "
+                "reader_oversized_pins={} reader_sub_batches={} "
+                "reader_max_cell_bytes={} reader_peak_retained_bytes={} "
+                "reader_source_chunks={} reader_bulk_pin_calls={} "
+                "reader_peak_batch_bytes={} skip_checks={} "
+                "skip_cache_hits={} batch_sizes=[{}]",
                 state->segment_id,
                 state->query_timestamp,
                 worker,
@@ -146,6 +159,20 @@ OffsetExpressionCallback::DestroyWorker(void* worker) noexcept {
                 p.index_read_ns / 1000.0,
                 p.string_row_values,
                 p.string_index_values,
+                p.prepared_raw_rows,
+                p.fallback_raw_rows,
+                p.reader_hits,
+                p.reader_pins,
+                p.reader_evictions,
+                p.reader_oversized_pins,
+                p.reader_sub_batches,
+                p.reader_max_cell_bytes,
+                p.reader_peak_retained_bytes,
+                p.reader_source_chunks,
+                p.reader_bulk_pin_calls,
+                p.reader_peak_batch_bytes,
+                p.skip_checks,
+                p.skip_cache_hits,
                 sizes.str());
         } catch (...) {
             // Telemetry must not turn worker destruction into a query failure.
@@ -218,7 +245,7 @@ OffsetExpressionCallback::EvalBatch(void* worker,
                                 ? row_ids[lane]
                                 : -1);
             }
-            LOG_DEBUG(
+            LOG_INFO(
                 "ann_fusing offset_trace worker={} count={} active={} "
                 "accepted={} ids=[{}]",
                 worker,

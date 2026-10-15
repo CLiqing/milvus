@@ -77,6 +77,16 @@ class ChunkedColumnGroup {
         return num_chunks_;
     }
 
+    size_t
+    OffsetChunkByteSize(int64_t chunk_id) const {
+        const auto* meta = static_cast<segcore::storagev2translator::GroupCTMeta*>(slot_->meta());
+        if (chunk_id >= 0 && static_cast<size_t>(chunk_id) < meta->chunk_memory_size_.size() &&
+            meta->chunk_memory_size_[chunk_id] > 0) {
+            return meta->chunk_memory_size_[chunk_id];
+        }
+        return std::numeric_limits<size_t>::max();
+    }
+
     PinWrapper<GroupChunk*>
     GetGroupChunk(milvus::OpContext* op_ctx, int64_t chunk_id) const {
         AssertInfo(
@@ -97,7 +107,9 @@ class ChunkedColumnGroup {
                            std::to_string(chunk_id) +
                            ", num_chunks: " + std::to_string(num_chunks_));
         }
-        return SemiInlineGet(slot_->PinCells(op_ctx, chunk_ids));
+        // Same loading timeout, cancellation and ownership as PinCells, but
+        // this shared bulk accessor never exposes asynchronous work.
+        return slot_->PinCellsDirect(op_ctx, chunk_ids);
     }
 
     bool
@@ -542,6 +554,25 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
         const auto bytes = owner.get()->Size();
         auto chunk = owner.get()->GetChunk(field_id_);
         return {PinWrapper<Chunk*>(std::move(owner), chunk.get()), bytes};
+    }
+
+    size_t
+    OffsetChunkByteSize(int64_t chunk_id) const override {
+        return group_->OffsetChunkByteSize(chunk_id);
+    }
+
+    std::pair<PinWrapper<std::vector<Chunk*>>, size_t>
+    PinOffsetChunks(milvus::OpContext* op_ctx,
+                    const std::vector<int64_t>& chunk_ids) const override {
+        auto owner = group_->GetGroupChunks(op_ctx, chunk_ids);
+        std::vector<Chunk*> chunks;
+        size_t bytes = 0;
+        for (auto id : chunk_ids) {
+            auto* group = owner->get_cell_of(id);
+            chunks.push_back(group->GetChunkRaw(field_id_));
+            bytes += group->Size();
+        }
+        return {PinWrapper<std::vector<Chunk*>>(std::move(owner), std::move(chunks)), bytes};
     }
 
     std::pair<size_t, size_t>

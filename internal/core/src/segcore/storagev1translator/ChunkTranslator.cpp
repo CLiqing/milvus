@@ -106,6 +106,7 @@ ChunkTranslator::ChunkTranslator(
                "ChunkTranslator not supported for system field");
     meta_.num_rows_until_chunk_.push_back(0);
     for (const auto& info : file_infos_) {
+        meta_.offset_backing_sizes_.push_back(info.memory_size);
         meta_.num_rows_until_chunk_.push_back(
             meta_.num_rows_until_chunk_.back() + info.row_count);
     }

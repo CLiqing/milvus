@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <limits>
 #include <vector>
 
 #include "cachinglayer/CacheSlot.h"
@@ -115,6 +116,30 @@ class ChunkedColumnInterface {
     virtual std::pair<PinWrapper<Chunk*>, size_t>
     PinOffsetChunk(milvus::OpContext* op_ctx, int64_t chunk_id) const {
         return {GetChunk(op_ctx, chunk_id), DataByteSize()};
+    }
+
+    // Conservative backing charge without loading. Used only to bound a
+    // temporary batch pin; unknown sources fall back to one cell at a time.
+    virtual size_t
+    OffsetChunkByteSize(int64_t chunk_id) const {
+        return std::numeric_limits<size_t>::max();
+    }
+
+    // One owner for the WHOLE requested cohort. Retaining any pointer retains
+    // every cell in this owner: caches must charge the aggregate, not one field
+    // or one cell. Pointers remain ordered like chunk_ids, never row offsets.
+    virtual std::pair<PinWrapper<std::vector<Chunk*>>, size_t>
+    PinOffsetChunks(milvus::OpContext* op_ctx,
+                    const std::vector<int64_t>& chunk_ids) const {
+        std::vector<std::pair<PinWrapper<Chunk*>, size_t>> owners;
+        std::vector<Chunk*> chunks;
+        size_t bytes = 0;
+        for (auto id : chunk_ids) {
+            owners.push_back(PinOffsetChunk(op_ctx, id));
+            chunks.push_back(owners.back().first.get());
+            bytes += owners.back().second;
+        }
+        return {PinWrapper<std::vector<Chunk*>>(std::move(owners), std::move(chunks)), bytes};
     }
 
     virtual void

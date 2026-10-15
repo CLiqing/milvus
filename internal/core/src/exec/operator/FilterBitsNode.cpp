@@ -101,6 +101,7 @@ PhyFilterBitsNode::PhyFilterBitsNode(
         if (diagnostic_params.contains("debug_ann_fusing_profile") &&
             diagnostic_params.value("debug_ann_fusing_profile", false)) {
             profile_ = std::make_unique<FilterDiagnostics>();
+            profile_->attribution = diagnostic_params.value("debug_ann_fusing_attribution", false);
             profile_segment_id_ = query_context_->get_segment()->get_segment_id();
             profile_timestamp_ = query_context_->get_query_timestamp();
         }
@@ -205,6 +206,10 @@ PhyFilterBitsNode::~PhyFilterBitsNode() {
     if (profile_) {
         try {
             const auto& p = *profile_;
+            if (p.attribution) {
+                LOG_INFO("ann_fusing profile phase=attribution role=baseline segment={} timestamp={} {}",
+                         profile_segment_id_, profile_timestamp_, p.AttributionString());
+            }
             LOG_INFO(
                 "ann_fusing profile phase=filter segment={} timestamp={} "
                 "skipped={} cache_hit={} completed={} errors={} rows={} "
