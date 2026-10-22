@@ -328,7 +328,7 @@ void
 VectorMemIndex<T>::LoadWithoutAssemble(const BinarySet& binary_set,
                                        const Config& config) {
     const auto restored_id_map =
-        RestoreIdMapFromBinarySet(binary_set, index_.GetIdMap());
+        RestoreIdMapFromBinarySet(binary_set, index_.Node()->GetIdMap());
     auto empty_emb_list_state =
         LoadEmptyEmbListOffsetsFromBinarySet(binary_set);
     if (empty_emb_list_state.has_value()) {
@@ -502,8 +502,8 @@ VectorMemIndex<T>::BuildWithDataset(const DatasetPtr& dataset,
     index_config.update(config);
 
     if (dataset != nullptr && dataset->HasIdMapData() &&
-        !index_.GetIdMap().IsEnabled()) {
-        index_.GetIdMap().SetType(knowhere::IdMap::Type::SEALED);
+        !index_.Node()->GetIdMap().IsEnabled()) {
+        index_.Node()->GetIdMap().SetType(knowhere::IdMap::Type::SEALED);
     }
     SetDim(dataset->GetDim());
     const auto id_map_only_build =
@@ -1185,7 +1185,7 @@ VectorMemIndex<T>::LoadFromFile(const Config& config) {
         AssertInfo(valid_data_count_codec && valid_data_codec,
                    "nullable vector index valid_data files are incomplete");
         return RestoreIdMapFromValidDataPayload(
-            index_.GetIdMap(),
+            index_.Node()->GetIdMap(),
             valid_data_count_codec->PayloadData(),
             valid_data_count_codec->PayloadSize(),
             valid_data_codec->PayloadData(),

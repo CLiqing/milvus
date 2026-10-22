@@ -121,17 +121,17 @@ class VectorDiskAnnIndex : public VectorIndex {
 
     knowhere::IdMap&
     GetIdMap() override {
-        return index_.GetIdMap();
+        return index_.Node()->GetIdMap();
     }
 
     const knowhere::IdMap&
     GetIdMap() const override {
-        return index_.GetIdMap();
+        return index_.Node()->GetIdMap();
     }
 
     void
     SetIdMapType(knowhere::IdMap::Type type) override {
-        index_.SetIdMapType(type);
+        index_.Node()->SetIdMapType(type);
     }
 
  private:

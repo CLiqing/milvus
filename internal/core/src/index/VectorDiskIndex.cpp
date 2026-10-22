@@ -365,7 +365,7 @@ VectorDiskAnnIndex<T>::Load(milvus::tracer::TraceContext ctx,
     auto disk_valid_data =
         ReadDiskValidData(local_chunk_manager, valid_data_path);
     const auto restored_id_map =
-        RestoreIdMapFromValidData(index_.GetIdMap(),
+        RestoreIdMapFromValidData(index_.Node()->GetIdMap(),
                                   disk_valid_data.View(),
                                   &load_config,
                                   local_index_path_prefix);
@@ -468,7 +468,7 @@ VectorDiskAnnIndex<T>::Build(const Config& config) {
         ReadDiskValidData(local_chunk_manager, valid_data_path);
     auto dim = GetValueFromConfig<int64_t>(build_config, DIM_KEY);
     auto id_map_dataset =
-        GenIdMapDatasetFromValidData(index_.GetIdMap(),
+        GenIdMapDatasetFromValidData(index_.Node()->GetIdMap(),
                                      static_cast<int64_t>(raw_data_rows),
                                      dim.value_or(0),
                                      disk_valid_data.View(),
@@ -616,11 +616,11 @@ VectorDiskAnnIndex<T>::BuildWithDataset(const DatasetPtr& dataset,
     build_config[DISK_ANN_PREFIX_PATH] = local_index_path_prefix;
 
     if (dataset != nullptr && dataset->HasIdMapData() &&
-        !index_.GetIdMap().IsEnabled()) {
-        index_.GetIdMap().SetType(knowhere::IdMap::Type::SEALED);
+        !index_.Node()->GetIdMap().IsEnabled()) {
+        index_.Node()->GetIdMap().SetType(knowhere::IdMap::Type::SEALED);
     }
     ConfigureIdMapMmapForDataset(
-        index_.GetIdMap(), dataset, build_config, local_index_path_prefix);
+        index_.Node()->GetIdMap(), dataset, build_config, local_index_path_prefix);
     const auto id_map_only_build =
         GetIdMapOnlyBuildPlan(dataset, is_embedding_list);
     if (id_map_only_build.enabled) {
