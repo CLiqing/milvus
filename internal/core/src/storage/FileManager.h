@@ -207,7 +207,10 @@ class FileManagerImpl : public milvus::FileManager {
      * remote object path.
      */
     std::shared_ptr<OutputStream>
-    OpenOutputStream(const std::string& local_full_file_path) override final {
+    OpenOutputStream(const std::string& local_full_file_path,
+                     milvus::OutputStreamOptions /*options*/ = {}) override final {
+        // This manager streams directly to its backing storage; staging and
+        // reservation hints do not change the existing index-object route.
         return OpenOutputStream(local_full_file_path, /*is_index_file=*/true);
     }
 
