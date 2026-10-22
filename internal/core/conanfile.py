@@ -10,6 +10,7 @@ import os
 class MilvusConan(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
     requires = (
+        "metis/5.2.1#85cfe7ee0dfc0cba7c0334e92efcbbc6",
         "rocksdb/6.29.5@milvus/dev#67b8ae76ad7be5f779082f67416f89bf",
         "onetbb/2021.9.0#f9d7a3aa294ac4a594a93f9b4c7f272d",
         "zstd/1.5.5#70dc5eb8ea16708fc946fbac884c507e",
@@ -29,7 +30,7 @@ class MilvusConan(ConanFile):
         "prometheus-cpp/1.2.4#0918d66c13f97acb7809759f9de49b3f",
         "re2/20230301#f8efaf45f98d0193cd0b2ea08b6b4060",
         "folly/2026.04.20.00@milvus/dev#06852bea5b6449f0c4eb0df002b5779c",
-        "milvus-common/1.0.0-45fca32@milvus/dev#ac7e38699c9dcc9a83d5be95e8227900",
+        "milvus-common/1.0.0-78f2c29@milvus/dev#af77e5f5444d6dd7cc5573182b958491",
         "google-cloud-cpp/2.28.0@milvus/dev#468918b43cec43624531a0340398cf43",
         "opentelemetry-cpp/1.23.0@milvus/dev#11bc565ec6e82910ae8f7471da756720",
         "librdkafka/2.6.1@milvus/dev#a15d9fefad917290d59fa3fcbc144888",
@@ -44,6 +45,7 @@ class MilvusConan(ConanFile):
     )
 
     default_options = {
+        "metis/*:with_64bit_types": True,
         # SDK initialization must reach the same CRT state in every shared
         # library and executable. Static AWS archives create private copies.
         "aws-sdk-cpp/*:shared": True,
