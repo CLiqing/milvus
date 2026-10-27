@@ -22,6 +22,7 @@
 #include <unordered_set>
 
 #include "ChunkedSegmentSealedImpl.h"
+#include "CardinalStageTrace.h"
 #include "NamedType/named_type_impl.hpp"
 #include "Utils.h"
 #include "bitset/bitset.h"
@@ -50,6 +51,103 @@
 #include "segcore/ConcurrentVector.h"
 
 namespace milvus::segcore {
+
+namespace {
+
+void
+EmitIncompleteCardinalStageTrace(int64_t segment_id,
+                                const std::string& tag,
+                                const char* reason) noexcept {
+    try {
+        LOG_INFO("CARDINAL_EXACT_STAGE_TRACE {}",
+                 IncompleteCardinalStageTrace(segment_id, tag, reason).dump());
+    } catch (...) {
+        // A missing completion manifest is itself an invalid capture; logging
+        // failure must not replace the already completed ordinary result.
+    }
+}
+
+// This is outside the measured search path and only runs for explicit
+// trace_visit diagnostics. Failure invalidates the trace, not the ordinary
+// search result or its original error classification.
+void
+EmitCardinalStageTrace(const SegmentInternalInterface* segment,
+                      const query::Plan* plan,
+                      const SearchResult& result,
+                      const folly::CancellationToken& cancel_token) noexcept {
+    std::string tag;
+    try {
+        const auto envelope =
+            nlohmann::json::parse(result.cardinal_stage_trace_json_);
+        tag = envelope.at("cardinal_stage_trace")
+                  .value("request_tag", std::string{});
+        if (result.read_snapshot_ == nullptr || plan == nullptr ||
+            plan->schema_ == nullptr) {
+            EmitIncompleteCardinalStageTrace(
+                segment->get_segment_id(), tag, "missing_pinned_snapshot");
+            return;
+        }
+        const auto pk_field = plan->schema_->get_primary_field_id();
+        if (!pk_field.has_value() ||
+            plan->schema_->operator[](pk_field.value()).get_data_type() !=
+                DataType::INT64) {
+            EmitIncompleteCardinalStageTrace(segment->get_segment_id(),
+                                            tag,
+                                            "unsupported_primary_key_type");
+            return;
+        }
+        const auto field_id = plan->plan_node_->search_info_.field_id_.get();
+        auto records = BuildCardinalStageTraceRecords(
+            result.cardinal_stage_trace_json_,
+            segment->get_segment_id(),
+            field_id,
+            [&](const std::vector<int64_t>& offsets) {
+                if (offsets.empty()) {
+                    return std::vector<int64_t>{};
+                }
+                for (const auto offset : offsets) {
+                    if (offset < 0 || offset >= segment->get_row_count()) {
+                        throw std::invalid_argument(
+                            "captured offset is outside segment");
+                    }
+                }
+                milvus::OpContext diagnostic_context(cancel_token);
+                const auto& meta =
+                    plan->schema_->operator[](pk_field.value());
+                auto data = BulkSubscriptWithSnapshot(segment,
+                                                     result.read_snapshot_,
+                                                     &diagnostic_context,
+                                                     pk_field.value(),
+                                                     meta,
+                                                     offsets.data(),
+                                                     offsets.size());
+                if (static_cast<DataType>(data->type()) != DataType::INT64) {
+                    throw std::invalid_argument(
+                        "captured primary key column has wrong type");
+                }
+                const auto& pks = data->scalars().long_data().data();
+                if (static_cast<size_t>(pks.size()) != offsets.size()) {
+                    throw std::invalid_argument(
+                        "captured primary key count mismatch");
+                }
+                return std::vector<int64_t>(pks.begin(), pks.end());
+            });
+        for (const auto& record : records) {
+            LOG_INFO("CARDINAL_EXACT_STAGE_TRACE {}", record.dump());
+        }
+    } catch (const std::exception&) {
+        // Do not log exception text: a storage exception may contain object
+        // paths. The fixed reason makes the diagnostic unusable for recall.
+        EmitIncompleteCardinalStageTrace(segment->get_segment_id(),
+                                        tag,
+                                        "trace_mapping_or_validation_failed");
+    } catch (...) {
+        EmitIncompleteCardinalStageTrace(
+            segment->get_segment_id(), tag, "trace_capture_failed");
+    }
+}
+
+}  // namespace
 
 std::shared_ptr<milvus::exec::SimpleGeometryCache>
 SegmentInternalInterface::GetGeometryCache(FieldId field_id) const {
@@ -172,6 +270,12 @@ SegmentInternalInterface::Search(
     auto results = std::make_unique<SearchResult>();
     *results = visitor.get_moved_result(*plan->plan_node_);
     results->segment_ = (void*)this;
+    if (!results->cardinal_stage_trace_json_.empty()) {
+        // The snapshot pins the searched state; mapping must not recursively
+        // acquire this segment mutex through a result-fill helper.
+        lck.unlock();
+        EmitCardinalStageTrace(this, plan, *results, cancel_token);
+    }
     return results;
 }
 

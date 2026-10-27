@@ -333,6 +333,10 @@ struct SearchResult {
     int64_t total_data_cnt_{0};
     void* segment_{nullptr};
 
+    // Optional diagnostic metadata from Cardinal's original pre/post-refine
+    // search path. It is not part of normal returned IDs or persisted indexes.
+    std::string cardinal_stage_trace_json_;
+
     // Sealed search requests keep publication blocked until the result is
     // deleted. Growing search results leave this empty.
     std::shared_ptr<segcore::SegmentReadLease> read_lease_;

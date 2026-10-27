@@ -41,6 +41,7 @@
 #include "fmt/core.h"
 #include "glog/logging.h"
 #include "index/Meta.h"
+#include "index/CardinalStageTraceMetadata.h"
 #include "index/Utils.h"
 #include "index/VectorIndexValidDataUtils.h"
 #include "knowhere/binaryset.h"
@@ -726,12 +727,15 @@ VectorDiskAnnIndex<T>::Query(const DatasetPtr dataset,
                              const BitsetView& bitset,
                              milvus::OpContext* op_context,
                              SearchResult& search_result) const {
+    search_result.cardinal_stage_trace_json_.clear();
     AssertInfo(GetMetricType() == search_info.metric_type_,
                "Metric type of field index isn't the same with search info");
     auto num_rows = dataset->GetRows();
     auto topk = search_info.topk_;
 
     knowhere::Json search_config = PrepareSearchParams(search_info);
+    const auto stage_trace_request =
+        TakeCardinalStageTraceRequest(search_config);
 
     const auto& id_map = GetIdMap();
     if (IsAllNullNullable(id_map) || IsEmptyEmbListIndex()) {
@@ -801,6 +805,8 @@ VectorDiskAnnIndex<T>::Query(const DatasetPtr dataset,
         }
     }();
 
+    PreserveCardinalStageTrace(
+        final, stage_trace_request, search_result.cardinal_stage_trace_json_);
     auto ids = final->GetIds();
     // In embedding list query, final->GetRows() can be different from dataset->GetRows().
     auto num_queries = final->GetRows();

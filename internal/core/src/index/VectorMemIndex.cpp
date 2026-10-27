@@ -53,6 +53,7 @@
 #include "common/Types.h"
 #include "common/Utils.h"
 #include "common/VectorArray.h"
+#include "index/CardinalStageTraceMetadata.h"
 #include "common/VectorTrait.h"
 #include "common/protobuf_utils.h"
 #include "glog/logging.h"
@@ -762,11 +763,14 @@ VectorMemIndex<T>::Query(const DatasetPtr dataset,
                          const BitsetView& bitset,
                          milvus::OpContext* op_context,
                          SearchResult& search_result) const {
+    search_result.cardinal_stage_trace_json_.clear();
     //    AssertInfo(GetMetricType() == search_info.metric_type_,
     //               "Metric type of field index isn't the same with search info");
 
     auto num_vectors = dataset->GetRows();
     knowhere::Json search_conf = PrepareSearchParams(search_info);
+    const auto stage_trace_request =
+        TakeCardinalStageTraceRequest(search_conf);
     auto topk = search_info.topk_;
     const auto& id_map = GetIdMap();
     if (IsAllNullNullable(id_map) || IsEmptyEmbListIndex()) {
@@ -829,6 +833,8 @@ VectorMemIndex<T>::Query(const DatasetPtr dataset,
         }
     }();
 
+    PreserveCardinalStageTrace(
+        final, stage_trace_request, search_result.cardinal_stage_trace_json_);
     auto ids = final->GetIds();
     // In embedding list query, final->GetRows() can be different from dataset->GetRows().
     auto num_queries = final->GetRows();
