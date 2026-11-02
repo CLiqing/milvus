@@ -135,7 +135,7 @@ class MilvusConan(ConanFile):
         self.requires("libcurl/8.10.1#a3113369c86086b0e84231844e7ed0a9", force=True)
         self.requires("nlohmann_json/3.11.3#ffb9e9236619f1c883e36662f944345d", force=True)
         self.requires("abseil/20250127.0#481edcc75deb0efb16500f511f0f0a1c", force=True)
-        self.requires("fmt/12.1.0", force=True)
+        self.requires("fmt/11.2.0#eb98daa559c7c59d591f4720dde4cd5c", force=True)
         # libbson only (BSON C library) for JSON stats — NOT the full mongo-c-driver.
         # Drops libmongoc/mongocxx/utf8proc; see src/common/bson_shim.h.
         self.requires("libbson/1.30.6@milvus/dev#4fc4c269cbda1b46c3118fa396cdc690")
