@@ -39,6 +39,9 @@
 #include "exec/expression/LogicalBinaryExpr.h"
 #include "exec/expression/LogicalUnaryExpr.h"
 #include "exec/expression/MatchExpr.h"
+#include "exec/AnnFusingPolicy.h"
+#include "index/IndexTypeAdapter.h"
+#include <cctype>
 #include "exec/expression/MembershipFilterExpr.h"
 #include "exec/expression/NullExpr.h"
 #include "exec/expression/RawExprCacheAdapter.h"
@@ -259,6 +262,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
                   const std::unordered_set<std::string>& flatten_candidates,
                   bool enable_constant_folding) {
     ExprPtr result;
+    auto expr_type = proto::plan::Expr::EXPR_NOT_SET;
     auto compiled_inputs = CompileInputs(expr, context, flatten_candidates);
 
     auto GetTypes = [](const std::vector<ExprPtr>& exprs) {
@@ -274,6 +278,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
     const auto& plan_options = context->get_plan_options();
 
     if (auto call = std::dynamic_pointer_cast<const expr::CallExpr>(expr)) {
+        expr_type = proto::plan::Expr::kCallExpr;
         result = std::make_shared<PhyCallExpr>(
             std::move(compiled_inputs),
             call,
@@ -284,6 +289,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
             context->query_config()->get_expr_batch_size());
     } else if (auto casted_expr = std::dynamic_pointer_cast<
                    const milvus::expr::UnaryRangeFilterExpr>(expr)) {
+        expr_type = proto::plan::Expr::kUnaryRangeExpr;
         result = std::make_shared<PhyUnaryRangeFilterExpr>(
             std::move(compiled_inputs),
             casted_expr,
@@ -297,6 +303,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
             context->get_enable_sub_expr_cache_write());
     } else if (auto casted_expr = std::dynamic_pointer_cast<
                    const milvus::expr::LogicalUnaryExpr>(expr)) {
+        expr_type = proto::plan::Expr::kUnaryExpr;
         result =
             std::make_shared<PhyLogicalUnaryExpr>(std::move(compiled_inputs),
                                                   casted_expr,
@@ -304,6 +311,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
                                                   op_ctx);
     } else if (auto casted_expr = std::dynamic_pointer_cast<
                    const milvus::expr::TermFilterExpr>(expr)) {
+        expr_type = proto::plan::Expr::kTermExpr;
         result = std::make_shared<PhyTermFilterExpr>(
             std::move(compiled_inputs),
             casted_expr,
@@ -317,6 +325,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
             plan_options);
     } else if (auto casted_expr = std::dynamic_pointer_cast<
                    const milvus::expr::LogicalBinaryExpr>(expr)) {
+        expr_type = proto::plan::Expr::kBinaryExpr;
         if (casted_expr->op_type_ ==
                 milvus::expr::LogicalBinaryExpr::OpType::And ||
             casted_expr->op_type_ ==
@@ -335,6 +344,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
         }
     } else if (auto casted_expr = std::dynamic_pointer_cast<
                    const milvus::expr::BinaryRangeFilterExpr>(expr)) {
+        expr_type = proto::plan::Expr::kBinaryRangeExpr;
         result = std::make_shared<PhyBinaryRangeFilterExpr>(
             std::move(compiled_inputs),
             casted_expr,
@@ -347,6 +357,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
             plan_options);
     } else if (auto casted_expr = std::dynamic_pointer_cast<
                    const milvus::expr::AlwaysTrueExpr>(expr)) {
+        expr_type = proto::plan::Expr::kAlwaysTrueExpr;
         result = std::make_shared<PhyAlwaysTrueExpr>(
             std::move(compiled_inputs),
             casted_expr,
@@ -357,6 +368,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
             context->query_config()->get_expr_batch_size());
     } else if (auto casted_expr = std::dynamic_pointer_cast<
                    const milvus::expr::BinaryArithOpEvalRangeExpr>(expr)) {
+        expr_type = proto::plan::Expr::kBinaryArithOpEvalRangeExpr;
         result = std::make_shared<PhyBinaryArithOpEvalRangeExpr>(
             std::move(compiled_inputs),
             casted_expr,
@@ -368,6 +380,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
             context->get_consistency_level());
     } else if (auto casted_expr = std::dynamic_pointer_cast<
                    const milvus::expr::TimestamptzArithCompareExpr>(expr)) {
+        expr_type = proto::plan::Expr::kTimestamptzArithCompareExpr;
         result = std::make_shared<PhyTimestamptzArithCompareExpr>(
             std::move(compiled_inputs),
             casted_expr,
@@ -380,6 +393,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
     } else if (auto casted_expr =
                    std::dynamic_pointer_cast<const milvus::expr::CompareExpr>(
                        expr)) {
+        expr_type = proto::plan::Expr::kCompareExpr;
         result = std::make_shared<PhyCompareFilterExpr>(
             std::move(compiled_inputs),
             casted_expr,
@@ -391,6 +405,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
     } else if (auto casted_expr =
                    std::dynamic_pointer_cast<const milvus::expr::ExistsExpr>(
                        expr)) {
+        expr_type = proto::plan::Expr::kExistsExpr;
         result = std::make_shared<PhyExistsFilterExpr>(
             std::move(compiled_inputs),
             casted_expr,
@@ -403,6 +418,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
             plan_options);
     } else if (auto casted_expr = std::dynamic_pointer_cast<
                    const milvus::expr::JsonContainsExpr>(expr)) {
+        expr_type = proto::plan::Expr::kJsonContainsExpr;
         result = std::make_shared<PhyJsonContainsFilterExpr>(
             std::move(compiled_inputs),
             casted_expr,
@@ -417,6 +433,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
                    std::dynamic_pointer_cast<const milvus::expr::ValueExpr>(
                        expr)) {
         // used for function call arguments, may emit any type
+        expr_type = proto::plan::Expr::kValueExpr;
         result = std::make_shared<PhyValueExpr>(
             std::move(compiled_inputs),
             value_expr,
@@ -428,6 +445,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
     } else if (auto column_expr =
                    std::dynamic_pointer_cast<const milvus::expr::ColumnExpr>(
                        expr)) {
+        expr_type = proto::plan::Expr::kColumnExpr;
         result = std::make_shared<PhyColumnExpr>(
             std::move(compiled_inputs),
             column_expr,
@@ -439,6 +457,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
     } else if (auto column_expr =
                    std::dynamic_pointer_cast<const milvus::expr::NullExpr>(
                        expr)) {
+        expr_type = proto::plan::Expr::kNullExpr;
         result = std::make_shared<PhyNullExpr>(
             std::move(compiled_inputs),
             column_expr,
@@ -450,6 +469,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
             context->get_consistency_level());
     } else if (auto casted_expr = std::dynamic_pointer_cast<
                    const milvus::expr::GISFunctionFilterExpr>(expr)) {
+        expr_type = proto::plan::Expr::kGisfunctionFilterExpr;
         result = std::make_shared<PhyGISFunctionFilterExpr>(
             std::move(compiled_inputs),
             casted_expr,
@@ -462,6 +482,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
     } else if (auto match_expr =
                    std::dynamic_pointer_cast<const milvus::expr::MatchExpr>(
                        expr)) {
+        expr_type = proto::plan::Expr::kMatchExpr;
         result = std::make_shared<PhyMatchFilterExpr>(
             std::move(compiled_inputs),
             match_expr,
@@ -472,6 +493,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
             context->query_config()->get_expr_batch_size());
     } else if (auto bloom_filter_expr = std::dynamic_pointer_cast<
                    const milvus::expr::BloomFilterExpr>(expr)) {
+        expr_type = proto::plan::Expr::kBloomFilterExpr;
         result = std::make_shared<PhyBloomFilterExpr>(
             std::move(compiled_inputs),
             bloom_filter_expr,
@@ -483,6 +505,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
             context->get_consistency_level());
     } else if (auto roaring_filter_expr = std::dynamic_pointer_cast<
                    const milvus::expr::RoaringFilterExpr>(expr)) {
+        expr_type = proto::plan::Expr::kRoaringFilterExpr;
         result = std::make_shared<PhyRoaringFilterExpr>(
             std::move(compiled_inputs),
             roaring_filter_expr,
@@ -499,6 +522,7 @@ CompileExpression(const expr::TypedExprPtr& expr,
     // non-pinned paths) to this expression. Runs for the whole compiled tree
     // because CompileExpression is recursive over inputs.
     result->SetSnapshot(context->get_read_snapshot().get());
+    result->SetExprType(expr_type);
     result->SetFeatureRecorder(plan_options.feature_recorder.get());
     return result;
 }
@@ -1014,6 +1038,100 @@ EvalExprSetOverAllBatches(ExprSet& expr_set,
     // relying on the convention that UNKNOWN rows carry data=0.
     bitset.inplace_and(valid_bitset, bitset.size());
     return bitset;
+}
+
+FilterSourceInfo
+SegmentExpr::DescribeColumnFilterSource(
+    proto::plan::Expr::ExprCase expr_type,
+    proto::plan::OpType operation,
+    proto::plan::ArithOpType arith_operation) const {
+    EnsureExecPathDetermined();
+    FilterSourceInfo facts{field_type_, expr_type, operation, arith_operation,
+                           exec_path_,
+                           static_cast<int32_t>(index::ScalarIndexType::NONE)};
+    if (exec_path_ == ExprExecPath::ScalarIndex) {
+        facts.index_type = -1;
+        if (selected_index_entry_) {
+            const auto& family = selected_index_entry_->family;
+            // Reuse canonical index ordinals/names and the existing adapter.
+            // New families without a legacy ordinal remain explicitly unknown.
+            for (int raw = static_cast<int>(index::ScalarIndexType::BITMAP);
+                 raw <= static_cast<int>(index::ScalarIndexType::FMINDEX);
+                 ++raw) {
+                const auto type = static_cast<index::ScalarIndexType>(raw);
+                auto canonical = index::FamilyFromScalarIndexType(type);
+                if (canonical.empty()) {
+                    canonical = index::ToString(type);
+                    std::transform(canonical.begin(), canonical.end(),
+                                   canonical.begin(), [](unsigned char c) {
+                                       return static_cast<char>(std::tolower(c));
+                                   });
+                }
+                if (canonical == family) {
+                    facts.index_type = raw;
+                    break;
+                }
+            }
+        }
+    }
+    return facts;
+}
+
+std::shared_ptr<const ChunkedColumnInterface>
+Expr::OffsetSamplingColumn() const {
+    std::shared_ptr<const ChunkedColumnInterface> source;
+    for (const auto& input : inputs_) {
+        auto column = input->OffsetSamplingColumn();
+        if (!column || !column->OffsetSamplingStorageIdentity()) {
+            return nullptr;
+        }
+        if (source && source->OffsetSamplingStorageIdentity() !=
+                          column->OffsetSamplingStorageIdentity()) {
+            return nullptr;
+        }
+        source = std::move(column);
+    }
+    return source;
+}
+
+std::shared_ptr<const ChunkedColumnInterface>
+SegmentExpr::OffsetSamplingColumn() const {
+    // Inspect inventory before path preparation/pinning. Sampling is restricted
+    // to raw columns whose whole expression shares one physical cell layout.
+    if (segment_->type() != SegmentType::Sealed || is_pk_field_ ||
+        // Registration metadata is sufficient here. Resolving capabilities
+        // would initialize lazy index entries merely to reject raw sampling.
+        !segment_->IndexRegistrations(field_id_).empty() ||
+        CanUseJsonStatsAtInit() || CanUseNgramIndex() ||
+        !segment_->HasFieldData(field_id_)) {
+        return nullptr;
+    }
+    auto column = snapshot_ ? snapshot_->GetDataScanResources(field_id_).first
+                            : segment_->GetDataScanResources(field_id_).first;
+    if (column) {
+        column->Prepare(op_ctx_);
+    }
+    return column && column->OffsetSamplingStorageIdentity() ? column : nullptr;
+}
+
+bool
+Expr::ConsiderAnnFusing(AnnFilterFusingRequest request) {
+    if (request == AnnFilterFusingRequest::Baseline || !SupportOffsetInput()) {
+        return false;
+    }
+    if (request != AnnFilterFusingRequest::Auto) {
+        return true;
+    }
+    const auto facts = DescribeFilterSource();
+    const MilvusAnnFusingRuleV4 rule{
+        sizeof(MilvusAnnFusingRuleV4), static_cast<uint32_t>(facts.data_type),
+        static_cast<uint32_t>(facts.expr_type),
+        static_cast<uint32_t>(facts.operation),
+        static_cast<uint32_t>(facts.arith_operation),
+        facts.access_path ? static_cast<uint32_t>(*facts.access_path)
+                          : static_cast<uint32_t>(-1),
+        static_cast<uint32_t>(facts.index_type)};
+    return AnnFusingPolicy::Instance().Consider(rule);
 }
 
 }  // namespace exec

@@ -40,6 +40,7 @@
 #include "exec/expression/ValueLookupSource.h"
 #include "exec/expression/ExprCacheHelper.h"
 #include "exec/QueryContext.h"
+#include "exec/FilterDiagnostics.h"
 #include "expr/ITypeExpr.h"
 #include "index/Families.h"
 #include "index/contracts/query/IJsonIndexReader.h"
@@ -315,6 +316,15 @@ ApplyValidMaskForCandidates(ValidityView validity,
     }
 }
 
+struct FilterSourceInfo {
+    DataType data_type{DataType::NONE};
+    proto::plan::Expr::ExprCase expr_type{proto::plan::Expr::EXPR_NOT_SET};
+    proto::plan::OpType operation{proto::plan::Invalid};
+    proto::plan::ArithOpType arith_operation{proto::plan::Unknown};
+    std::optional<ExprExecPath> access_path;
+    int32_t index_type{-1};  // Existing ScalarIndexType ordinal, -1 if unknown.
+};
+
 class Expr : public std::enable_shared_from_this<Expr> {
  public:
     Expr(DataType type,
@@ -328,6 +338,24 @@ class Expr : public std::enable_shared_from_this<Expr> {
     }
 
     virtual ~Expr() = default;
+
+    virtual FilterSourceInfo
+    DescribeFilterSource() const {
+        FilterSourceInfo result;
+        result.expr_type = expr_type_;
+        return result;
+    }
+
+    void
+    SetExprType(proto::plan::Expr::ExprCase type) {
+        expr_type_ = type;
+    }
+
+    virtual std::shared_ptr<const ChunkedColumnInterface>
+    OffsetSamplingColumn() const;
+
+    virtual bool
+    ConsiderAnnFusing(AnnFilterFusingRequest request);
 
     const DataType&
     type() const {
@@ -462,6 +490,7 @@ class Expr : public std::enable_shared_from_this<Expr> {
     }
 
  protected:
+    proto::plan::Expr::ExprCase expr_type_{proto::plan::Expr::EXPR_NOT_SET};
     DataType type_;
     std::vector<std::shared_ptr<Expr>> inputs_;
     std::string name_;
@@ -479,6 +508,20 @@ using ExprPtr = std::shared_ptr<milvus::exec::Expr>;
  */
 class SegmentExpr : public Expr {
  public:
+    FilterSourceInfo
+    DescribeFilterSource() const override {
+        return DescribeColumnFilterSource(expr_type_);
+    }
+
+    FilterSourceInfo
+    DescribeColumnFilterSource(
+        proto::plan::Expr::ExprCase expr_type,
+        proto::plan::OpType operation = proto::plan::Invalid,
+        proto::plan::ArithOpType arith_operation = proto::plan::Unknown) const;
+
+    std::shared_ptr<const ChunkedColumnInterface>
+    OffsetSamplingColumn() const override;
+
     SegmentExpr(std::vector<ExprPtr>&& input,
                 const std::string& name,
                 milvus::OpContext* op_ctx,

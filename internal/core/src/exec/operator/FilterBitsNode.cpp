@@ -26,10 +26,15 @@
 #include "common/Tracer.h"
 #include "common/Types.h"
 #include "exec/QueryContext.h"
+#include "exec/AnnFusingPolicy.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/ExprCache.h"
+#include "exec/expression/OffsetExpressionCallback.h"
+#include "exec/expression/OffsetExpressionSampler.h"
+#include "query/PlanImpl.h"
 #include "expr/ITypeExpr.h"
 #include "fmt/core.h"
+#include "log/Log.h"
 #include "monitor/Monitor.h"
 #include "plan/PlanNode.h"
 #include "prometheus/histogram.h"
@@ -82,20 +87,106 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                operator_id,
                filter->id(),
                "PhyFilterBitsNode") {
+    const auto preparation_started = std::chrono::steady_clock::now();
     ExecContext* exec_context = operator_context_->get_exec_context();
     query_context_ = exec_context->get_query_context();
-    std::vector<expr::TypedExprPtr> filters;
-    filters.emplace_back(filter->filter());
-    // This operator folds UNKNOWN predicate rows into the excluded set
-    // (ConvertPredicateToFilteredBitset), i.e. it is a null-rejecting
-    // consumer: let conjunctions in the predicate tree drop UNKNOWN rows
-    // from their active sets early.
+    const auto* placeholders = query_context_->get_placeholder_group();
+    // Retrieve/filter-only operators do not have an initialized ANN request.
+    // Diagnostics must retain the same boundary as ANN strategy selection.
+    if (placeholders != nullptr) {
+        const auto& diagnostic_params =
+            query_context_->get_search_info().search_params_;
+        if (diagnostic_params.contains("debug_ann_fusing_profile") &&
+            diagnostic_params.value("debug_ann_fusing_profile", false)) {
+            profile_ = std::make_unique<FilterDiagnostics>();
+            profile_->attribution = diagnostic_params.value("debug_ann_fusing_attribution", false);
+            profile_segment_id_ = query_context_->get_segment()->get_segment_id();
+            profile_timestamp_ = query_context_->get_query_timestamp();
+        }
+    }
+    FilterDiagnosticTimer profile_prepare(profile_ ? &profile_->prepare_ns
+                                                   : nullptr);
+    // Compile the normal Expr once; this same tree is retained for baseline.
     exprs_ = std::make_unique<ExprSet>(
-        filters, exec_context, /*null_rejecting=*/true);
+        std::vector<expr::TypedExprPtr>{filter->filter()}, exec_context, true);
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
 
-    enable_expr_cache_ = query_context_->get_enable_expr_cache();
+    // This operator also serves scalar retrieve/get and filter-only plans.
+    // Their default SearchInfo is not an ANN request and has no field binding.
+    const auto request = placeholders == nullptr
+                             ? AnnFilterFusingRequest::Baseline
+                             : query_context_->get_search_info()
+                                   .ann_filter_fusing_request;
+    if (request != AnnFilterFusingRequest::Baseline) {
+        // Demo eligibility only, not another evaluator/operator implementation.
+        // Unsupported shapes keep baseline before any bitmap is skipped.
+        const auto info = query_context_->get_search_info();
+        const auto* segment = query_context_->get_segment();
+        const auto schema = segment->get_schema_snapshot();
+        if (segment->type() == SegmentType::Sealed && placeholders != nullptr &&
+            placeholders->size() == 1 && !placeholders->at(0).element_level_ &&
+            !schema->get_ttl_field_id().has_value() &&
+            !(*schema)[info.field_id_].is_nullable() &&
+            (*schema)[info.field_id_].get_data_type() ==
+                DataType::VECTOR_FLOAT &&
+            !info.iterative_filter_execution &&
+            !info.iterator_v2_info_.has_value() &&
+            info.group_by_field_ids_.empty() &&
+            !info.materialized_view_involved &&
+            !info.search_params_.contains("radius") &&
+            !info.global_refine_enable_) {
+            auto& root = exprs_->exprs().front();
+            // Prove locality from storage metadata before policy description
+            // can prepare/pin an index. Unknown locality leaves AUTO baseline;
+            // debug forcing still bypasses policy and sampling as before.
+            const auto sampling_column =
+                request == AnnFilterFusingRequest::Auto &&
+                        AnnFusingPolicy::Instance().available()
+                    ? root->OffsetSamplingColumn()
+                    : nullptr;
+            const bool considered =
+                (request != AnnFilterFusingRequest::Auto || sampling_column) &&
+                root->ConsiderAnnFusing(request);
+            bool chosen = considered;
+            std::optional<double> ratio;
+            if (considered && request == AnnFilterFusingRequest::Auto) {
+                // Actual whole-expression evaluation, not a disposable
+                // capability probe. Baseline's scan cursor stays untouched.
+                ratio = SampleOffsetFilterRatio(filter->filter(), exec_context, sampling_column);
+                chosen = ratio && AnnFusingPolicy::Instance().Choose(
+                                      {sizeof(MilvusAnnFusingSampleV4),
+                                       ratio.value_or(1),
+                                       -1});
+                LOG_DEBUG("ann_fusing auto sample decision={} filter_ratio={}",
+                          chosen ? "fusing" : "baseline",
+                          ratio.value_or(-1));
+            }
+            if (chosen) {
+                OffsetExpressionOptions options;
+                options.null_rejecting = true;
+                query_context_->set_ann_fusing_callback(
+                    std::make_shared<OffsetExpressionCallback>(
+                        filter->filter(), exec_context, need_process_rows_, options),
+                    ratio);
+                skip_user_bitmap_ = true;
+                // Do not prefetch whole columns for a deferred user predicate.
+                // Each actual search task owns its mutable offset workspace.
+                exprs_->Clear();
+            }
+        }
+        LOG_DEBUG(
+            "ann_fusing reached FilterBitsNode request={}; decision={} "
+            "reason=whole_expression compiled_roots=1 prepare_us={}",
+            request == AnnFilterFusingRequest::Auto ? "auto" : "force",
+            query_context_->get_ann_fusing_callback() ? "fusing" : "baseline",
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - preparation_started)
+                .count());
+    }
+
+    enable_expr_cache_ = query_context_->get_enable_expr_cache() &&
+                         !query_context_->get_ann_fusing_callback();
     if (enable_expr_cache_) {
         const bool cache_setup_completed = RunExprCacheBestEffort([&]() {
             // Only cache the predicate result when EVERY expression in it is
@@ -116,6 +207,38 @@ PhyFilterBitsNode::PhyFilterBitsNode(
         if (!cache_setup_completed) {
             enable_expr_cache_ = false;
             expr_cache_key_.clear();
+        }
+    }
+}
+
+PhyFilterBitsNode::~PhyFilterBitsNode() {
+    if (profile_) {
+        try {
+            const auto& p = *profile_;
+            if (p.attribution) {
+                LOG_INFO("ann_fusing profile phase=attribution role=baseline segment={} timestamp={} {}",
+                         profile_segment_id_, profile_timestamp_, p.AttributionString());
+            }
+            LOG_INFO(
+                "ann_fusing profile phase=filter segment={} timestamp={} "
+                "skipped={} cache_hit={} completed={} errors={} rows={} "
+                "prepare_us={} output_us={} prefetch_wait_us={} filter_us={} "
+                "string_row_values={} string_index_values={}",
+                profile_segment_id_,
+                profile_timestamp_,
+                skip_user_bitmap_,
+                profile_cache_hit_,
+                num_processed_rows_ == need_process_rows_,
+                p.errors,
+                num_processed_rows_,
+                p.prepare_ns / 1000.0,
+                p.execute_ns / 1000.0,
+                p.wait_ns / 1000.0,
+                p.filter_ns / 1000.0,
+                p.string_row_values,
+                p.string_index_values);
+        } catch (...) {
+            // Logging must not change destruction/cancellation semantics.
         }
     }
 }
@@ -141,10 +264,25 @@ PhyFilterBitsNode::IsFinished() {
 
 RowVectorPtr
 PhyFilterBitsNode::GetOutput() {
+    FilterDiagnosticTimer profile_output(profile_ ? &profile_->execute_ns
+                                                  : nullptr);
+    FilterDiagnosticFailure profile_failure(profile_.get());
     milvus::exec::checkCancellation(query_context_);
 
     if (AllInputProcessed()) {
         return nullptr;
+    }
+
+    if (skip_user_bitmap_) {
+        // Only mandatory visibility bitmap storage remains; MvccNode applies
+        // timestamps/deletions as usual. Do not Eval() the user predicate here.
+        num_processed_rows_ = need_process_rows_;
+        LOG_DEBUG("ann_fusing skipped_user_predicate_bitmap rows={}",
+                  need_process_rows_);
+        return std::make_shared<RowVector>(
+            std::vector<VectorPtr>{std::make_shared<ColumnVector>(
+                TargetBitmap(need_process_rows_),
+                TargetBitmap(need_process_rows_, true))});
     }
 
     // Cache read: Stage 2 of two-stage search reuses the bitset cached by Stage 1.
@@ -189,7 +327,15 @@ PhyFilterBitsNode::GetOutput() {
         "PhyFilterBitsNode::Execute", tracer::GetRootSpan(), true);
     tracer::AddEvent(fmt::format("input_rows: {}", need_process_rows_));
 
-    exprs_->WaitPrefetch();
+    WaitPrefetch();
+    // Collect shared Expr/index work only during actual baseline evaluation.
+    // Bitmap cache hits and the fusing skip return above without evaluating.
+    std::optional<FilterDiagnosticScope> profile_scope;
+    if (profile_) {
+        profile_scope.emplace(profile_.get());
+    }
+    FilterDiagnosticTimer profile_filter(profile_ ? &profile_->filter_ns
+                                                  : nullptr);
 
     std::chrono::high_resolution_clock::time_point scalar_start =
         std::chrono::high_resolution_clock::now();

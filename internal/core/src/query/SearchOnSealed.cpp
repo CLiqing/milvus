@@ -176,6 +176,11 @@ SearchOnSealedColumn(const Schema& schema,
                      const BitsetView& bitview,
                      milvus::OpContext* op_context,
                      SearchResult& result) {
+    if (!bitview.is_bitmap()) {
+        // This entry invokes raw-vector/BF consumers. Signal before search,
+        // rather than letting a bitmap shortcut drop the deferred predicate.
+        throw DeferredFilterUnsupported("raw-vector search requires a bitmap");
+    }
     const auto* schema_ptr = &schema;
     auto register_vector_search_provider = [&] {
         if (!result.allow_filtered_vector_search_ ||

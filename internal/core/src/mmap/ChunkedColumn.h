@@ -86,6 +86,10 @@ std::pair<std::vector<milvus::cachinglayer::cid_t>,
 
 class ChunkedColumnBase : public ChunkedColumnInterface {
  public:
+    const void*
+    OffsetSamplingStorageIdentity() const override {
+        return slot_.get();
+    }
     explicit ChunkedColumnBase(std::shared_ptr<CacheSlot<Chunk>> slot,
                                const FieldMeta& field_meta)
         : nullable_(field_meta.is_nullable()),

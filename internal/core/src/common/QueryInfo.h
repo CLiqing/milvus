@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 
@@ -52,6 +53,14 @@ struct BruteForceIndexParams {
     std::optional<int64_t> minhash_element_bit_width_;
 };
 
+// This is the caller's ANN-filter request, not the per-segment execution
+// decision. Auto consults the native policy; a missing policy keeps baseline.
+enum class AnnFilterFusingRequest : uint8_t {
+    Baseline = 0,
+    ExplicitFusing = 1,
+    Auto = 2,
+};
+
 struct SearchInfo {
     int64_t topk_{0};
     int64_t group_size_{1};
@@ -70,6 +79,8 @@ struct SearchInfo {
     tracer::TraceContext trace_ctx_;
     bool materialized_view_involved = false;
     bool iterative_filter_execution = false;
+    AnnFilterFusingRequest ann_filter_fusing_request =
+        AnnFilterFusingRequest::Auto;
     std::optional<SearchIteratorV2Info> iterator_v2_info_ = std::nullopt;
     std::optional<std::string> json_path_;
     std::optional<milvus::DataType> json_type_;

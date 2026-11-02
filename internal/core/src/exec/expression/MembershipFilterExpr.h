@@ -135,6 +135,11 @@ struct RoaringMembershipProbe {
 template <typename LogicalExpr, typename ProbePolicy>
 class PhyMembershipFilterExpr : public SegmentExpr {
  public:
+    bool
+    SupportOffsetInput() override {
+        return true;
+    }
+
     PhyMembershipFilterExpr(std::vector<std::shared_ptr<Expr>> input,
                             const std::shared_ptr<const LogicalExpr>& expr,
                             const std::string& name,

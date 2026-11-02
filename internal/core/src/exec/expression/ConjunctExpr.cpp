@@ -217,5 +217,14 @@ PhyConjunctFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
     ClearBitmapInput(context);
 }
 
+bool
+PhyConjunctFilterExpr::ConsiderAnnFusing(AnnFilterFusingRequest request) {
+    // Keep the original Boolean tree. Any rejected leaf rejects the whole tree.
+    return !inputs_.empty() &&
+           std::all_of(inputs_.begin(), inputs_.end(), [&](const auto& input) {
+               return input->ConsiderAnnFusing(request);
+           });
+}
+
 }  //namespace exec
 }  // namespace milvus

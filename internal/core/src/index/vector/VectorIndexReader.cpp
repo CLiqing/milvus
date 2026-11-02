@@ -566,6 +566,9 @@ VectorIndexReader::SearchMemory(const DatasetPtr& dataset,
     auto final = [&] {
         if (CheckAndUpdateKnowhereRangeSearchParam(
                 params, topk, engine_.Metric(), search_conf)) {
+            if (!bitset.is_bitmap()) {
+                throw DeferredFilterUnsupported("range search requires a bitmap");
+            }
             milvus::tracer::AddEvent("start_knowhere_index_range_search");
             auto search = engine_.native_index.RangeSearch(
                 dataset, search_conf, bitset, op_ctx);
@@ -643,6 +646,9 @@ VectorIndexReader::SearchDisk(const DatasetPtr& dataset,
     auto final = [&] {
         if (CheckAndUpdateKnowhereRangeSearchParam(
                 params, topk, engine_.Metric(), search_config)) {
+            if (!bitset.is_bitmap()) {
+                throw DeferredFilterUnsupported("range search requires a bitmap");
+            }
             auto search = engine_.native_index.RangeSearch(
                 dataset, search_config, bitset, op_ctx);
             if (!search.has_value()) {

@@ -46,6 +46,11 @@ namespace exec {
 
 class PhyColumnExpr : public Expr {
  public:
+    bool
+    SupportOffsetInput() override {
+        return true;
+    }
+
     PhyColumnExpr(std::vector<std::shared_ptr<Expr>> input,
                   const std::shared_ptr<const milvus::expr::ColumnExpr>& expr,
                   const std::string& name,

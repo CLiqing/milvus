@@ -64,6 +64,9 @@ class PhyConjunctFilterExpr : public Expr {
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
 
+    bool
+    ConsiderAnnFusing(AnnFilterFusingRequest request) override;
+
     void
     MoveCursor() override {
         if (!has_offset_input_) {

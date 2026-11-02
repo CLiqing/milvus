@@ -24,6 +24,7 @@
 #include "bitset/detail/element_wise.h"
 #include "common/Types.h"
 #include "common/EasyAssert.h"
+#include "common/DeferredFilter.h"
 #include "knowhere/bitsetview.h"
 
 namespace milvus {
@@ -54,6 +55,9 @@ class BitsetView : public knowhere::BitsetView {
     // Return whether all bits are set (vacuously true when empty).
     bool
     all() const {
+        if (!is_bitmap()) {
+            throw DeferredFilterUnsupported("all() requires a materialized bitmap");
+        }
         if (empty()) {
             return true;
         }
@@ -72,6 +76,9 @@ class BitsetView : public knowhere::BitsetView {
     // Return whether no bit is set (vacuously true when empty).
     bool
     none() const {
+        if (!is_bitmap()) {
+            throw DeferredFilterUnsupported("none() requires a materialized bitmap");
+        }
         if (empty()) {
             return true;
         }
@@ -89,6 +96,9 @@ class BitsetView : public knowhere::BitsetView {
 
     BitsetView
     subview(size_t offset, size_t size) const {
+        if (!is_bitmap()) {
+            throw DeferredFilterUnsupported("raw subview requires a materialized bitmap");
+        }
         if (empty()) {
             return {};
         }

@@ -343,6 +343,10 @@ class ChunkedColumnGroup {
 
 class ProxyChunkColumn : public ChunkedColumnInterface {
  public:
+    const void*
+    OffsetSamplingStorageIdentity() const override {
+        return group_.get();
+    }
     explicit ProxyChunkColumn(std::shared_ptr<ChunkedColumnGroup> group,
                               FieldId field_id,
                               const FieldMeta& field_meta)

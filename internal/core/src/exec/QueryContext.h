@@ -35,6 +35,8 @@
 
 namespace milvus::exec {
 
+class OffsetExpressionCallback;
+
 enum class ContextScope { GLOBAL = 0, SESSION = 1, QUERY = 2, Executor = 3 };
 
 class BaseConfig {
@@ -225,6 +227,24 @@ class QueryContext : public Context {
         return search_info_;
     }
 
+    void
+    set_ann_fusing_callback(
+        std::shared_ptr<OffsetExpressionCallback> callback,
+        std::optional<double> user_filter_ratio = std::nullopt) {
+        ann_fusing_callback_ = std::move(callback);
+        ann_fusing_user_filter_ratio_ = user_filter_ratio;
+    }
+
+    const std::shared_ptr<OffsetExpressionCallback>&
+    get_ann_fusing_callback() const {
+        return ann_fusing_callback_;
+    }
+
+    std::optional<double>
+    get_ann_fusing_user_filter_ratio() const {
+        return ann_fusing_user_filter_ratio_;
+    }
+
     knowhere::MetricType
     get_metric_type() {
         return search_info_.metric_type_;
@@ -377,6 +397,30 @@ class QueryContext : public Context {
         return read_snapshot_;
     }
 
+    // A callback search task owns mutable Expr/cache cursors independently.
+    // Share only the immutable request description and leased source snapshot;
+    // the originating request/segment/OpContext must outlive all such tasks.
+    std::unique_ptr<QueryContext>
+    MakeOffsetContext() const {
+        auto result = std::make_unique<QueryContext>(
+            query_id_, segment_, active_count_, query_timestamp_,
+            collection_ttl_timestamp_, consistency_level_, plan_options_,
+            query_config_, executor_,
+            std::unordered_map<std::string, std::shared_ptr<BaseConfig>>{},
+            entity_ttl_physical_time_us_);
+        result->read_snapshot_ = read_snapshot_;
+        result->op_context_ = op_context_;
+        result->search_info_ = search_info_;
+        result->placeholder_group_ = placeholder_group_;
+        result->struct_name_ = struct_name_;
+        result->struct_element_offsets_ = struct_element_offsets_;
+        result->active_element_count_ = active_element_count_;
+        result->bitset_is_element_level_ = bitset_is_element_level_;
+        result->enable_expr_cache_ = false;
+        result->enable_sub_expr_cache_write_ = false;
+        return result;
+    }
+
  private:
     folly::Executor* executor_;
     //folly::Executor::KeepAlive<> executor_keepalive_;
@@ -395,7 +439,11 @@ class QueryContext : public Context {
     milvus::Timestamp collection_ttl_timestamp_;
     // used for vector search
     milvus::SearchInfo search_info_;
-    const query::PlaceholderGroup* placeholder_group_;
+    std::shared_ptr<OffsetExpressionCallback> ann_fusing_callback_;
+    std::optional<double> ann_fusing_user_filter_ratio_;
+    // Retrieve/filter-only contexts have no vector placeholders. In particular,
+    // AUTO eligibility must never inspect an indeterminate pointer on that path.
+    const query::PlaceholderGroup* placeholder_group_{nullptr};
 
     // used for store segment search result
     milvus::SearchResult search_result_;

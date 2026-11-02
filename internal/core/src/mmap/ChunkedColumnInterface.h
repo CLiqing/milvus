@@ -69,6 +69,13 @@ class ChunkedColumnInterface : public FieldChunkMetricsProvider {
 
     ~ChunkedColumnInterface() override = default;
 
+    // Equal non-null identities guarantee shared physical chunk boundaries.
+    // This metadata-only query never pins a payload; unknown sources decline.
+    virtual const void*
+    OffsetSamplingStorageIdentity() const {
+        return nullptr;
+    }
+
     // Materialize a lazy column's chunk directory with the caller's context
     // before using context-free layout accessors. This does not pin raw data.
     virtual void
