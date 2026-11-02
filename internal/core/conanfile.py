@@ -29,7 +29,7 @@ class MilvusConan(ConanFile):
         "xz_utils/5.4.5#fc4e36861e0a47ecd4a40a00e6d29ac8",
         "prometheus-cpp/1.2.4#0918d66c13f97acb7809759f9de49b3f",
         "folly/2026.04.20.00@milvus/dev#06852bea5b6449f0c4eb0df002b5779c",
-        "milvus-common/1.0.0-78f2c29@milvus/dev#af77e5f5444d6dd7cc5573182b958491",
+        "milvus-common/1.0.0-a88c21f@milvus/dev#0eb9a7f2f5d5fe0e7d37f45f3f9a38ea",
         "google-cloud-cpp/2.28.0@milvus/dev#468918b43cec43624531a0340398cf43",
         "opentelemetry-cpp/1.23.0@milvus/dev#11bc565ec6e82910ae8f7471da756720",
         "librdkafka/2.6.1@milvus/dev#a15d9fefad917290d59fa3fcbc144888",
@@ -135,7 +135,7 @@ class MilvusConan(ConanFile):
         self.requires("libcurl/8.10.1#a3113369c86086b0e84231844e7ed0a9", force=True)
         self.requires("nlohmann_json/3.11.3#ffb9e9236619f1c883e36662f944345d", force=True)
         self.requires("abseil/20250127.0#481edcc75deb0efb16500f511f0f0a1c", force=True)
-        self.requires("fmt/11.2.0#eb98daa559c7c59d591f4720dde4cd5c", force=True)
+        self.requires("fmt/12.1.0", force=True)
         # libbson only (BSON C library) for JSON stats — NOT the full mongo-c-driver.
         # Drops libmongoc/mongocxx/utf8proc; see src/common/bson_shim.h.
         self.requires("libbson/1.30.6@milvus/dev#4fc4c269cbda1b46c3118fa396cdc690")
