@@ -125,9 +125,11 @@ PhyFilterBitsNode::PhyFilterBitsNode(
         query_context_->get_search_info().search_params_.value(
             "debug_coarse_post", false);
     if (coarse_post) {
-        AssertInfo(
-            request != AnnFilterFusingRequest::Baseline,
-            "debug_coarse_post conflicts with baseline or iterative execution");
+        if (request == AnnFilterFusingRequest::Baseline) {
+            ThrowInfo(ErrorCode::InvalidParameter,
+                      "debug_coarse_post conflicts with baseline or iterative "
+                      "execution");
+        }
         // Prepare the same shared offset evaluator, without sampling or YAML
         // policy selection. Only the backend predicate scheduling changes.
         request = AnnFilterFusingRequest::ExplicitFusing;
@@ -203,9 +205,11 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                 .count());
     }
 
-    AssertInfo(
-        !coarse_post || query_context_->get_ann_fusing_callback(),
-        "debug_coarse_post requires a supported whole offset expression");
+    if (coarse_post && !query_context_->get_ann_fusing_callback()) {
+        ThrowInfo(
+            ErrorCode::InvalidParameter,
+            "debug_coarse_post requires a supported whole offset expression");
+    }
 
     enable_expr_cache_ = query_context_->get_enable_expr_cache() &&
                          !query_context_->get_ann_fusing_callback();
