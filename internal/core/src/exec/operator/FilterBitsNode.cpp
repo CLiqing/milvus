@@ -99,8 +99,10 @@ PhyFilterBitsNode::PhyFilterBitsNode(
         if (diagnostic_params.contains("debug_ann_fusing_profile") &&
             diagnostic_params.value("debug_ann_fusing_profile", false)) {
             profile_ = std::make_unique<FilterDiagnostics>();
-            profile_->attribution = diagnostic_params.value("debug_ann_fusing_attribution", false);
-            profile_segment_id_ = query_context_->get_segment()->get_segment_id();
+            profile_->attribution =
+                diagnostic_params.value("debug_ann_fusing_attribution", false);
+            profile_segment_id_ =
+                query_context_->get_segment()->get_segment_id();
             profile_timestamp_ = query_context_->get_query_timestamp();
         }
     }
@@ -114,10 +116,22 @@ PhyFilterBitsNode::PhyFilterBitsNode(
 
     // This operator also serves scalar retrieve/get and filter-only plans.
     // Their default SearchInfo is not an ANN request and has no field binding.
-    const auto request = placeholders == nullptr
-                             ? AnnFilterFusingRequest::Baseline
-                             : query_context_->get_search_info()
-                                   .ann_filter_fusing_request;
+    auto request =
+        placeholders == nullptr
+            ? AnnFilterFusingRequest::Baseline
+            : query_context_->get_search_info().ann_filter_fusing_request;
+    const bool coarse_post =
+        placeholders != nullptr &&
+        query_context_->get_search_info().search_params_.value(
+            "debug_coarse_post", false);
+    if (coarse_post) {
+        AssertInfo(
+            request != AnnFilterFusingRequest::Baseline,
+            "debug_coarse_post conflicts with baseline or iterative execution");
+        // Prepare the same shared offset evaluator, without sampling or YAML
+        // policy selection. Only the backend predicate scheduling changes.
+        request = AnnFilterFusingRequest::ExplicitFusing;
+    }
     if (request != AnnFilterFusingRequest::Baseline) {
         // Demo eligibility only, not another evaluator/operator implementation.
         // Unsupported shapes keep baseline before any bitmap is skipped.
@@ -153,7 +167,8 @@ PhyFilterBitsNode::PhyFilterBitsNode(
             if (considered && request == AnnFilterFusingRequest::Auto) {
                 // Actual whole-expression evaluation, not a disposable
                 // capability probe. Baseline's scan cursor stays untouched.
-                ratio = SampleOffsetFilterRatio(filter->filter(), exec_context, sampling_column);
+                ratio = SampleOffsetFilterRatio(
+                    filter->filter(), exec_context, sampling_column);
                 chosen = ratio && AnnFusingPolicy::Instance().Choose(
                                       {sizeof(MilvusAnnFusingSampleV4),
                                        ratio.value_or(1),
@@ -167,7 +182,10 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                 options.null_rejecting = true;
                 query_context_->set_ann_fusing_callback(
                     std::make_shared<OffsetExpressionCallback>(
-                        filter->filter(), exec_context, need_process_rows_, options),
+                        filter->filter(),
+                        exec_context,
+                        need_process_rows_,
+                        options),
                     ratio);
                 skip_user_bitmap_ = true;
                 // Do not prefetch whole columns for a deferred user predicate.
@@ -184,6 +202,10 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                 std::chrono::steady_clock::now() - preparation_started)
                 .count());
     }
+
+    AssertInfo(
+        !coarse_post || query_context_->get_ann_fusing_callback(),
+        "debug_coarse_post requires a supported whole offset expression");
 
     enable_expr_cache_ = query_context_->get_enable_expr_cache() &&
                          !query_context_->get_ann_fusing_callback();
@@ -216,8 +238,12 @@ PhyFilterBitsNode::~PhyFilterBitsNode() {
         try {
             const auto& p = *profile_;
             if (p.attribution) {
-                LOG_INFO("ann_fusing profile phase=attribution role=baseline segment={} timestamp={} {}",
-                         profile_segment_id_, profile_timestamp_, p.AttributionString());
+                LOG_INFO(
+                    "ann_fusing profile phase=attribution role=baseline "
+                    "segment={} timestamp={} {}",
+                    profile_segment_id_,
+                    profile_timestamp_,
+                    p.AttributionString());
             }
             LOG_INFO(
                 "ann_fusing profile phase=filter segment={} timestamp={} "

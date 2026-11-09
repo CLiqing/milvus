@@ -197,15 +197,20 @@ PhyVectorSearchNode::GetOutput() {
     // all joined Cardinal workers. The view never owns expression state.
     knowhere::CandidateEvaluatorView callback_view;
     if (const auto& callback = query_context_->get_ann_fusing_callback()) {
-        callback_view = callback->view();
+        callback_view = callback->view(
+            !search_info_.search_params_.value("debug_coarse_post", false));
         auto& params = search_info_.search_params_;
         // Backend transport field is derived here, not a public strategy knob.
         params.erase("ann_fusing_filter_ratio");
-        if (params.contains("debug_ann_fusing_filter_ratio")) {
+        if (params.value("debug_coarse_post", false)) {
+            // Observed post through-rate controls candidate batching only;
+            // graph navigation continues to see mandatory constraints alone.
+        } else if (params.contains("debug_ann_fusing_filter_ratio")) {
             // Development override is the COMPLETE query filter ratio.
             // Only DiskANN expansion consumes it, never user-predicate sampling
             // or the exact mandatory bitmap count.
-            const double ratio = params.at("debug_ann_fusing_filter_ratio").get<double>();
+            const double ratio =
+                params.at("debug_ann_fusing_filter_ratio").get<double>();
             AssertInfo(std::isfinite(ratio) && ratio >= 0 && ratio <= 1,
                        "debug_ann_fusing_filter_ratio must be in [0,1]");
             params["ann_fusing_filter_ratio"] = ratio;
@@ -217,8 +222,11 @@ PhyVectorSearchNode::GetOutput() {
                     // A freshly constructed BitsetView has no cached count.
                     search_view.count_filtered_bits(0, search_view.num_bits());
                 }
-                const double mandatory = search_view.size() == 0 ? 0.0 :
-                    static_cast<double>(search_view.count()) / search_view.size();
+                const double mandatory =
+                    search_view.size() == 0
+                        ? 0.0
+                        : static_cast<double>(search_view.count()) /
+                              search_view.size();
                 // Independence approximation, NOT an exact union count.
                 // CAP acceptance injects the known full-query rate until
                 // estimator precision/correlation is separately qualified.
@@ -241,23 +249,28 @@ PhyVectorSearchNode::GetOutput() {
     auto op_context = query_context_->get_op_context();
     try {
         segment_->vector_search(search_info_,
-                            src_data,
-                            src_offsets,
-                            num_queries,
-                            query_timestamp_,
-                            search_view,
-                            op_context,
+                                src_data,
+                                src_offsets,
+                                num_queries,
+                                query_timestamp_,
+                                search_view,
+                                op_context,
                                 search_result);
     } catch (const DeferredFilterUnsupported&) {
+        if (search_info_.search_params_.value("debug_coarse_post", false))
+            throw;
         const auto callback = query_context_->get_ann_fusing_callback();
-        AssertInfo(callback != nullptr, "bitmap fallback requires a deferred predicate");
+        AssertInfo(callback != nullptr,
+                   "bitmap fallback requires a deferred predicate");
         callback->RethrowIfFailed();
         auto baseline = callback->EvalBaseline();
         baseline.flip();  // Expr TRUE bitmap -> search exclusion bitmap.
         if (search_view.num_bits() != 0) {
-            AssertInfo(search_view.num_bits() == baseline.size(), "mandatory bitmap size mismatch");
-            TargetBitmapView mandatory(const_cast<uint8_t*>(search_view.mandatory_data()),
-                                        search_view.num_bits());
+            AssertInfo(search_view.num_bits() == baseline.size(),
+                       "mandatory bitmap size mismatch");
+            TargetBitmapView mandatory(
+                const_cast<uint8_t*>(search_view.mandatory_data()),
+                search_view.num_bits());
             baseline.inplace_or(mandatory, baseline.size());
         }
         milvus::BitsetView baseline_view(
@@ -267,9 +280,14 @@ PhyVectorSearchNode::GetOutput() {
         // Only an explicit unsupported-before-search signal reaches here.
         // The new runtime snapshot may differ; the exact bitmap is safe for
         // either indexed or raw search. No index-type whitelist lives here.
-        segment_->vector_search(baseline_info, src_data, src_offsets,
-                                num_queries, query_timestamp_, baseline_view,
-                                op_context, search_result);
+        segment_->vector_search(baseline_info,
+                                src_data,
+                                src_offsets,
+                                num_queries,
+                                query_timestamp_,
+                                baseline_view,
+                                op_context,
+                                search_result);
         query_context_->set_ann_fusing_callback(nullptr);
         LOG_DEBUG("ann_fusing fallback reason=entry_requires_bitmap");
     } catch (...) {
@@ -283,7 +301,6 @@ PhyVectorSearchNode::GetOutput() {
     }
     if (const auto& callback = query_context_->get_ann_fusing_callback()) {
         callback->RethrowIfFailed();
-
     }
     if (search_result.used_interim_index_) {
         MarkFeature(query_context_->get_plan_options().feature_recorder.get(),

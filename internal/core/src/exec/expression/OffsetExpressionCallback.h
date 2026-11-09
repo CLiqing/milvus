@@ -21,7 +21,7 @@ class OffsetExpressionCallback final {
                              OffsetExpressionOptions options = {});
 
     knowhere::CandidateEvaluatorView
-    view() const;
+    view(bool memoize = true) const;
 
     // After search tasks join, restore the original storage/Expr/cancellation
     // exception rather than classifying it from a generic backend string.
@@ -40,8 +40,11 @@ class OffsetExpressionCallback final {
     static void
     DestroyWorker(void* worker) noexcept;
     static knowhere::CandidateEvalStatus
-    EvalBatch(void* worker, const int32_t* ids, uint32_t count,
-              uint64_t active_mask, uint64_t* accepted_mask) noexcept;
+    EvalBatch(void* worker,
+              const int32_t* ids,
+              size_t count,
+              const uint64_t* active_mask,
+              uint64_t* accepted_mask) noexcept;
 
     expr::TypedExprPtr expression_;
     PreparedOffsetExpressionEvaluator prepared_;

@@ -2,7 +2,8 @@
 // license agreements. Licensed under the Apache License, Version 2.0.
 #include "exec/expression/OffsetExpressionCallback.h"
 
-#include <array>
+#include <algorithm>
+#include <limits>
 
 namespace milvus::exec {
 using Status = knowhere::CandidateEvalStatus;
@@ -30,17 +31,20 @@ struct OffsetExpressionCallback::Worker {
         AssertInfo(workspace->SupportsOffsetInput(),
                    "callback expression does not support offsets");
         offsets.reserve(64);
+        lanes.reserve(64);
     }
     const OffsetExpressionCallback* factory;
     std::unique_ptr<QueryContext> query;
     ExecContext context;
     std::unique_ptr<OffsetExpressionWorkspace> workspace;
     OffsetVector offsets;
-    std::array<uint32_t, 64> lanes;
+    std::vector<size_t> lanes;
 };
 
 OffsetExpressionCallback::OffsetExpressionCallback(
-    expr::TypedExprPtr expression, ExecContext* context, int64_t row_count,
+    expr::TypedExprPtr expression,
+    ExecContext* context,
+    int64_t row_count,
     OffsetExpressionOptions options)
     : expression_(std::move(expression)),
       prepared_(expression_, options),
@@ -52,9 +56,14 @@ OffsetExpressionCallback::OffsetExpressionCallback(
 }
 
 knowhere::CandidateEvaluatorView
-OffsetExpressionCallback::view() const {
-    return {1, sizeof(knowhere::CandidateEvaluatorView), this,
-            CreateWorker, DestroyWorker, EvalBatch};
+OffsetExpressionCallback::view(bool memoize) const {
+    return {2,
+            sizeof(knowhere::CandidateEvaluatorView),
+            this,
+            CreateWorker,
+            DestroyWorker,
+            EvalBatch,
+            memoize};
 }
 
 TargetBitmap
@@ -63,8 +72,10 @@ OffsetExpressionCallback::EvalBaseline() const {
     ExecContext context(query.get());
     ExprSet expressions({expression_}, &context, true);
     EvalCtx eval(&context);
-    return EvalExprSetOverAllBatches(expressions, eval, row_count_,
-                                    "deferred-entry baseline materialization");
+    return EvalExprSetOverAllBatches(expressions,
+                                     eval,
+                                     row_count_,
+                                     "deferred-entry baseline materialization");
 }
 
 void
@@ -113,61 +124,91 @@ OffsetExpressionCallback::DestroyWorker(void* worker) noexcept {
 }
 
 Status
-OffsetExpressionCallback::EvalBatch(void* opaque, const int32_t* ids,
-                                   uint32_t count, uint64_t active,
-                                   uint64_t* accepted) noexcept {
-    if (opaque == nullptr || accepted == nullptr || count > 64 ||
-        (count != 0 && ids == nullptr) ||
-        (count < 64 && (active >> count) != 0)) {
+OffsetExpressionCallback::EvalBatch(void* opaque,
+                                    const int32_t* ids,
+                                    size_t count,
+                                    const uint64_t* active,
+                                    uint64_t* accepted) noexcept {
+    if (opaque == nullptr || accepted == nullptr ||
+        (count != 0 && ids == nullptr)) {
         return Status::InvalidArgument;
     }
-    *accepted = 0;
+    const size_t words = count / 64 + (count % 64 != 0);
+    const uint64_t tail = count == 0        ? 0
+                          : count % 64 == 0 ? ~uint64_t{0}
+                                            : (uint64_t{1} << (count % 64)) - 1;
+    if (active != nullptr && words != 0 && (active[words - 1] & ~tail) != 0)
+        return Status::InvalidArgument;
+    std::fill_n(accepted, words, uint64_t{0});
     auto& worker = *static_cast<Worker*>(opaque);
     try {
         checkCancellation(worker.query.get());
-        worker.offsets.clear();
-        const auto lanes = count == 64 ? ~uint64_t{0}
-                                      : (uint64_t{1} << count) - 1;
-        const bool all_active = active == lanes;
-        if (all_active) {
-            // No positional restoration is needed when every input lane is
-            // active. Keep the input copy contiguous and omit the lane map.
-            if (count != 0) {
-                worker.offsets.assign(ids, ids + count);
-            }
-            for (const auto id : worker.offsets) {
-                AssertInfo(id >= 0 && id < worker.factory->row_count_,
-                           "callback offset outside active domain");
-            }
-        } else {
-            for (uint32_t lane = 0; lane < count; ++lane) {
-                if ((active & (uint64_t{1} << lane)) == 0) {
-                    continue;
+        bool all_active = true;
+        if (active != nullptr) {
+            for (size_t word = 0; word < words; ++word) {
+                if (active[word] != (word + 1 == words ? tail : ~uint64_t{0})) {
+                    all_active = false;
+                    break;
                 }
-                AssertInfo(ids[lane] >= 0 && ids[lane] < worker.factory->row_count_,
-                           "callback offset outside active domain");
-                worker.lanes[worker.offsets.size()] = lane;
-                worker.offsets.push_back(ids[lane]);
             }
         }
-        if (worker.offsets.empty()) {
-            return Status::Success;
-        }
-        const auto result = worker.workspace->EvalOffsets(worker.offsets);
-        if (all_active) {
-            *accepted = ReadPackedLanes(result->GetRawData(), count) &
-                        ReadPackedLanes(result->GetValidRawData(), count) & lanes;
-            return Status::Success;
-        }
-        TargetBitmapView truth(result->GetRawData(), result->size());
-        TargetBitmapView known(result->GetValidRawData(), result->size());
-        uint64_t mask = 0;
-        for (size_t i = 0; i < worker.offsets.size(); ++i) {
-            if (truth[i] && known[i]) {
-                mask |= uint64_t{1} << worker.lanes[i];
+        // Existing Expr kernels use signed int lengths. This is an internal
+        // safety window, not a transport cap or 64-row Expr subdivision.
+        constexpr size_t window =
+            (size_t(std::numeric_limits<int>::max()) / 64) * 64;
+        for (size_t begin = 0; begin < count;) {
+            const size_t length = std::min(window, count - begin);
+            worker.offsets.clear();
+            worker.lanes.clear();
+            if (all_active) {
+                worker.offsets.assign(ids + begin, ids + begin + length);
+                for (const auto id : worker.offsets) {
+                    AssertInfo(id >= 0 && id < worker.factory->row_count_,
+                               "callback offset outside active domain");
+                }
+            } else {
+                for (size_t lane = begin; lane < begin + length; ++lane) {
+                    if (((active[lane / 64] >> (lane % 64)) & 1) == 0)
+                        continue;
+                    AssertInfo(ids[lane] >= 0 &&
+                                   ids[lane] < worker.factory->row_count_,
+                               "callback offset outside active domain");
+                    worker.lanes.push_back(lane);
+                    worker.offsets.push_back(ids[lane]);
+                }
             }
+            if (!worker.offsets.empty()) {
+                checkCancellation(worker.query.get());
+                const auto result =
+                    worker.workspace->EvalOffsets(worker.offsets);
+                if (all_active) {
+                    const auto* truth =
+                        static_cast<const uint8_t*>(result->GetRawData());
+                    const auto* known =
+                        static_cast<const uint8_t*>(result->GetValidRawData());
+                    for (size_t local = 0; local < length; local += 64) {
+                        const auto n = static_cast<uint32_t>(
+                            std::min<size_t>(64, length - local));
+                        accepted[(begin + local) / 64] =
+                            ReadPackedLanes(truth + local / 8, n) &
+                            ReadPackedLanes(known + local / 8, n) &
+                            (n == 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1);
+                    }
+                } else {
+                    TargetBitmapView truth(result->GetRawData(),
+                                           result->size());
+                    TargetBitmapView known(result->GetValidRawData(),
+                                           result->size());
+                    for (size_t i = 0; i < worker.offsets.size(); ++i) {
+                        if (truth[i] && known[i]) {
+                            const auto lane = worker.lanes[i];
+                            accepted[lane / 64] |= uint64_t{1} << (lane % 64);
+                        }
+                    }
+                }
+            }
+            begin += length;
         }
-        *accepted = mask;
         return Status::Success;
     } catch (...) {
         worker.factory->CaptureException();
