@@ -196,13 +196,14 @@ PhyVectorSearchNode::GetOutput() {
     // Descriptor and query-owned factory outlive the synchronous search and
     // all joined Cardinal workers. The view never owns expression state.
     knowhere::CandidateEvaluatorView callback_view;
+    const bool post_filter =
+        search_info_.ann_filter_request == AnnFilterRequest::PostFilter;
     if (const auto& callback = query_context_->get_ann_fusing_callback()) {
-        callback_view = callback->view(
-            !search_info_.search_params_.value("debug_coarse_post", false));
+        callback_view = callback->view(!post_filter);
         auto& params = search_info_.search_params_;
         // Backend transport field is derived here, not a public strategy knob.
         params.erase("ann_fusing_filter_ratio");
-        if (params.value("debug_coarse_post", false)) {
+        if (post_filter) {
             // Observed post through-rate controls candidate batching only;
             // graph navigation continues to see mandatory constraints alone.
         } else if (params.contains("debug_ann_fusing_filter_ratio")) {
@@ -239,7 +240,11 @@ PhyVectorSearchNode::GetOutput() {
         }
     }
     if (query_context_->get_ann_fusing_callback()) {
-        search_view.set_candidate_evaluator(&callback_view, active_count_);
+        search_view.set_candidate_evaluator(
+            &callback_view,
+            active_count_,
+            post_filter ? knowhere::FilterMode::PostFilter
+                        : knowhere::FilterMode::InFilter);
     }
     milvus::SearchResult search_result;
     if (query::CanUseStrictGroupSearch(search_info_, num_queries) &&
@@ -257,7 +262,7 @@ PhyVectorSearchNode::GetOutput() {
                                 op_context,
                                 search_result);
     } catch (const DeferredFilterUnsupported&) {
-        if (search_info_.search_params_.value("debug_coarse_post", false))
+        if (post_filter)
             throw;
         const auto callback = query_context_->get_ann_fusing_callback();
         AssertInfo(callback != nullptr,

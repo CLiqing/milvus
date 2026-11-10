@@ -355,7 +355,7 @@ class Expr : public std::enable_shared_from_this<Expr> {
     OffsetSamplingColumn() const;
 
     virtual bool
-    ConsiderAnnFusing(AnnFilterFusingRequest request);
+    ConsiderAnnFusing(AnnFilterRequest request);
 
     const DataType&
     type() const {

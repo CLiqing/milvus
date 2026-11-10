@@ -1046,7 +1046,10 @@ SegmentExpr::DescribeColumnFilterSource(
     proto::plan::OpType operation,
     proto::plan::ArithOpType arith_operation) const {
     EnsureExecPathDetermined();
-    FilterSourceInfo facts{field_type_, expr_type, operation, arith_operation,
+    FilterSourceInfo facts{field_type_,
+                           expr_type,
+                           operation,
+                           arith_operation,
                            exec_path_,
                            static_cast<int32_t>(index::ScalarIndexType::NONE)};
     if (exec_path_ == ExprExecPath::ScalarIndex) {
@@ -1062,10 +1065,13 @@ SegmentExpr::DescribeColumnFilterSource(
                 auto canonical = index::FamilyFromScalarIndexType(type);
                 if (canonical.empty()) {
                     canonical = index::ToString(type);
-                    std::transform(canonical.begin(), canonical.end(),
-                                   canonical.begin(), [](unsigned char c) {
-                                       return static_cast<char>(std::tolower(c));
-                                   });
+                    std::transform(
+                        canonical.begin(),
+                        canonical.end(),
+                        canonical.begin(),
+                        [](unsigned char c) {
+                            return static_cast<char>(std::tolower(c));
+                        });
                 }
                 if (canonical == family) {
                     facts.index_type = raw;
@@ -1115,16 +1121,17 @@ SegmentExpr::OffsetSamplingColumn() const {
 }
 
 bool
-Expr::ConsiderAnnFusing(AnnFilterFusingRequest request) {
-    if (request == AnnFilterFusingRequest::Baseline || !SupportOffsetInput()) {
+Expr::ConsiderAnnFusing(AnnFilterRequest request) {
+    if (request == AnnFilterRequest::PreFilter || !SupportOffsetInput()) {
         return false;
     }
-    if (request != AnnFilterFusingRequest::Auto) {
+    if (request != AnnFilterRequest::Auto) {
         return true;
     }
     const auto facts = DescribeFilterSource();
     const MilvusAnnFusingRuleV4 rule{
-        sizeof(MilvusAnnFusingRuleV4), static_cast<uint32_t>(facts.data_type),
+        sizeof(MilvusAnnFusingRuleV4),
+        static_cast<uint32_t>(facts.data_type),
         static_cast<uint32_t>(facts.expr_type),
         static_cast<uint32_t>(facts.operation),
         static_cast<uint32_t>(facts.arith_operation),

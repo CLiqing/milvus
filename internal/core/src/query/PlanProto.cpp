@@ -155,16 +155,28 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
                    "search hints must be a string");
         hint = search_info.search_params_[HINTS].get<std::string>();
     }
-    if (hint == ANN_FUSING) {
-        search_info.ann_filter_fusing_request =
-            AnnFilterFusingRequest::ExplicitFusing;
+    if (hint == ANN_FUSING || hint == IN_FILTER_HINT ||
+        hint == ANN_FUSING_HINT_ALIAS) {
+        search_info.ann_filter_request = AnnFilterRequest::InFilter;
+    } else if (hint == POST_FILTER_HINT) {
+        search_info.ann_filter_request = AnnFilterRequest::PostFilter;
     } else if (hint.empty() || hint == ANN_FUSING_AUTO) {
-        search_info.ann_filter_fusing_request =
-            AnnFilterFusingRequest::Auto;
+        search_info.ann_filter_request = AnnFilterRequest::Auto;
     } else {
-        search_info.ann_filter_fusing_request =
-            AnnFilterFusingRequest::Baseline;
+        search_info.ann_filter_request = AnnFilterRequest::PreFilter;
     }
+
+    // Historical local harness compatibility only. New requests select post
+    // directly with a hint, and the backend receives placement in its filter.
+    if (search_info.search_params_.value("debug_coarse_post", false)) {
+        if (search_info.ann_filter_request == AnnFilterRequest::PreFilter) {
+            ThrowInfo(ErrorCode::InvalidParameter,
+                      "debug_coarse_post conflicts with baseline or iterative "
+                      "execution");
+        }
+        search_info.ann_filter_request = AnnFilterRequest::PostFilter;
+    }
+    search_info.search_params_.erase("debug_coarse_post");
 
     // currently, iterative filter does not support range search
     if (!search_info.search_params_.contains(RADIUS)) {
@@ -174,6 +186,9 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
             } else if (query_info_proto.hints() == ITERATIVE_FILTER) {
                 search_info.iterative_filter_execution = true;
             } else if (query_info_proto.hints() == ANN_FUSING ||
+                       query_info_proto.hints() == IN_FILTER_HINT ||
+                       query_info_proto.hints() == ANN_FUSING_HINT_ALIAS ||
+                       query_info_proto.hints() == POST_FILTER_HINT ||
                        query_info_proto.hints() == ANN_FUSING_AUTO ||
                        query_info_proto.hints() == ANN_FUSING_BASELINE) {
                 // Parsed above.  Fusing and iterative filtering are separate
@@ -188,8 +203,13 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
             if (search_info.search_params_[HINTS] == ITERATIVE_FILTER) {
                 search_info.iterative_filter_execution = true;
             } else if (search_info.search_params_[HINTS] == ANN_FUSING ||
+                       search_info.search_params_[HINTS] == IN_FILTER_HINT ||
+                       search_info.search_params_[HINTS] ==
+                           ANN_FUSING_HINT_ALIAS ||
+                       search_info.search_params_[HINTS] == POST_FILTER_HINT ||
                        search_info.search_params_[HINTS] == ANN_FUSING_AUTO ||
-                       search_info.search_params_[HINTS] == ANN_FUSING_BASELINE ||
+                       search_info.search_params_[HINTS] ==
+                           ANN_FUSING_BASELINE ||
                        search_info.search_params_[HINTS] == "disable") {
                 // Parsed above.
             } else {

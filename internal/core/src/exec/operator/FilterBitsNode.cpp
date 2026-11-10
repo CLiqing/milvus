@@ -116,25 +116,11 @@ PhyFilterBitsNode::PhyFilterBitsNode(
 
     // This operator also serves scalar retrieve/get and filter-only plans.
     // Their default SearchInfo is not an ANN request and has no field binding.
-    auto request =
-        placeholders == nullptr
-            ? AnnFilterFusingRequest::Baseline
-            : query_context_->get_search_info().ann_filter_fusing_request;
-    const bool coarse_post =
-        placeholders != nullptr &&
-        query_context_->get_search_info().search_params_.value(
-            "debug_coarse_post", false);
-    if (coarse_post) {
-        if (request == AnnFilterFusingRequest::Baseline) {
-            ThrowInfo(ErrorCode::InvalidParameter,
-                      "debug_coarse_post conflicts with baseline or iterative "
-                      "execution");
-        }
-        // Prepare the same shared offset evaluator, without sampling or YAML
-        // policy selection. Only the backend predicate scheduling changes.
-        request = AnnFilterFusingRequest::ExplicitFusing;
-    }
-    if (request != AnnFilterFusingRequest::Baseline) {
+    auto request = placeholders == nullptr
+                       ? AnnFilterRequest::PreFilter
+                       : query_context_->get_search_info().ann_filter_request;
+    const bool post_filter = request == AnnFilterRequest::PostFilter;
+    if (request != AnnFilterRequest::PreFilter) {
         // Demo eligibility only, not another evaluator/operator implementation.
         // Unsupported shapes keep baseline before any bitmap is skipped.
         const auto info = query_context_->get_search_info();
@@ -157,16 +143,16 @@ PhyFilterBitsNode::PhyFilterBitsNode(
             // can prepare/pin an index. Unknown locality leaves AUTO baseline;
             // debug forcing still bypasses policy and sampling as before.
             const auto sampling_column =
-                request == AnnFilterFusingRequest::Auto &&
+                request == AnnFilterRequest::Auto &&
                         AnnFusingPolicy::Instance().available()
                     ? root->OffsetSamplingColumn()
                     : nullptr;
             const bool considered =
-                (request != AnnFilterFusingRequest::Auto || sampling_column) &&
+                (request != AnnFilterRequest::Auto || sampling_column) &&
                 root->ConsiderAnnFusing(request);
             bool chosen = considered;
             std::optional<double> ratio;
-            if (considered && request == AnnFilterFusingRequest::Auto) {
+            if (considered && request == AnnFilterRequest::Auto) {
                 // Actual whole-expression evaluation, not a disposable
                 // capability probe. Baseline's scan cursor stays untouched.
                 ratio = SampleOffsetFilterRatio(
@@ -198,17 +184,18 @@ PhyFilterBitsNode::PhyFilterBitsNode(
         LOG_DEBUG(
             "ann_fusing reached FilterBitsNode request={}; decision={} "
             "reason=whole_expression compiled_roots=1 prepare_us={}",
-            request == AnnFilterFusingRequest::Auto ? "auto" : "force",
-            query_context_->get_ann_fusing_callback() ? "fusing" : "baseline",
+            request == AnnFilterRequest::Auto ? "auto" : "force",
+            query_context_->get_ann_fusing_callback()
+                ? (post_filter ? "post" : "in")
+                : "pre",
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - preparation_started)
                 .count());
     }
 
-    if (coarse_post && !query_context_->get_ann_fusing_callback()) {
-        ThrowInfo(
-            ErrorCode::InvalidParameter,
-            "debug_coarse_post requires a supported whole offset expression");
+    if (post_filter && !query_context_->get_ann_fusing_callback()) {
+        ThrowInfo(ErrorCode::InvalidParameter,
+                  "post-filter requires a supported whole offset expression");
     }
 
     enable_expr_cache_ = query_context_->get_enable_expr_cache() &&
