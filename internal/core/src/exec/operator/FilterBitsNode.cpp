@@ -241,6 +241,20 @@ PhyFilterBitsNode::~PhyFilterBitsNode() {
     if (profile_) {
         try {
             const auto& p = *profile_;
+            if (!skip_user_bitmap_) {
+                LOG_INFO(
+                    "ann_work scalar role=baseline segment={} timestamp={} "
+                    "expr_rows={} raw_rows={} raw_batches={} string_values={} "
+                    "bitmap_rows={} cache_hit={}",
+                    profile_segment_id_,
+                    profile_timestamp_,
+                    p.string_row_values,
+                    p.raw_read_rows,
+                    p.raw_read_batches,
+                    p.string_row_values,
+                    num_processed_rows_,
+                    profile_cache_hit_);
+            }
             if (p.attribution) {
                 LOG_INFO(
                     "ann_fusing profile phase=attribution role=baseline "

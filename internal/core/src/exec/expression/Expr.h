@@ -2020,12 +2020,18 @@ class SegmentExpr : public Expr {
                    take->Size(),
                    input_view.size);
         const auto take_is_owned = take->IsOwned();
+        if (active_filter_diagnostics != nullptr) {
+            ++active_filter_diagnostics->raw_read_batches;
+        }
 
         if (take_is_owned && data_take_filter_ == nullptr &&
             !has_candidate_mask) {
             auto owned = take->GetOwn();
             AssertInfo(owned.size == take->Size() && !owned.values.empty(),
                        "invalid owned take result");
+            if (active_filter_diagnostics != nullptr) {
+                active_filter_diagnostics->raw_read_rows += owned.size;
+            }
             func.template operator()<FilterType::random>(
                 owned.values.template data_as<T>(),
                 owned.validity,
@@ -2100,6 +2106,9 @@ class SegmentExpr : public Expr {
                        "active Take row {} has no value",
                        logical_pos);
             const auto& value = *item.value;
+            if (active_filter_diagnostics != nullptr) {
+                ++active_filter_diagnostics->raw_read_rows;
+            }
             func.template operator()<FilterType::random>(
                 &value,
                 nullable ? ValidityView::FromExpanded(&valid) : ValidityView{},
@@ -2873,6 +2882,10 @@ class SegmentExpr : public Expr {
                            "data scan batch [{}, {}) has no values",
                            batch.row_id_start,
                            batch.row_id_start + batch.size);
+                if (active_filter_diagnostics != nullptr) {
+                    ++active_filter_diagnostics->raw_read_batches;
+                    active_filter_diagnostics->raw_read_rows += batch.size;
+                }
                 evaluate_batch(batch.values.data_as<T>(),
                                batch.validity,
                                batch.row_id_start,

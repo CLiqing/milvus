@@ -57,6 +57,10 @@ struct FilterDiagnostics {
     uint64_t reader_bulk_pin_calls{0}, reader_peak_batch_bytes{0};
     uint64_t skip_checks{0}, skip_cache_hits{0};
     uint64_t raw_read_rows{0}, index_read_rows{0};
+    // Logical successful Scan/Take deliveries, NOT disk reads or cache cells.
+    // Scan counts exposed row slots; Take counts exposed non-NULL values.
+    // These agree for the nonnullable raw text anchor used by this experiment.
+    uint64_t raw_read_batches{0};
     // Values presented to the instrumented shared string predicates, counted
     // once per batch/range, not distinct IDs or regex-engine invocations.
     // Row kernels keep their existing bitmap/validity order; index kernels

@@ -32,6 +32,29 @@ struct OffsetExpressionCallback::Worker {
                    "callback expression does not support offsets");
         offsets.reserve(64);
         lanes.reserve(64);
+        if (factory->query_context_->get_search_info().search_params_.value(
+                "debug_ann_fusing_profile", false)) {
+            profile = std::make_unique<FilterDiagnostics>();
+        }
+    }
+    ~Worker() {
+        if (profile) {
+            try {
+                LOG_INFO(
+                    "ann_work scalar role=callback segment={} timestamp={} "
+                    "eval_calls={} expr_rows={} raw_rows={} raw_batches={} "
+                    "string_values={}",
+                    query->get_segment()->get_segment_id(),
+                    query->get_query_timestamp(),
+                    profile->calls,
+                    profile->input_rows,
+                    profile->raw_read_rows,
+                    profile->raw_read_batches,
+                    profile->string_row_values);
+            } catch (...) {
+                // Diagnostics never change search/destruction semantics.
+            }
+        }
     }
     const OffsetExpressionCallback* factory;
     std::unique_ptr<QueryContext> query;
@@ -39,6 +62,7 @@ struct OffsetExpressionCallback::Worker {
     std::unique_ptr<OffsetExpressionWorkspace> workspace;
     OffsetVector offsets;
     std::vector<size_t> lanes;
+    std::unique_ptr<FilterDiagnostics> profile;
 };
 
 OffsetExpressionCallback::OffsetExpressionCallback(
@@ -179,6 +203,11 @@ OffsetExpressionCallback::EvalBatch(void* opaque,
             }
             if (!worker.offsets.empty()) {
                 checkCancellation(worker.query.get());
+                FilterDiagnosticScope diagnostic_scope(worker.profile.get());
+                if (worker.profile) {
+                    ++worker.profile->calls;
+                    worker.profile->input_rows += worker.offsets.size();
+                }
                 const auto result =
                     worker.workspace->EvalOffsets(worker.offsets);
                 if (all_active) {
