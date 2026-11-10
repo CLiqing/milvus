@@ -277,15 +277,16 @@ PrepareCommonLoadConfig(Config& config,
     config[DISK_ANN_THREADS_NUM] = *open_options.load_threads;
 }
 
-// Create the backend mmap prefix, reporting filesystem failures before
-// deserialization.
+// Stream-backed DiskANN still materializes its graph tensors into local files
+// for direct I/O, even when mmap is disabled. Create the selected per-load
+// directory before either disk or mmap deserialization opens those files.
 void
-EnsureMmapDirectory(const std::string& path) {
+EnsureBackendDirectory(const std::string& path) {
     std::error_code error;
     std::filesystem::create_directories(path, error);
     if (error) {
         ThrowInfo(FileCreateFailed,
-                  "failed to create disk vector mmap directory {}: {}",
+                  "failed to create disk vector backend directory {}: {}",
                   path,
                   error.message());
     }
@@ -446,9 +447,10 @@ OpenIndex(bool use_async,
                               paths[i]);
                 }
             }
-        } else if (enable_mmap) {
+        } else if (enable_mmap ||
+                   params.index_type == knowhere::IndexEnum::INDEX_DISKANN) {
             {
-                auto local_io = [&] { EnsureMmapDirectory(prefix); };
+                auto local_io = [&] { EnsureBackendDirectory(prefix); };
                 if (use_async) {
                     co_await storage::RunLocalFileIOAsync(local_io, priority);
                 } else {
