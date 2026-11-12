@@ -14,7 +14,7 @@
 # Update KNOWHERE_VERSION for the first occurrence
 milvus_add_pkg_config("knowhere")
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES "")
-set( KNOWHERE_VERSION 250bdf261fa0394f0460406cb9ec38e6e4639d47 )
+set( KNOWHERE_VERSION 8af5b198f41ae2d5984411f0b9619820f7144270 )
 # Experimental dependency chain; use the official repository once these changes
 # are published there. Keep the local build and the review source on one pin.
 set( GIT_REPOSITORY  "https://github.com/CLiqing/knowhere.git")
