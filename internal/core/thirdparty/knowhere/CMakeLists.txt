@@ -14,7 +14,7 @@
 # Update KNOWHERE_VERSION for the first occurrence
 milvus_add_pkg_config("knowhere")
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES "")
-set( KNOWHERE_VERSION 1cb768a5a0ce17c4b1f171c3f4bbdd7d7f352f23 )
+set( KNOWHERE_VERSION e677a6354d94df21498353190c68247f4d6db42b )
 set( GIT_REPOSITORY  "https://github.com/zilliztech/knowhere.git")
 
 message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")
