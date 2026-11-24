@@ -35,6 +35,11 @@ include_directories(
     ${MILVUS_STORAGE_INCLUDE_DIR}
 )
 
+if ( INDEX_ENGINE STREQUAL "cardinal" )
+    include_directories("${KNOWHERE_INCLUDE_DIR}/../thirdparty/cardinalv2")
+    add_compile_definitions(MILVUS_CARDINAL_DEFERRED_FILTER)
+endif()
+
 # Conan dependency targets shared between milvus_conan_deps (for object library
 # include propagation) and LINK_TARGETS (for milvus_core final linking).
 set(CONAN_TARGETS

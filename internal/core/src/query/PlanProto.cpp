@@ -131,6 +131,12 @@ MergeExprWithNamespace(const SchemaPtr schema,
     return and_expr;
 }
 
+static std::optional<AnnFilterRequest>
+ChooseAnnFilterStrategy(const SearchInfo&) {
+    // Policy/white-list selection is intentionally not enabled in this phase.
+    return std::nullopt;
+}
+
 SearchInfo
 ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
     SearchInfo search_info;
@@ -161,22 +167,41 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
     } else if (hint == POST_FILTER_HINT) {
         search_info.ann_filter_request = AnnFilterRequest::PostFilter;
     } else if (hint.empty() || hint == ANN_FUSING_AUTO) {
-        search_info.ann_filter_request = AnnFilterRequest::Auto;
-    } else {
-        search_info.ann_filter_request = AnnFilterRequest::PreFilter;
+        search_info.ann_filter_request =
+            ChooseAnnFilterStrategy(search_info).value_or(AnnFilterRequest::PreFilter);
     }
 
-    // Historical local harness compatibility only. New requests select post
-    // directly with a hint, and the backend receives placement in its filter.
-    if (search_info.search_params_.value("debug_coarse_post", false)) {
-        if (search_info.ann_filter_request == AnnFilterRequest::PreFilter) {
+    if (auto it = search_info.search_params_.find("ann_filter_strategy");
+        it != search_info.search_params_.end()) {
+        if (!it->is_string()) {
             ThrowInfo(ErrorCode::InvalidParameter,
-                      "debug_coarse_post conflicts with baseline or iterative "
-                      "execution");
+                      "ann_filter_strategy must be pre, in, iterative or post");
         }
-        search_info.ann_filter_request = AnnFilterRequest::PostFilter;
+        const auto strategy = it->get<std::string>();
+        if (strategy == "pre") {
+            search_info.ann_filter_request = AnnFilterRequest::PreFilter;
+        } else if (strategy == "in") {
+            search_info.ann_filter_request = AnnFilterRequest::InFilter;
+        } else if (strategy == "iterative") {
+            search_info.ann_filter_request = AnnFilterRequest::IterativeFilter;
+        } else if (strategy == "post") {
+            search_info.ann_filter_request = AnnFilterRequest::PostFilter;
+        } else {
+            ThrowInfo(ErrorCode::InvalidParameter,
+                      "ann_filter_strategy must be pre, in, iterative or post");
+        }
+        search_info.search_params_.erase(it);
     }
-    search_info.search_params_.erase("debug_coarse_post");
+    if (auto it = search_info.search_params_.find("ann_filter_iterative_batch_size");
+        it != search_info.search_params_.end()) {
+        if (search_info.ann_filter_request != AnnFilterRequest::IterativeFilter ||
+            !it->is_number_integer() || *it < 1 || *it > 64) {
+            ThrowInfo(ErrorCode::InvalidParameter,
+                      "ann_filter_iterative_batch_size must be an integer in [1,64] for iterative only");
+        }
+        search_info.ann_iterative_batch_size = it->get<size_t>();
+        search_info.search_params_.erase(it);
+    }
 
     // currently, iterative filter does not support range search
     if (!search_info.search_params_.contains(RADIUS)) {
@@ -219,6 +244,13 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
                           search_info.search_params_[HINTS].dump());
             }
         }
+    }
+
+    if (search_info.ann_filter_request != AnnFilterRequest::PreFilter &&
+        (search_info.iterative_filter_execution ||
+         search_info.search_params_.contains(RADIUS))) {
+        ThrowInfo(ErrorCode::InvalidParameter,
+                  "deferred ANN filtering cannot be combined with range or legacy iterator filtering");
     }
 
     if (query_info_proto.bm25_avgdl() > 0) {

@@ -2,11 +2,12 @@
 // license agreements. Licensed under the Apache License, Version 2.0.
 #include "exec/expression/OffsetExpressionCallback.h"
 
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
 #include <algorithm>
 #include <limits>
 
 namespace milvus::exec {
-using Status = knowhere::CandidateEvalStatus;
+using Status = cardinalv2::CandidateEvalStatus;
 namespace {
 // Result transport only: preserve the Expr's packed bitmaps instead of
 // unpacking/repacking every accepted row. Read allocated bytes only, without
@@ -79,27 +80,14 @@ OffsetExpressionCallback::OffsetExpressionCallback(
                "callback requires a query context and valid active domain");
 }
 
-knowhere::CandidateEvaluatorView
-OffsetExpressionCallback::view(bool memoize) const {
-    return {2,
-            sizeof(knowhere::CandidateEvaluatorView),
-            this,
-            CreateWorker,
-            DestroyWorker,
-            EvalBatch,
-            memoize};
-}
-
-TargetBitmap
-OffsetExpressionCallback::EvalBaseline() const {
-    auto query = query_context_->MakeOffsetContext();
-    ExecContext context(query.get());
-    ExprSet expressions({expression_}, &context, true);
-    EvalCtx eval(&context);
-    return EvalExprSetOverAllBatches(expressions,
-                                     eval,
-                                     row_count_,
-                                     "deferred-entry baseline materialization");
+cardinalv2::CandidateEvaluatorView
+OffsetExpressionCallback::view() const {
+    cardinalv2::CandidateEvaluatorView view;
+    view.context = this;
+    view.create_worker = CreateWorker;
+    view.destroy_worker = DestroyWorker;
+    view.eval_batch = EvalBatch;
+    return view;
 }
 
 void
@@ -245,3 +233,4 @@ OffsetExpressionCallback::EvalBatch(void* opaque,
     }
 }
 }  // namespace milvus::exec
+#endif

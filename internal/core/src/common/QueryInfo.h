@@ -30,6 +30,10 @@
 // Use nlohmann::json here to avoid a knowhere configuration-header dependency;
 // the parameter contents still follow knowhere's search schema.
 
+namespace cardinalv2 {
+struct DeferredFilterRequest;
+}
+
 namespace milvus {
 
 // The search-parameter blob. Same underlying type as `knowhere::Json`, named
@@ -54,12 +58,13 @@ struct BruteForceIndexParams {
 };
 
 // This is the caller's ANN-filter request, not the per-segment execution
-// decision. Auto consults the native policy; a missing policy keeps baseline.
+// decision. Auto is reserved for policy code; the initial hook never overrides Pre.
 enum class AnnFilterRequest : uint8_t {
     PreFilter = 0,
     InFilter = 1,
     Auto = 2,
     PostFilter = 3,
+    IterativeFilter = 4,
 };
 
 struct SearchInfo {
@@ -80,7 +85,9 @@ struct SearchInfo {
     tracer::TraceContext trace_ctx_;
     bool materialized_view_involved = false;
     bool iterative_filter_execution = false;
-    AnnFilterRequest ann_filter_request = AnnFilterRequest::Auto;
+    AnnFilterRequest ann_filter_request = AnnFilterRequest::PreFilter;
+    size_t ann_iterative_batch_size = 32;
+    std::shared_ptr<const cardinalv2::DeferredFilterRequest> deferred_filter_request_;
     std::optional<SearchIteratorV2Info> iterator_v2_info_ = std::nullopt;
     std::optional<std::string> json_path_;
     std::optional<milvus::DataType> json_type_;

@@ -26,11 +26,9 @@
 #include "common/Tracer.h"
 #include "common/Types.h"
 #include "exec/QueryContext.h"
-#include "exec/AnnFusingPolicy.h"
 #include "exec/expression/EvalCtx.h"
 #include "exec/expression/ExprCache.h"
 #include "exec/expression/OffsetExpressionCallback.h"
-#include "exec/expression/OffsetExpressionSampler.h"
 #include "query/PlanImpl.h"
 #include "expr/ITypeExpr.h"
 #include "fmt/core.h"
@@ -87,7 +85,6 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                operator_id,
                filter->id(),
                "PhyFilterBitsNode") {
-    const auto preparation_started = std::chrono::steady_clock::now();
     ExecContext* exec_context = operator_context_->get_exec_context();
     query_context_ = exec_context->get_query_context();
     const auto* placeholders = query_context_->get_placeholder_group();
@@ -119,10 +116,10 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     auto request = placeholders == nullptr
                        ? AnnFilterRequest::PreFilter
                        : query_context_->get_search_info().ann_filter_request;
-    const bool post_filter = request == AnnFilterRequest::PostFilter;
     if (request != AnnFilterRequest::PreFilter) {
-        // Demo eligibility only, not another evaluator/operator implementation.
-        // Unsupported shapes keep baseline before any bitmap is skipped.
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+        // Only stable row offsets and supported offset Exprs may bypass the
+        // user bitmap. The actual loaded graph is checked at the search boundary.
         const auto info = query_context_->get_search_info();
         const auto* segment = query_context_->get_segment();
         const auto schema = segment->get_schema_snapshot();
@@ -139,33 +136,7 @@ PhyFilterBitsNode::PhyFilterBitsNode(
             !info.search_params_.contains("radius") &&
             !info.global_refine_enable_) {
             auto& root = exprs_->exprs().front();
-            // Prove locality from storage metadata before policy description
-            // can prepare/pin an index. Unknown locality leaves AUTO baseline;
-            // debug forcing still bypasses policy and sampling as before.
-            const auto sampling_column =
-                request == AnnFilterRequest::Auto &&
-                        AnnFusingPolicy::Instance().available()
-                    ? root->OffsetSamplingColumn()
-                    : nullptr;
-            const bool considered =
-                (request != AnnFilterRequest::Auto || sampling_column) &&
-                root->ConsiderAnnFusing(request);
-            bool chosen = considered;
-            std::optional<double> ratio;
-            if (considered && request == AnnFilterRequest::Auto) {
-                // Actual whole-expression evaluation, not a disposable
-                // capability probe. Baseline's scan cursor stays untouched.
-                ratio = SampleOffsetFilterRatio(
-                    filter->filter(), exec_context, sampling_column);
-                chosen = ratio && AnnFusingPolicy::Instance().Choose(
-                                      {sizeof(MilvusAnnFusingSampleV4),
-                                       ratio.value_or(1),
-                                       -1});
-                LOG_DEBUG("ann_fusing auto sample decision={} filter_ratio={}",
-                          chosen ? "fusing" : "baseline",
-                          ratio.value_or(-1));
-            }
-            if (chosen) {
+            if (root->ConsiderAnnFusing(request)) {
                 OffsetExpressionOptions options;
                 options.null_rejecting = true;
                 query_context_->set_ann_fusing_callback(
@@ -173,29 +144,18 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                         filter->filter(),
                         exec_context,
                         need_process_rows_,
-                        options),
-                    ratio);
+                        options));
                 skip_user_bitmap_ = true;
                 // Do not prefetch whole columns for a deferred user predicate.
                 // Each actual search task owns its mutable offset workspace.
                 exprs_->Clear();
             }
         }
-        LOG_DEBUG(
-            "ann_fusing reached FilterBitsNode request={}; decision={} "
-            "reason=whole_expression compiled_roots=1 prepare_us={}",
-            request == AnnFilterRequest::Auto ? "auto" : "force",
-            query_context_->get_ann_fusing_callback()
-                ? (post_filter ? "post" : "in")
-                : "pre",
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - preparation_started)
-                .count());
+#endif
     }
-
-    if (post_filter && !query_context_->get_ann_fusing_callback()) {
+    if (request != AnnFilterRequest::PreFilter && !query_context_->get_ann_fusing_callback()) {
         ThrowInfo(ErrorCode::InvalidParameter,
-                  "post-filter requires a supported whole offset expression");
+                  "deferred ANN filtering requires a supported sealed vector and whole offset expression");
     }
 
     enable_expr_cache_ = query_context_->get_enable_expr_cache() &&

@@ -6,7 +6,8 @@
 #include <mutex>
 
 #include "exec/expression/OffsetExpressionEvaluator.h"
-#include "knowhere/candidate_evaluator.h"
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+#include <cardinal/algo/deferred_filter.h>
 
 namespace milvus::exec {
 
@@ -20,26 +21,23 @@ class OffsetExpressionCallback final {
                              int64_t row_count,
                              OffsetExpressionOptions options = {});
 
-    knowhere::CandidateEvaluatorView
-    view(bool memoize = true) const;
+    cardinalv2::CandidateEvaluatorView
+    view() const;
 
     // After search tasks join, restore the original storage/Expr/cancellation
     // exception rather than classifying it from a generic backend string.
     void
     RethrowIfFailed() const;
 
-    TargetBitmap
-    EvalBaseline() const;
-
  private:
     struct Worker;
     void
     CaptureException() const noexcept;
-    static knowhere::CandidateEvalStatus
+    static cardinalv2::CandidateEvalStatus
     CreateWorker(const void* context, void** output) noexcept;
     static void
     DestroyWorker(void* worker) noexcept;
-    static knowhere::CandidateEvalStatus
+    static cardinalv2::CandidateEvalStatus
     EvalBatch(void* worker,
               const int32_t* ids,
               size_t count,
@@ -54,3 +52,4 @@ class OffsetExpressionCallback final {
     mutable std::exception_ptr first_failure_;
 };
 }  // namespace milvus::exec
+#endif

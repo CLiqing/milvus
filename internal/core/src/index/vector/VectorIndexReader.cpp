@@ -36,9 +36,32 @@
 #include "index/vector/VectorReaderValidation.h"
 #include "index/vector/VectorTypeUtils.h"
 #include "knowhere/comp/index_param.h"
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+#include <know/deferred_filter_dataset.h>
+#endif
 
 namespace milvus::index {
 namespace {
+
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+auto
+CheckNativeDeferredFilter(const KnowhereEngine& engine, const DatasetPtr& dataset) {
+    auto deferred = cardinalv2::know_adapter::SearchFilter(dataset);
+    if (deferred && !cardinalv2::know_adapter::CanSearchWithDeferredFilter(engine.native_index.Node())) {
+        ThrowInfo(ErrorCode::InvalidParameter,
+                  "loaded vector index does not support Cardinal deferred filtering");
+    }
+    return deferred;
+}
+
+void
+CheckNativeFilterCompleted(const DatasetPtr& result,
+                           const cardinalv2::DeferredFilterRequestPtr& deferred) {
+    if (deferred && !cardinalv2::know_adapter::SearchFilterCompleted(result, deferred)) {
+        ThrowInfo(ErrorCode::UnexpectedError, "Cardinal deferred filter completion receipt is missing");
+    }
+}
+#endif
 
 void
 ValidateDiskAnnBeamwidth(const KnowhereEngine& engine, uint32_t beamwidth) {
@@ -554,6 +577,9 @@ VectorIndexReader::SearchMemory(const DatasetPtr& dataset,
     const auto topk = params.topk_;
     const auto result_count = detail::CheckedResultCount(shape, topk);
     auto search_conf = PrepareVectorSearchParams(params);
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+    const auto deferred = CheckNativeDeferredFilter(engine_, dataset);
+#endif
 
     if (IsEmptyEngine()) {
         result.seg_offsets_.assign(result_count, INVALID_SEG_OFFSET);
@@ -566,9 +592,6 @@ VectorIndexReader::SearchMemory(const DatasetPtr& dataset,
     auto final = [&] {
         if (CheckAndUpdateKnowhereRangeSearchParam(
                 params, topk, engine_.Metric(), search_conf)) {
-            if (!bitset.is_bitmap()) {
-                throw DeferredFilterUnsupported("range search requires a bitmap");
-            }
             milvus::tracer::AddEvent("start_knowhere_index_range_search");
             auto search = engine_.native_index.RangeSearch(
                 dataset, search_conf, bitset, op_ctx);
@@ -600,6 +623,9 @@ VectorIndexReader::SearchMemory(const DatasetPtr& dataset,
                       knowhere::Status2String(status),
                       search.what());
         }
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+        CheckNativeFilterCompleted(search.value(), deferred);
+#endif
         return search.value();
     }();
 
@@ -623,6 +649,9 @@ VectorIndexReader::SearchDisk(const DatasetPtr& dataset,
     const auto topk = params.topk_;
     const auto result_count = detail::CheckedResultCount(shape, topk);
     auto search_config = PrepareVectorSearchParams(params);
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+    const auto deferred = CheckNativeDeferredFilter(engine_, dataset);
+#endif
 
     if (IsEmptyEngine()) {
         result.seg_offsets_.assign(result_count, INVALID_SEG_OFFSET);
@@ -646,9 +675,6 @@ VectorIndexReader::SearchDisk(const DatasetPtr& dataset,
     auto final = [&] {
         if (CheckAndUpdateKnowhereRangeSearchParam(
                 params, topk, engine_.Metric(), search_config)) {
-            if (!bitset.is_bitmap()) {
-                throw DeferredFilterUnsupported("range search requires a bitmap");
-            }
             auto search = engine_.native_index.RangeSearch(
                 dataset, search_config, bitset, op_ctx);
             if (!search.has_value()) {
@@ -663,6 +689,9 @@ VectorIndexReader::SearchDisk(const DatasetPtr& dataset,
         if (!search.has_value()) {
             ThrowSearchError("search", search, &search_config);
         }
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+        CheckNativeFilterCompleted(search.value(), deferred);
+#endif
         return search.value();
     }();
 

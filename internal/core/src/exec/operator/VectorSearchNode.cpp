@@ -192,60 +192,45 @@ PhyVectorSearchNode::GetOutput() {
         data_cnt = search_view.size();
     }
 
-    // Single search + metrics path
-    // Descriptor and query-owned factory outlive the synchronous search and
-    // all joined Cardinal workers. The view never owns expression state.
-    knowhere::CandidateEvaluatorView callback_view;
-    const bool post_filter =
-        search_info_.ann_filter_request == AnnFilterRequest::PostFilter;
-    if (const auto& callback = query_context_->get_ann_fusing_callback()) {
-        callback_view = callback->view(!post_filter);
+    const auto& callback = query_context_->get_ann_fusing_callback();
+    if (search_info_.ann_filter_request != AnnFilterRequest::PreFilter && !callback) {
+        ThrowInfo(ErrorCode::InvalidParameter,
+                  "deferred ANN filtering requires an offset predicate");
+    }
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+    if (callback) {
+        using cardinalv2::FilterStrategy;
+        auto request = std::make_shared<cardinalv2::DeferredFilterRequest>();
+        switch (search_info_.ann_filter_request) {
+            case AnnFilterRequest::InFilter:
+                request->strategy = FilterStrategy::In;
+                break;
+            case AnnFilterRequest::IterativeFilter:
+                request->strategy = FilterStrategy::Iterative;
+                break;
+            case AnnFilterRequest::PostFilter:
+                request->strategy = FilterStrategy::Post;
+                break;
+            default:
+                ThrowInfo(ErrorCode::InvalidParameter, "invalid deferred ANN strategy");
+        }
+        request->row_count = active_count_;
+        request->iterative_batch_size = search_info_.ann_iterative_batch_size;
+        request->owner = callback;
+        request->evaluator = callback->view();
+        search_info_.deferred_filter_request_ = std::move(request);
         auto& params = search_info_.search_params_;
-        // Backend transport field is derived here, not a public strategy knob.
         params.erase("ann_fusing_filter_ratio");
-        if (post_filter) {
-            // Observed post through-rate controls candidate batching only;
-            // graph navigation continues to see mandatory constraints alone.
-        } else if (params.contains("debug_ann_fusing_filter_ratio")) {
-            // Development override is the COMPLETE query filter ratio.
-            // Only DiskANN expansion consumes it, never user-predicate sampling
-            // or the exact mandatory bitmap count.
+        if (search_info_.ann_filter_request == AnnFilterRequest::InFilter &&
+            params.contains("debug_ann_fusing_filter_ratio")) {
             const double ratio =
                 params.at("debug_ann_fusing_filter_ratio").get<double>();
             AssertInfo(std::isfinite(ratio) && ratio >= 0 && ratio <= 1,
                        "debug_ann_fusing_filter_ratio must be in [0,1]");
             params["ann_fusing_filter_ratio"] = ratio;
-        } else {
-            if (const auto user_ratio =
-                    query_context_->get_ann_fusing_user_filter_ratio()) {
-                if (!search_view.has_known_count()) {
-                    // This is the already materialized mandatory bitmap only.
-                    // A freshly constructed BitsetView has no cached count.
-                    search_view.count_filtered_bits(0, search_view.num_bits());
-                }
-                const double mandatory =
-                    search_view.size() == 0
-                        ? 0.0
-                        : static_cast<double>(search_view.count()) /
-                              search_view.size();
-                // Independence approximation, NOT an exact union count.
-                // CAP acceptance injects the known full-query rate until
-                // estimator precision/correlation is separately qualified.
-                // DiskANN consumes this advisory. Do not set filter_level:
-                // memory graph uses that name for a different connectivity
-                // policy which must remain unchanged by scalar sampling.
-                params["ann_fusing_filter_ratio"] =
-                    mandatory + (1.0 - mandatory) * *user_ratio;
-            }
         }
     }
-    if (query_context_->get_ann_fusing_callback()) {
-        search_view.set_candidate_evaluator(
-            &callback_view,
-            active_count_,
-            post_filter ? knowhere::FilterMode::PostFilter
-                        : knowhere::FilterMode::InFilter);
-    }
+#endif
     milvus::SearchResult search_result;
     if (query::CanUseStrictGroupSearch(search_info_, num_queries) &&
         !search_view.empty()) {
@@ -261,52 +246,22 @@ PhyVectorSearchNode::GetOutput() {
                                 search_view,
                                 op_context,
                                 search_result);
-    } catch (const DeferredFilterUnsupported&) {
-        if (post_filter)
-            throw;
-        const auto callback = query_context_->get_ann_fusing_callback();
-        AssertInfo(callback != nullptr,
-                   "bitmap fallback requires a deferred predicate");
-        callback->RethrowIfFailed();
-        auto baseline = callback->EvalBaseline();
-        baseline.flip();  // Expr TRUE bitmap -> search exclusion bitmap.
-        if (search_view.num_bits() != 0) {
-            AssertInfo(search_view.num_bits() == baseline.size(),
-                       "mandatory bitmap size mismatch");
-            TargetBitmapView mandatory(
-                const_cast<uint8_t*>(search_view.mandatory_data()),
-                search_view.num_bits());
-            baseline.inplace_or(mandatory, baseline.size());
-        }
-        milvus::BitsetView baseline_view(
-            reinterpret_cast<const uint8_t*>(baseline.data()), baseline.size());
-        auto baseline_info = search_info_;
-        baseline_info.search_params_.erase("ann_fusing_filter_ratio");
-        // Only an explicit unsupported-before-search signal reaches here.
-        // The new runtime snapshot may differ; the exact bitmap is safe for
-        // either indexed or raw search. No index-type whitelist lives here.
-        segment_->vector_search(baseline_info,
-                                src_data,
-                                src_offsets,
-                                num_queries,
-                                query_timestamp_,
-                                baseline_view,
-                                op_context,
-                                search_result);
-        query_context_->set_ann_fusing_callback(nullptr);
-        LOG_DEBUG("ann_fusing fallback reason=entry_requires_bitmap");
     } catch (...) {
         // Backends join their task futures before returning either results or
         // failure. Prefer the original Expr/storage/cancellation cause to a
         // generic cross-ABI callback-failed status.
-        if (const auto& callback = query_context_->get_ann_fusing_callback()) {
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+        if (callback) {
             callback->RethrowIfFailed();
         }
+#endif
         throw;
     }
-    if (const auto& callback = query_context_->get_ann_fusing_callback()) {
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+    if (callback) {
         callback->RethrowIfFailed();
     }
+#endif
     if (search_result.used_interim_index_) {
         MarkFeature(query_context_->get_plan_options().feature_recorder.get(),
                     FeatureBit::InterimIndexSearch);

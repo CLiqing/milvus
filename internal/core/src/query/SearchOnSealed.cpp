@@ -34,6 +34,9 @@
 #include "index/contracts/query/IVectorReader.h"
 #include "knowhere/comp/index_param.h"
 #include "knowhere/dataset.h"
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+#include <know/deferred_filter_dataset.h>
+#endif
 #include "mmap/ChunkedColumnInterface.h"
 #include "query/CachedSearchIterator.h"
 #include "query/SearchBruteForce.h"
@@ -123,6 +126,20 @@ SearchOnSealedIndex(const Schema& schema,
     }
 
     dataset->SetIsSparse(is_sparse);
+    if (search_info.deferred_filter_request_) {
+#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
+        if (search_info.iterator_v2_info_.has_value() ||
+            search_info.iterative_filter_execution || query_offsets != nullptr ||
+            search_info.struct_element_offsets_ != nullptr) {
+            ThrowInfo(ErrorCode::InvalidParameter,
+                      "deferred filtering requires ordinary sealed graph Search");
+        }
+        cardinalv2::know_adapter::AttachSearchFilter(
+            dataset, search_info.deferred_filter_request_);
+#else
+        ThrowInfo(ErrorCode::InvalidParameter, "Cardinal deferred filtering is not available");
+#endif
+    }
 
     // Nullable row mapping lives inside the reader's knowhere IdMap (#50524),
     // so the plan's logical bitset and the result offsets both stay in
@@ -176,10 +193,8 @@ SearchOnSealedColumn(const Schema& schema,
                      const BitsetView& bitview,
                      milvus::OpContext* op_context,
                      SearchResult& result) {
-    if (!bitview.is_bitmap()) {
-        // This entry invokes raw-vector/BF consumers. Signal before search,
-        // rather than letting a bitmap shortcut drop the deferred predicate.
-        throw DeferredFilterUnsupported("raw-vector search requires a bitmap");
+    if (search_info.deferred_filter_request_) {
+        ThrowInfo(ErrorCode::InvalidParameter, "raw-vector search does not support deferred filtering");
     }
     const auto* schema_ptr = &schema;
     auto register_vector_search_provider = [&] {
