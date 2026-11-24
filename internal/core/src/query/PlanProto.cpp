@@ -192,15 +192,9 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
         }
         search_info.search_params_.erase(it);
     }
-    if (auto it = search_info.search_params_.find("ann_filter_iterative_batch_size");
-        it != search_info.search_params_.end()) {
-        if (search_info.ann_filter_request != AnnFilterRequest::IterativeFilter ||
-            !it->is_number_integer() || *it < 1 || *it > 64) {
-            ThrowInfo(ErrorCode::InvalidParameter,
-                      "ann_filter_iterative_batch_size must be an integer in [1,64] for iterative only");
-        }
-        search_info.ann_iterative_batch_size = it->get<size_t>();
-        search_info.search_params_.erase(it);
+    if (search_info.search_params_.contains("ann_filter_iterative_batch_size")) {
+        ThrowInfo(ErrorCode::InvalidParameter,
+                  "iterative batch size is not a Milvus search parameter");
     }
 
     // currently, iterative filter does not support range search

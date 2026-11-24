@@ -36,32 +36,10 @@
 #include "index/vector/VectorReaderValidation.h"
 #include "index/vector/VectorTypeUtils.h"
 #include "knowhere/comp/index_param.h"
-#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
-#include <know/deferred_filter_dataset.h>
-#endif
 
 namespace milvus::index {
 namespace {
 
-#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
-auto
-CheckNativeDeferredFilter(const KnowhereEngine& engine, const DatasetPtr& dataset) {
-    auto deferred = cardinalv2::know_adapter::SearchFilter(dataset);
-    if (deferred && !cardinalv2::know_adapter::CanSearchWithDeferredFilter(engine.native_index.Node())) {
-        ThrowInfo(ErrorCode::InvalidParameter,
-                  "loaded vector index does not support Cardinal deferred filtering");
-    }
-    return deferred;
-}
-
-void
-CheckNativeFilterCompleted(const DatasetPtr& result,
-                           const cardinalv2::DeferredFilterRequestPtr& deferred) {
-    if (deferred && !cardinalv2::know_adapter::SearchFilterCompleted(result, deferred)) {
-        ThrowInfo(ErrorCode::UnexpectedError, "Cardinal deferred filter completion receipt is missing");
-    }
-}
-#endif
 
 void
 ValidateDiskAnnBeamwidth(const KnowhereEngine& engine, uint32_t beamwidth) {
@@ -241,6 +219,9 @@ VectorIndexReader::Search(const DatasetPtr& dataset,
                           const BitsetView& bitset,
                           milvus::OpContext* op_ctx,
                           SearchResult& result) const {
+    if (params.evaluator_ && (IsGrowingGeneration() || params.search_params_.contains("radius"))) {
+        ThrowInfo(ErrorCode::InvalidParameter, "evaluator requires ordinary sealed vector search");
+    }
     if (!IsGrowingGeneration()) {
         if (backend_ == Backend::Disk) {
             SearchDisk(dataset, params, bitset, op_ctx, result);
@@ -577,9 +558,6 @@ VectorIndexReader::SearchMemory(const DatasetPtr& dataset,
     const auto topk = params.topk_;
     const auto result_count = detail::CheckedResultCount(shape, topk);
     auto search_conf = PrepareVectorSearchParams(params);
-#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
-    const auto deferred = CheckNativeDeferredFilter(engine_, dataset);
-#endif
 
     if (IsEmptyEngine()) {
         result.seg_offsets_.assign(result_count, INVALID_SEG_OFFSET);
@@ -611,8 +589,9 @@ VectorIndexReader::SearchMemory(const DatasetPtr& dataset,
         }
 
         milvus::tracer::AddEvent("start_knowhere_index_search");
-        auto search =
-            engine_.native_index.Search(dataset, search_conf, bitset, op_ctx);
+        auto search = params.evaluator_
+                          ? engine_.native_index.Search(dataset, search_conf, bitset, *params.evaluator_, op_ctx)
+                          : engine_.native_index.Search(dataset, search_conf, bitset, op_ctx);
         milvus::tracer::AddEvent("finish_knowhere_index_search");
         if (!search.has_value()) {
             const auto status = search.error();
@@ -623,9 +602,6 @@ VectorIndexReader::SearchMemory(const DatasetPtr& dataset,
                       knowhere::Status2String(status),
                       search.what());
         }
-#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
-        CheckNativeFilterCompleted(search.value(), deferred);
-#endif
         return search.value();
     }();
 
@@ -649,9 +625,6 @@ VectorIndexReader::SearchDisk(const DatasetPtr& dataset,
     const auto topk = params.topk_;
     const auto result_count = detail::CheckedResultCount(shape, topk);
     auto search_config = PrepareVectorSearchParams(params);
-#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
-    const auto deferred = CheckNativeDeferredFilter(engine_, dataset);
-#endif
 
     if (IsEmptyEngine()) {
         result.seg_offsets_.assign(result_count, INVALID_SEG_OFFSET);
@@ -684,14 +657,12 @@ VectorIndexReader::SearchDisk(const DatasetPtr& dataset,
                 search.value(), topk, shape.logical_nq, engine_.Metric());
         }
 
-        auto search =
-            engine_.native_index.Search(dataset, search_config, bitset, op_ctx);
+        auto search = params.evaluator_
+                          ? engine_.native_index.Search(dataset, search_config, bitset, *params.evaluator_, op_ctx)
+                          : engine_.native_index.Search(dataset, search_config, bitset, op_ctx);
         if (!search.has_value()) {
             ThrowSearchError("search", search, &search_config);
         }
-#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
-        CheckNativeFilterCompleted(search.value(), deferred);
-#endif
         return search.value();
     }();
 

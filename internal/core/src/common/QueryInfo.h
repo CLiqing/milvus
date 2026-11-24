@@ -30,8 +30,8 @@
 // Use nlohmann::json here to avoid a knowhere configuration-header dependency;
 // the parameter contents still follow knowhere's search schema.
 
-namespace cardinalv2 {
-struct DeferredFilterRequest;
+namespace knowhere {
+struct CandidateEvaluatorView;
 }
 
 namespace milvus {
@@ -86,8 +86,7 @@ struct SearchInfo {
     bool materialized_view_involved = false;
     bool iterative_filter_execution = false;
     AnnFilterRequest ann_filter_request = AnnFilterRequest::PreFilter;
-    size_t ann_iterative_batch_size = 32;
-    std::shared_ptr<const cardinalv2::DeferredFilterRequest> deferred_filter_request_;
+    std::shared_ptr<const knowhere::CandidateEvaluatorView> evaluator_;
     std::optional<SearchIteratorV2Info> iterator_v2_info_ = std::nullopt;
     std::optional<std::string> json_path_;
     std::optional<milvus::DataType> json_type_;

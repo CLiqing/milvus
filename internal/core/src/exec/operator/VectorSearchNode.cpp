@@ -197,28 +197,22 @@ PhyVectorSearchNode::GetOutput() {
         ThrowInfo(ErrorCode::InvalidParameter,
                   "deferred ANN filtering requires an offset predicate");
     }
-#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
     if (callback) {
-        using cardinalv2::FilterStrategy;
-        auto request = std::make_shared<cardinalv2::DeferredFilterRequest>();
         switch (search_info_.ann_filter_request) {
             case AnnFilterRequest::InFilter:
-                request->strategy = FilterStrategy::In;
+                search_info_.search_params_["ann_filter_strategy"] = "in";
                 break;
             case AnnFilterRequest::IterativeFilter:
-                request->strategy = FilterStrategy::Iterative;
+                search_info_.search_params_["ann_filter_strategy"] = "iterative";
                 break;
             case AnnFilterRequest::PostFilter:
-                request->strategy = FilterStrategy::Post;
+                search_info_.search_params_["ann_filter_strategy"] = "post";
                 break;
             default:
                 ThrowInfo(ErrorCode::InvalidParameter, "invalid deferred ANN strategy");
         }
-        request->row_count = active_count_;
-        request->iterative_batch_size = search_info_.ann_iterative_batch_size;
-        request->owner = callback;
-        request->evaluator = callback->view();
-        search_info_.deferred_filter_request_ = std::move(request);
+        search_info_.evaluator_ =
+            std::make_shared<const knowhere::CandidateEvaluatorView>(callback->view());
         auto& params = search_info_.search_params_;
         params.erase("ann_fusing_filter_ratio");
         if (search_info_.ann_filter_request == AnnFilterRequest::InFilter &&
@@ -230,7 +224,6 @@ PhyVectorSearchNode::GetOutput() {
             params["ann_fusing_filter_ratio"] = ratio;
         }
     }
-#endif
     milvus::SearchResult search_result;
     if (query::CanUseStrictGroupSearch(search_info_, num_queries) &&
         !search_view.empty()) {
@@ -250,18 +243,14 @@ PhyVectorSearchNode::GetOutput() {
         // Backends join their task futures before returning either results or
         // failure. Prefer the original Expr/storage/cancellation cause to a
         // generic cross-ABI callback-failed status.
-#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
         if (callback) {
             callback->RethrowIfFailed();
         }
-#endif
         throw;
     }
-#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
     if (callback) {
         callback->RethrowIfFailed();
     }
-#endif
     if (search_result.used_interim_index_) {
         MarkFeature(query_context_->get_plan_options().feature_recorder.get(),
                     FeatureBit::InterimIndexSearch);

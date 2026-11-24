@@ -2,12 +2,11 @@
 // license agreements. Licensed under the Apache License, Version 2.0.
 #include "exec/expression/OffsetExpressionCallback.h"
 
-#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
 #include <algorithm>
 #include <limits>
 
 namespace milvus::exec {
-using Status = cardinalv2::CandidateEvalStatus;
+using Status = knowhere::CandidateEvalStatus;
 namespace {
 // Result transport only: preserve the Expr's packed bitmaps instead of
 // unpacking/repacking every accepted row. Read allocated bytes only, without
@@ -80,9 +79,10 @@ OffsetExpressionCallback::OffsetExpressionCallback(
                "callback requires a query context and valid active domain");
 }
 
-cardinalv2::CandidateEvaluatorView
+knowhere::CandidateEvaluatorView
 OffsetExpressionCallback::view() const {
-    cardinalv2::CandidateEvaluatorView view;
+    knowhere::CandidateEvaluatorView view;
+    view.row_count = static_cast<size_t>(row_count_);
     view.context = this;
     view.create_worker = CreateWorker;
     view.destroy_worker = DestroyWorker;
@@ -233,4 +233,3 @@ OffsetExpressionCallback::EvalBatch(void* opaque,
     }
 }
 }  // namespace milvus::exec
-#endif

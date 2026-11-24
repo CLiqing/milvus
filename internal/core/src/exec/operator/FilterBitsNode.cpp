@@ -117,7 +117,6 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                        ? AnnFilterRequest::PreFilter
                        : query_context_->get_search_info().ann_filter_request;
     if (request != AnnFilterRequest::PreFilter) {
-#ifdef MILVUS_CARDINAL_DEFERRED_FILTER
         // Only stable row offsets and supported offset Exprs may bypass the
         // user bitmap. The actual loaded graph is checked at the search boundary.
         const auto info = query_context_->get_search_info();
@@ -151,7 +150,6 @@ PhyFilterBitsNode::PhyFilterBitsNode(
                 exprs_->Clear();
             }
         }
-#endif
     }
     if (request != AnnFilterRequest::PreFilter && !query_context_->get_ann_fusing_callback()) {
         ThrowInfo(ErrorCode::InvalidParameter,

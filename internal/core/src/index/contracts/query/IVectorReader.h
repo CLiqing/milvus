@@ -32,6 +32,10 @@
 #include "knowhere/expected.h"
 #include "knowhere/index/index_node.h"
 
+namespace knowhere {
+struct CandidateEvaluatorView;
+}
+
 namespace milvus {
 struct OpContext;
 }  // namespace milvus
@@ -50,6 +54,7 @@ struct VectorSearchParams {
     MetricType metric_type_;
     int64_t topk_{0};
     tracer::TraceContext trace_ctx_;
+    const knowhere::CandidateEvaluatorView* evaluator_ = nullptr;  // synchronous Search only
 };
 
 class IVectorReader {
