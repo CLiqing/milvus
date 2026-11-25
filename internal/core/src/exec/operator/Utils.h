@@ -112,7 +112,8 @@ ProjectVectorSearchParams(const SearchInfo& search_info) {
     return index::VectorSearchParams{search_info.search_params_,
                                      search_info.metric_type_,
                                      search_info.topk_,
-                                     search_info.trace_ctx_};
+                                     search_info.trace_ctx_,
+                                     search_info.evaluator_};
 }
 
 [[maybe_unused]] static bool

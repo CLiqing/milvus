@@ -131,6 +131,12 @@ MergeExprWithNamespace(const SchemaPtr schema,
     return and_expr;
 }
 
+// Placeholder for automatic selection; explicit hints are the only opt-in.
+static AnnFilterRequest
+DefaultAnnFilterStrategy() {
+    return AnnFilterRequest::PreFilter;
+}
+
 SearchInfo
 ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
     SearchInfo search_info;
@@ -146,8 +152,28 @@ ProtoParser::ParseSearchInfo(const planpb::VectorANNS& anns_proto) {
     ParseStrictGroupSettings(search_info);
     search_info.materialized_view_involved =
         query_info_proto.materialized_view_involved();
-    // currently, iterative filter does not support range search
-    if (!search_info.search_params_.contains(RADIUS)) {
+    auto& params = search_info.search_params_;
+    auto hint = query_info_proto.hints();
+    if (hint.empty() && params.contains(HINTS) && params[HINTS].is_string())
+        hint = params[HINTS].get<std::string>();
+    if (params.contains("ann_filter_strategy"))
+        ThrowInfo(ConfigInvalid,
+                  "ann_filter_strategy is internal; use a search hint");
+    if (hint == "in" || hint == "fusing")
+        search_info.ann_filter_request = AnnFilterRequest::InFilter;
+    else if (hint == "post")
+        search_info.ann_filter_request = AnnFilterRequest::PostFilter;
+    else if (hint == "iterative")
+        search_info.ann_filter_request = AnnFilterRequest::IterativeFilter;
+    else if (hint == "auto" || hint.empty())
+        search_info.ann_filter_request = DefaultAnnFilterStrategy();
+    if (search_info.ann_filter_request != AnnFilterRequest::PreFilter &&
+        params.contains(RADIUS))
+        ThrowInfo(ConfigInvalid,
+                  "deferred filtering does not support range searches");
+    // Leave legacy iterative_filter on the existing external iterator path.
+    if (search_info.ann_filter_request == AnnFilterRequest::PreFilter &&
+        hint != "pre" && hint != "auto" && !params.contains(RADIUS)) {
         if (query_info_proto.hints() != "") {
             if (query_info_proto.hints() == "disable") {
                 search_info.iterative_filter_execution = false;

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 
@@ -28,6 +29,10 @@
 // search parameters, metric, topk, and trace context into VectorSearchParams.
 // Use nlohmann::json here to avoid a knowhere configuration-header dependency;
 // the parameter contents still follow knowhere's search schema.
+
+namespace knowhere {
+struct CandidateEvaluatorView;
+}
 
 namespace milvus {
 
@@ -52,6 +57,14 @@ struct BruteForceIndexParams {
     std::optional<int64_t> minhash_element_bit_width_;
 };
 
+// Auto policy is resolved before the search request reaches the index.
+enum class AnnFilterRequest : uint8_t {
+    PreFilter,
+    InFilter,
+    IterativeFilter,
+    PostFilter,
+};
+
 struct SearchInfo {
     int64_t topk_{0};
     int64_t group_size_{1};
@@ -70,6 +83,9 @@ struct SearchInfo {
     tracer::TraceContext trace_ctx_;
     bool materialized_view_involved = false;
     bool iterative_filter_execution = false;
+    AnnFilterRequest ann_filter_request = AnnFilterRequest::PreFilter;
+    const knowhere::CandidateEvaluatorView* evaluator_ =
+        nullptr;  // Borrowed during synchronous search.
     std::optional<SearchIteratorV2Info> iterator_v2_info_ = std::nullopt;
     std::optional<std::string> json_path_;
     std::optional<milvus::DataType> json_type_;

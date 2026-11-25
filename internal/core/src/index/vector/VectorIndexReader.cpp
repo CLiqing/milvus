@@ -332,6 +332,10 @@ VectorIndexReader::Search(const DatasetPtr& dataset,
                           const VectorSearchParams& params,
                           const BitsetView& bitset,
                           SearchResult& result) const {
+    if (params.evaluator_ &&
+        (IsGrowingGeneration() || params.search_params_.contains("radius")))
+        ThrowInfo(ErrorCode::InvalidParameter,
+                  "deferred filter requires ordinary sealed Search");
     const auto& engine_pin = GetEngine();
     const auto& engine = *engine_pin;
     if (!IsGrowingGeneration()) {
@@ -749,7 +753,11 @@ VectorIndexReader::SearchMemory(const KnowhereEngine& engine,
 
         milvus::tracer::AddEvent("start_knowhere_index_search");
         auto search =
-            engine.native_index.Search(dataset, search_conf, bitset, op_ctx);
+            params.evaluator_
+                ? engine.native_index.Search(
+                      dataset, search_conf, bitset, *params.evaluator_, op_ctx)
+                : engine.native_index.Search(
+                      dataset, search_conf, bitset, op_ctx);
         milvus::tracer::AddEvent("finish_knowhere_index_search");
         if (!search.has_value()) {
             const auto status = search.error();
@@ -816,8 +824,14 @@ VectorIndexReader::SearchDisk(const KnowhereEngine& engine,
                 search.value(), topk, shape.logical_nq, engine.Metric());
         }
 
-        auto search =
-            engine.native_index.Search(dataset, search_config, bitset, op_ctx);
+        auto search = params.evaluator_
+                          ? engine.native_index.Search(dataset,
+                                                       search_config,
+                                                       bitset,
+                                                       *params.evaluator_,
+                                                       op_ctx)
+                          : engine.native_index.Search(
+                                dataset, search_config, bitset, op_ctx);
         if (!search.has_value()) {
             ThrowSearchError("search", search, &search_config);
         }

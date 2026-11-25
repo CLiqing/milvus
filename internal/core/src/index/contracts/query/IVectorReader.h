@@ -36,6 +36,10 @@
 // implementations, not shared or scalar contracts. Construction, persistence,
 // and loading use separate objects.
 
+namespace knowhere {
+struct CandidateEvaluatorView;
+}
+
 namespace milvus::index {
 
 // Vector search inputs projected from the execution layer: search parameters,
@@ -46,6 +50,7 @@ struct VectorSearchParams {
     MetricType metric_type_;
     int64_t topk_{0};
     tracer::TraceContext trace_ctx_;
+    const knowhere::CandidateEvaluatorView* evaluator_ = nullptr;
 };
 
 /** @brief Vector operations use the context bound by IIndex::CreateReader. */

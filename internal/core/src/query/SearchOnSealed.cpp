@@ -173,6 +173,9 @@ SearchOnSealedColumn(const FieldMeta& field,
                      const BitsetView& bitview,
                      milvus::OpContext* op_context,
                      SearchResult& result) {
+    if (search_info.evaluator_)
+        ThrowInfo(ErrorCode::InvalidParameter,
+                  "raw vector search cannot execute a deferred filter");
     auto register_vector_search_provider = [&] {
         if (!result.allow_filtered_vector_search_ ||
             !CanUseStrictGroupSearch(search_info, num_queries) ||

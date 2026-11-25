@@ -27,6 +27,7 @@
 #include "common/Types.h"
 #include "exec/QueryContext.h"
 #include "exec/expression/EvalCtx.h"
+#include "exec/expression/OffsetPredicate.h"
 #include "exec/expression/ExprCache.h"
 #include "expr/ITypeExpr.h"
 #include "fmt/core.h"
@@ -97,6 +98,30 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
 
+    const auto* placeholders = query_context_->get_placeholder_group();
+    const auto& info = query_context_->get_search_info();
+    if (placeholders &&
+        info.ann_filter_request != AnnFilterRequest::PreFilter) {
+        const auto schema = query_context_->get_read_schema();
+        if (query_context_->offset_predicate ||
+            query_context_->get_segment()->type() != SegmentType::Sealed ||
+            placeholders->size() != 1 || placeholders->front().element_level_ ||
+            schema->get_ttl_field_id() ||
+            (*schema)[info.field_id_].is_nullable() ||
+            (*schema)[info.field_id_].get_data_type() !=
+                DataType::VECTOR_FLOAT ||
+            info.iterative_filter_execution || info.iterator_v2_info_ ||
+            !info.group_by_field_ids_.empty() ||
+            info.materialized_view_involved || info.global_refine_enable_ ||
+            !exprs_->expr(0)->SupportOffsetInput()) {
+            ThrowInfo(ErrorCode::InvalidParameter,
+                      "deferred filtering requires a supported sealed "
+                      "row-level Search");
+        }
+        query_context_->offset_predicate =
+            std::make_shared<OffsetPredicate>(filter->filter(), query_context_);
+        return;
+    }
     enable_expr_cache_ = query_context_->get_enable_expr_cache();
     if (enable_expr_cache_) {
         const bool cache_setup_completed = RunExprCacheBestEffort([&]() {
@@ -149,6 +174,14 @@ PhyFilterBitsNode::GetOutput() {
         return nullptr;
     }
 
+    if (query_context_->offset_predicate) {
+        // Leave the visibility mask to the normal MVCC operator.
+        num_processed_rows_ = need_process_rows_;
+        return std::make_shared<RowVector>(
+            std::vector<VectorPtr>{std::make_shared<ColumnVector>(
+                TargetBitmap(need_process_rows_),
+                TargetBitmap(need_process_rows_, true))});
+    }
     tracer::AutoSpan span(
         "PhyFilterBitsNode::Execute", tracer::GetRootSpan(), true);
     const bool recording =

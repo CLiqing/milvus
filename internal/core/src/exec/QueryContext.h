@@ -147,6 +147,8 @@ class Context {
     //std::shared_ptr<const Config> config_;
 };
 
+class OffsetPredicate;
+
 class QueryContext : public Context {
  public:
     QueryContext(const std::string& query_id,
@@ -220,8 +222,8 @@ class QueryContext : public Context {
         return active_count_;
     }
 
-    milvus::SearchInfo
-    get_search_info() {
+    const milvus::SearchInfo&
+    get_search_info() const {
         return search_info_;
     }
 
@@ -364,6 +366,31 @@ class QueryContext : public Context {
         return enable_sub_expr_cache_write_;
     }
 
+    std::shared_ptr<OffsetPredicate> offset_predicate;
+
+    // Exprs own mutable cursors. Each ANN task gets its own context but reads
+    // the same leased segment and logical schema as the originating request.
+    std::unique_ptr<QueryContext>
+    MakeOffsetContext() const {
+        auto copy = std::make_unique<QueryContext>(
+            query_id_,
+            segment_,
+            active_count_,
+            query_timestamp_,
+            collection_ttl_timestamp_,
+            consistency_level_,
+            plan_options_,
+            query_config_,
+            executor_,
+            std::unordered_map<std::string, std::shared_ptr<BaseConfig>>{},
+            entity_ttl_physical_time_us_);
+        copy->read_snapshot_ = read_snapshot_;
+        copy->read_schema_ = read_schema_;
+        copy->op_context_ = op_context_;
+        copy->enable_sub_expr_cache_write_ = false;
+        return copy;
+    }
+
     // Logical read semantics belong to the plan's schema, independently of
     // the schema used to encode/load the shared physical segment.
     void
@@ -406,7 +433,7 @@ class QueryContext : public Context {
     milvus::Timestamp collection_ttl_timestamp_;
     // used for vector search
     milvus::SearchInfo search_info_;
-    const query::PlaceholderGroup* placeholder_group_;
+    const query::PlaceholderGroup* placeholder_group_{nullptr};
 
     // used for store segment search result
     milvus::SearchResult search_result_;

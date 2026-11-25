@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include "VectorSearchNode.h"
+#include "exec/expression/OffsetPredicate.h"
 
 #include <algorithm>
 #include <chrono>
@@ -195,15 +196,35 @@ PhyVectorSearchNode::GetOutput() {
         !search_view.empty()) {
         search_result.vector_search_filter_owner_ = GetColumnVector(input_);
     }
+    const auto& predicate = query_context_->offset_predicate;
+    if (search_info_.ann_filter_request != AnnFilterRequest::PreFilter) {
+        if (!predicate)
+            ThrowInfo(ErrorCode::InvalidParameter,
+                      "deferred filtering requires an offset predicate");
+        search_info_.evaluator_ = &predicate->view();
+        search_info_.search_params_["ann_filter_strategy"] =
+            search_info_.ann_filter_request == AnnFilterRequest::InFilter ? "in"
+            : search_info_.ann_filter_request == AnnFilterRequest::PostFilter
+                ? "post"
+                : "iterative";
+    }
     auto op_context = query_context_->get_op_context();
-    segment_->vector_search(search_info_,
-                            src_data,
-                            src_offsets,
-                            num_queries,
-                            query_timestamp_,
-                            search_view,
-                            op_context,
-                            search_result);
+    try {
+        segment_->vector_search(search_info_,
+                                src_data,
+                                src_offsets,
+                                num_queries,
+                                query_timestamp_,
+                                search_view,
+                                op_context,
+                                search_result);
+    } catch (...) {
+        if (predicate)
+            predicate->RethrowIfFailed();
+        throw;
+    }
+    if (predicate)
+        predicate->RethrowIfFailed();
     if (search_result.used_interim_index_) {
         MarkFeature(query_context_->get_plan_options().feature_recorder.get(),
                     FeatureBit::InterimIndexSearch);
